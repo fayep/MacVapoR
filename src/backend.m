@@ -124,6 +124,7 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_started, g_connected, g_force_idr = true;
 // The client sends placeholder views and a placeholder head pose until it has decoded a frame.
 static bool g_tracking_real;
+static unsigned g_samples_since_real;
 static stream_setup g_setup;
 static NSString *g_setup_raw;
 static uint32_t g_eye_w, g_eye_h;          // stream size per eye, before foveation
@@ -453,6 +454,7 @@ static void *event_thread(void *arg) {
                 g_force_idr = true;
                 g_have_offset = false;
                 g_tracking_real = false;
+                g_samples_since_real = 0;
                 pthread_mutex_unlock(&g_lock);
                 axr_log("headset connected");
                 break;
@@ -483,6 +485,7 @@ static void *event_thread(void *arg) {
                 double offset = (double)axr_now_ns() - (double)ts;
                 pthread_mutex_lock(&g_lock);
                 if (ts > g_newest_ts) g_newest_ts = ts;
+                if (g_tracking_real) g_samples_since_real++;
                 // Smoothed, since each sample's arrival carries network jitter.
                 g_clock_offset = g_have_offset ? g_clock_offset + (offset - g_clock_offset) * 0.05 : offset;
                 g_have_offset = true;
@@ -603,7 +606,8 @@ void axr_backend_start(void) {
 
 bool axr_backend_tracking(void) {
     pthread_mutex_lock(&g_lock);
-    bool t = g_connected && g_tracking_real;
+    // Samples queued before the first decoded frame still carry the placeholder pose.
+    bool t = g_connected && g_tracking_real && g_samples_since_real > 45;
     pthread_mutex_unlock(&g_lock);
     return t;
 }

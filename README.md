@@ -4,8 +4,9 @@ An OpenXR runtime for macOS that displays through ALVR: frames go to the ALVR vi
 on an Apple Vision Pro, and head, PS VR2 Sense controller and button input comes back. No
 SteamVR and no PC. The streaming side is the one proven in ../alvr-mac-spike.
 
-Status (2026-10-15): Khronos `hello_xr -g Metal` runs on it and shows correctly on the
-headset, with controller input and haptics.
+Status (2026-10-15): Khronos `hello_xr` runs on it and shows correctly on the headset with
+Metal and with Vulkan (both `XR_KHR_vulkan_enable` and `enable2`, through MoltenVK), with
+controller input and haptics.
 
 ## Build and use
 
@@ -22,6 +23,11 @@ file, for a look with a desktop decoder.
 ## What is there
 
 - Instance and system, the session state machine, VIEW/LOCAL/STAGE spaces, paths.
+- Vulkan swapchains (`XR_KHR_vulkan_enable`, `enable2`): images are made on the app's own
+  VkDevice and MoltenVK exports the MTLTexture behind each (`VK_EXT_metal_objects`), so the
+  Metal compositor samples them, on the MTLCommandQueue behind the app's VkQueue. Vulkan is
+  called through the library that owns the app's handles: the loader for a native app,
+  MoltenVK itself under CrossOver, whose Wine loads it without a loader.
 - Metal swapchains (`XR_KHR_metal_enable`); the first stereo projection layer is composed
   straight into ALVR's foveated stream layout on the app's own queue, then HEVC-encoded.
 - Each frame is tied to an ALVR tracking sample: its poses come from that sample and the
@@ -32,7 +38,9 @@ file, for a look with a desktop decoder.
 
 ## Not yet
 
-- Vulkan swapchains (`XR_KHR_vulkan_enable`/`enable2`), which Proton's wineopenxr needs.
+- `hello_xr -g Vulkan` behind the Homebrew loader needs `VK_DRIVER_FILES` pointing at a copy of
+  MoltenVK's manifest without `is_portability_driver`, since that app does not ask for
+  portability drivers. (`-g Vulkan2` is fine: the runtime creates the instance and asks.)
 - The aim pose is the grip pose; the offset is not measured yet.
 - Quad and other non-projection layers are ignored; depth is accepted and ignored.
 - Velocities are not reported.

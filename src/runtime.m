@@ -9,6 +9,7 @@
 
 #define XR_USE_GRAPHICS_API_METAL
 #define XR_USE_TIMESPEC
+#include "vk.h"
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
@@ -54,7 +55,9 @@ typedef struct swapchain {
     uint32_t magic;
     session *sess;
     XrSwapchainCreateInfo info;
-    id<MTLTexture> __strong images[3];
+    id<MTLTexture> __strong images[3];   // for Vulkan, the MTLTextures behind vk_images
+    VkImage vk_images[3];
+    VkDeviceMemory vk_memory[3];
     uint32_t count, next, acquired[3], acquired_count;
     int32_t released;                       // last released image, -1 before the first
 } swapchain;
@@ -76,6 +79,8 @@ struct session {
     uint32_t magic;
     instance *inst;
     id<MTLCommandQueue> queue;
+    bool vulkan;
+    VkDevice vk_device;
     XrSessionState state;
     bool running, exit_requested;
     NSMutableArray<NSValue *> *action_sets;
@@ -174,6 +179,8 @@ static XrResult xrPollEvent_(XrInstance inst, XrEventDataBuffer *out) {
 
 static const XrExtensionProperties g_extensions[] = {
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_METAL_ENABLE_EXTENSION_NAME, XR_KHR_metal_enable_SPEC_VERSION},
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION},
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION},
 };
@@ -340,28 +347,88 @@ static XrResult xrGetMetalGraphicsRequirementsKHR_(XrInstance h, XrSystemId sys,
     return XR_SUCCESS;
 }
 
+static XrResult xrGetVulkanGraphicsRequirementsKHR_(XrInstance h, XrSystemId sys, XrGraphicsRequirementsVulkanKHR *r) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    r->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
+    r->maxApiVersionSupported = XR_MAKE_VERSION(1, 4, 0);
+    return XR_SUCCESS;
+}
+
+static XrResult xrGetVulkanGraphicsRequirements2KHR_(XrInstance h, XrSystemId sys, XrGraphicsRequirementsVulkan2KHR *r) {
+    return xrGetVulkanGraphicsRequirementsKHR_(h, sys, (XrGraphicsRequirementsVulkanKHR *)r);
+}
+
+static XrResult xrGetVulkanInstanceExtensionsKHR_(XrInstance h, XrSystemId sys, uint32_t cap, uint32_t *n, char *buf) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    return copy_string(axr_vk_instance_extensions(), cap, n, buf);
+}
+
+static XrResult xrGetVulkanDeviceExtensionsKHR_(XrInstance h, XrSystemId sys, uint32_t cap, uint32_t *n, char *buf) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    return copy_string(axr_vk_device_extensions(), cap, n, buf);
+}
+
+static XrResult xrGetVulkanGraphicsDeviceKHR_(XrInstance h, XrSystemId sys, VkInstance vk, VkPhysicalDevice *out) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (sys != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    return axr_vk_physical_device(vk, out) == VK_SUCCESS ? XR_SUCCESS : XR_ERROR_RUNTIME_FAILURE;
+}
+
+static XrResult xrGetVulkanGraphicsDevice2KHR_(XrInstance h, const XrVulkanGraphicsDeviceGetInfoKHR *info,
+                                               VkPhysicalDevice *out) {
+    return xrGetVulkanGraphicsDeviceKHR_(h, info->systemId, info->vulkanInstance, out);
+}
+
+static XrResult xrCreateVulkanInstanceKHR_(XrInstance h, const XrVulkanInstanceCreateInfoKHR *info, VkInstance *out,
+                                           VkResult *vr) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (info->systemId != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    *vr = axr_vk_create_instance(info->pfnGetInstanceProcAddr, info->vulkanCreateInfo, info->vulkanAllocator, out);
+    return XR_SUCCESS;
+}
+
+static XrResult xrCreateVulkanDeviceKHR_(XrInstance h, const XrVulkanDeviceCreateInfoKHR *info, VkDevice *out,
+                                         VkResult *vr) {
+    CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
+    if (info->systemId != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
+    axr_vk_load(info->pfnGetInstanceProcAddr);
+    *vr = axr_vk_create_device(info->vulkanPhysicalDevice, info->vulkanCreateInfo, info->vulkanAllocator, out);
+    return XR_SUCCESS;
+}
+
 // ------------------------------------------------------------------------------------- session
 
 static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, XrSession *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (info->systemId != SYSTEM_ID) return XR_ERROR_SYSTEM_INVALID;
     const XrGraphicsBindingMetalKHR *binding = NULL;
-    for (const XrBaseInStructure *n = info->next; n; n = n->next)
+    const XrGraphicsBindingVulkanKHR *vk = NULL;   // also XrGraphicsBindingVulkan2KHR
+    for (const XrBaseInStructure *n = info->next; n; n = n->next) {
         if (n->type == XR_TYPE_GRAPHICS_BINDING_METAL_KHR) binding = (const XrGraphicsBindingMetalKHR *)n;
-    if (!binding || !binding->commandQueue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+        if (n->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) vk = (const XrGraphicsBindingVulkanKHR *)n;
+    }
+    id<MTLCommandQueue> queue = nil;
+    if (binding) queue = (__bridge id<MTLCommandQueue>)binding->commandQueue;
+    else if (vk) queue = axr_vk_session_queue(vk->instance, vk->device, vk->queueFamilyIndex, vk->queueIndex);
+    if (!queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
     pthread_mutex_lock(&g_lock);
     if (g_session) { pthread_mutex_unlock(&g_lock); return XR_ERROR_LIMIT_REACHED; }
     session *s = calloc(1, sizeof *s);
     s->magic = MAGIC_SESSION;
     s->inst = (instance *)h;
-    s->queue = (__bridge id<MTLCommandQueue>)binding->commandQueue;
+    s->queue = queue;
+    s->vulkan = vk != NULL;
+    s->vk_device = vk ? vk->device : VK_NULL_HANDLE;
     s->action_sets = [NSMutableArray array];
     s->local_height = 1.6f;
     g_session = s;
     set_state(s, XR_SESSION_STATE_IDLE);
     set_state(s, XR_SESSION_STATE_READY);
     pthread_mutex_unlock(&g_lock);
-    axr_log("session created");
+    axr_log("session created (%s)", vk ? "Vulkan" : "Metal");
     *out = (XrSession)s;
     return XR_SUCCESS;
 }
@@ -503,10 +570,12 @@ static XrResult xrDestroySpace_(XrSpace h) {
 static float local_height(session *s, XrTime t) {
     if (!s->local_from_headset && axr_backend_tracking()) {
         axr_motion head = axr_device_motion(AXR_HEAD, t);
-        if (head.valid && head.pose.position[1] > 0.3f) {
+        bool placeholder = head.pose.position[0] == 0 && head.pose.position[1] == 1.2f && head.pose.position[2] == 0;
+        if (head.valid && head.pose.position[1] > 0.3f && !placeholder) {
             s->local_height = head.pose.position[1];
             s->local_from_headset = true;
-            axr_log("LOCAL space at %.2f m above the floor", s->local_height);
+            axr_log("LOCAL space at %.3f m above the floor (head at %.3f, %.3f)", s->local_height,
+                    head.pose.position[0], head.pose.position[2]);
         }
     }
     return s->local_height;
@@ -587,18 +656,48 @@ static const int64_t g_formats[] = {
 };
 #define FORMAT_COUNT (sizeof g_formats / sizeof g_formats[0])
 
+static const int64_t g_vk_formats[] = {
+    VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+    VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT,
+};
+_Static_assert(sizeof g_vk_formats == sizeof g_formats, "one Vulkan format per Metal one");
+
 static XrResult xrEnumerateSwapchainFormats_(XrSession h, uint32_t cap, uint32_t *n, int64_t *out) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
-    TWO_CALL(cap, n, out, g_formats, FORMAT_COUNT, out[i_] = g_formats[i_]);
+    const int64_t *f = ((session *)h)->vulkan ? g_vk_formats : g_formats;
+    TWO_CALL(cap, n, out, f, FORMAT_COUNT, out[i_] = f[i_]);
     return XR_SUCCESS;
 }
 
 static XrResult xrCreateSwapchain_(XrSession h, const XrSwapchainCreateInfo *info, XrSwapchain *out) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
+    session *s = (session *)h;
+    const int64_t *f = s->vulkan ? g_vk_formats : g_formats;
     bool known = false;
-    for (size_t i = 0; i < FORMAT_COUNT; i++) known |= g_formats[i] == info->format;
+    for (size_t i = 0; i < FORMAT_COUNT; i++) known |= f[i] == info->format;
     if (!known) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
     if (info->sampleCount > 1 || info->faceCount != 1) return XR_ERROR_FEATURE_UNSUPPORTED;
+    if (s->vulkan) {
+        swapchain *sc = calloc(1, sizeof *sc);
+        sc->magic = MAGIC_SWAPCHAIN;
+        sc->sess = s;
+        sc->info = *info;
+        sc->count = 3;
+        sc->released = -1;
+        for (uint32_t i = 0; i < sc->count; i++) {
+            sc->images[i] = axr_vk_create_image(s->vk_device, info, &sc->vk_images[i], &sc->vk_memory[i]);
+            if (!sc->images[i]) {
+                for (uint32_t j = 0; j < i; j++) {
+                    sc->images[j] = nil;
+                    axr_vk_destroy_image(s->vk_device, sc->vk_images[j], sc->vk_memory[j]);
+                }
+                free(sc);
+                return XR_ERROR_RUNTIME_FAILURE;
+            }
+        }
+        *out = (XrSwapchain)sc;
+        return XR_SUCCESS;
+    }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.pixelFormat = (MTLPixelFormat)info->format;
     d.width = info->width;
@@ -632,7 +731,10 @@ static XrResult xrDestroySwapchain_(XrSwapchain h) {
     CHECK_HANDLE(h, swapchain, MAGIC_SWAPCHAIN);
     swapchain *sc = (swapchain *)h;
     sc->magic = 0;
-    for (uint32_t i = 0; i < sc->count; i++) sc->images[i] = nil;
+    for (uint32_t i = 0; i < sc->count; i++) {
+        sc->images[i] = nil;
+        if (sc->sess->vulkan) axr_vk_destroy_image(sc->sess->vk_device, sc->vk_images[i], sc->vk_memory[i]);
+    }
     free(sc);
     return XR_SUCCESS;
 }
@@ -640,6 +742,14 @@ static XrResult xrDestroySwapchain_(XrSwapchain h) {
 static XrResult xrEnumerateSwapchainImages_(XrSwapchain h, uint32_t cap, uint32_t *n, XrSwapchainImageBaseHeader *out) {
     CHECK_HANDLE(h, swapchain, MAGIC_SWAPCHAIN);
     swapchain *sc = (swapchain *)h;
+    if (sc->sess->vulkan) {
+        XrSwapchainImageVulkanKHR *vimg = (XrSwapchainImageVulkanKHR *)out;
+        TWO_CALL(cap, n, out, x, sc->count, {
+            if (vimg[i_].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            vimg[i_].image = sc->vk_images[i_];
+        });
+        return XR_SUCCESS;
+    }
     XrSwapchainImageMetalKHR *img = (XrSwapchainImageMetalKHR *)out;
     TWO_CALL(cap, n, out, x, sc->count, {
         if (img[i_].type != XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR) return XR_ERROR_VALIDATION_FAILURE;
@@ -1082,7 +1192,9 @@ static XrResult xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceL
     X(xrGetActionStateVector2f) X(xrGetActionStatePose) X(xrSyncActions)                                  \
     X(xrEnumerateBoundSourcesForAction) X(xrGetInputSourceLocalizedName) X(xrApplyHapticFeedback)         \
     X(xrStopHapticFeedback) X(xrGetMetalGraphicsRequirementsKHR) X(xrConvertTimespecTimeToTimeKHR)        \
-    X(xrConvertTimeToTimespecTimeKHR)
+    X(xrConvertTimeToTimespecTimeKHR) X(xrGetVulkanGraphicsRequirementsKHR) X(xrGetVulkanGraphicsRequirements2KHR)   \
+    X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR)  \
+    X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR)
 
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
 
