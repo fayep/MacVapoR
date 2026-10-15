@@ -215,6 +215,8 @@ static NSMutableDictionary<NSNumber *, NSNumber *> *g_pts_to_ts;
 static float g_bitrate = 30e6f;
 static unsigned g_stat_frames, g_stat_bytes, g_stat_submit_calls, g_stat_not_ready;
 unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;
+unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;   // runtime.m's input
+static unsigned g_stat_button_events;
 static int64_t g_stat_since;
 
 id<MTLDevice> axr_metal_device(void) {
@@ -564,6 +566,7 @@ static void *event_thread(void *arg) {
                 if (n > 256) n = 256;
                 uint64_t got = alvr_get_buttons(entries);
                 pthread_mutex_lock(&g_lock);
+                g_stat_button_events++;
                 for (uint64_t i = 0; i < got && i < n; i++) {
                     // The id says nothing about binary or scalar, and a bool only sets the first byte.
                     NSNumber *old = g_inputs[@(entries[i].id)];
@@ -612,9 +615,13 @@ static void *event_thread(void *arg) {
             if (now - g_stat_since > 5000000000LL) {
                 double dt = (now - g_stat_since) / 1e9;
                 if (g_stat_frames || axr_stat_wait)
-                    axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples",
+                    axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
+                            " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
-                            axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused);
+                            axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
+                            g_stat_button_events, (unsigned long)g_inputs.count, axr_stat_syncs,
+                            axr_stat_unfocused_syncs, axr_stat_pressed);
+                g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
                 axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
                 g_stat_since = now;

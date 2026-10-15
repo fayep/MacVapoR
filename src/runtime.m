@@ -18,6 +18,7 @@
 #include "alvrxr.h"
 
 extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
+extern unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
 
 #define EXPORT __attribute__((visibility("default")))
 
@@ -1023,7 +1024,11 @@ static XrResult xrSyncActions_(XrSession h, const XrActionsSyncInfo *info) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     session *s = (session *)h;
     if (!s->action_sets.count) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
-    if (s->state != XR_SESSION_STATE_FOCUSED) return XR_SESSION_NOT_FOCUSED;
+    axr_stat_syncs++;
+    if (s->state != XR_SESSION_STATE_FOCUSED) {
+        axr_stat_unfocused_syncs++;
+        return XR_SESSION_NOT_FOCUSED;
+    }
     XrTime now = axr_now_ns();
     bool connected = axr_backend_connected();
     for (uint32_t i = 0; i < info->countActiveActionSets; i++) {
@@ -1092,6 +1097,7 @@ static XrResult xrGetActionStateBoolean_(XrSession h, const XrActionStateGetInfo
     action *a = state_action(info, XR_ACTION_TYPE_BOOLEAN_INPUT, &u, &err);
     if (!a) return err;
     st->currentState = a->value[u][0] > 0.5f;
+    if (st->currentState) axr_stat_pressed++;
     st->changedSinceLastSync = a->changed[u];
     st->lastChangeTime = a->change_time[u];
     st->isActive = a->active[u];
