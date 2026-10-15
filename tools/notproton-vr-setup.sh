@@ -5,6 +5,8 @@
 #
 #   tools/notproton-vr-setup.sh APPID 'Game.exe'      e.g. 620980 'Beat Saber.exe'
 #   tools/notproton-vr-setup.sh --undo APPID 'Game.exe'
+#   GFX=dxmt tools/notproton-vr-setup.sh APPID 'Game.exe'   D3D11 games on CrossOver's DXMT,
+#       chosen with the game's graphics option in NotProton; no DXVK is put in place
 #
 # What goes where, and why (NotProton 1.0.3's run script):
 #   - wineopenxr goes into aarch64-windows/ and aarch64-unix/ under the prefix's Steam staging
@@ -13,9 +15,9 @@
 #   - HKCU\Software\Wine\VR is written as a persistent key. The Steam shim creates it volatile
 #     on every launch and leaves it alone when it already exists; without SteamVR it would
 #     mark VR unavailable.
-#   - DXVK's d3d11 goes beside the game with its builtin marker cleared, and an AppDefaults
-#     override makes the game load it: on the FEX runner CrossOver's own DXVK switch never
-#     reaches an ARM64EC process.
+#   - Unless GFX=dxmt, DXVK's d3d11 goes beside the game with its builtin marker cleared, and
+#     an AppDefaults override makes the game load it: on the FEX runner CrossOver's own DXVK
+#     switch never reaches an ARM64EC process. DXMT's switch does, as it is ARM64 itself.
 #   - The native OpenXR loader inside wineopenxr finds alvrxr through the per-user
 #     ~/.config/openxr/1/active_runtime.json, since the run script passes no XR_* variables.
 #
@@ -78,6 +80,10 @@ cp -f "$WOX/aarch64-unix/wineopenxr.so" "$WOX/aarch64-unix/libopenxr_loader.dyli
 # The Khronos loader opens the runtime by its system32 path; Wine then takes the builtin.
 cp -f "$WOX/x86_64-windows/wineopenxr.dll" "$WOX/wineopenxr64.json" "$sys32/"
 
+if [ "${GFX:-dxvk}" = dxmt ]; then
+    rm -f "$game/d3d11.dll"
+    reg delete "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /f 2>/dev/null || true
+else
 python3 -I - "$RUNNER/lib/dxvk/x86_64-windows/d3d11.dll" "$game/d3d11.dll" <<'PY'
 import sys
 b = bytearray(open(sys.argv[1], "rb").read())
@@ -85,9 +91,10 @@ assert b[0x40:0x50] == b"Wine builtin DLL", "not CrossOver's DXVK d3d11"
 b[0x40:0x50] = bytes(16)
 open(sys.argv[2], "wb").write(b)
 PY
+reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /t REG_SZ /d native /f
+fi
 
 reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\windows\system32\wineopenxr64.json' /f
-reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /t REG_SZ /d native /f
 reg add 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0 /f
 # The values wineopenxr_init_registry records for alvrxr under CrossOver (see alvrxr's vulkan.m).
 reg add 'HKCU\Software\Wine\VR' /v state /t REG_DWORD /d 1 /f

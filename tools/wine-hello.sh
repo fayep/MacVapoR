@@ -5,6 +5,7 @@
 #
 #   tools/wine-hello.sh [hello_xr args]     default: -g D3D11
 #   APP='C:\games\x\x.exe' tools/wine-hello.sh [args]   any other app in the prefix
+#   GFX=dxmt tools/wine-hello.sh             D3D11 on CrossOver's DXMT instead of DXVK
 #
 # Overridable: RUNNER, PREFIX, WOX (dir with wineopenxr.dll and wineopenxr.so), HELLO (dir
 # with hello_xr.exe and libopenxr_loader.dll), ALVRXR_JSON.
@@ -88,6 +89,11 @@ else
     [ $# -gt 0 ] || set -- -g D3D11
     cd "$app"
 fi
-export WINEDLLOVERRIDES="d3d11=n"
+if [ "${GFX:-dxvk}" = dxmt ]; then
+    # CrossOver puts its DXMT ahead of the builtins itself; the DXVK copy above stays unused.
+    export CX_GRAPHICS_BACKEND=dxmt
+else
+    export WINEDLLOVERRIDES="d3d11=n"
+fi
 # hello_xr quits on a key press; keep its stdin open.
 sleep 100000 | "$WINELOADER" "$exe" "$@"
