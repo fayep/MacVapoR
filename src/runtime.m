@@ -17,6 +17,8 @@
 
 #include "alvrxr.h"
 
+extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
+
 #define EXPORT __attribute__((visibility("default")))
 
 // ------------------------------------------------------------------------------------ handles
@@ -525,8 +527,8 @@ static const XrPosef IDENTITY = {{0, 0, 0, 1}, {0, 0, 0}};
 static XrResult xrEnumerateReferenceSpaces_(XrSession h, uint32_t cap, uint32_t *n, XrReferenceSpaceType *out) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     static const XrReferenceSpaceType types[] = {XR_REFERENCE_SPACE_TYPE_VIEW, XR_REFERENCE_SPACE_TYPE_LOCAL,
-                                                 XR_REFERENCE_SPACE_TYPE_STAGE};
-    TWO_CALL(cap, n, out, types, 3, out[i_] = types[i_]);
+                                                 XR_REFERENCE_SPACE_TYPE_STAGE, XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR};
+    TWO_CALL(cap, n, out, types, 4, out[i_] = types[i_]);
     return XR_SUCCESS;
 }
 
@@ -544,7 +546,8 @@ static XrResult xrCreateReferenceSpace_(XrSession h, const XrReferenceSpaceCreat
     switch (info->referenceSpaceType) {
     case XR_REFERENCE_SPACE_TYPE_VIEW:
     case XR_REFERENCE_SPACE_TYPE_LOCAL:
-    case XR_REFERENCE_SPACE_TYPE_STAGE: break;
+    case XR_REFERENCE_SPACE_TYPE_STAGE:
+    case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: break;   // core in OpenXR 1.1
     default: return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
     }
     return new_space((session *)h, (space){.kind = SPACE_REFERENCE, .ref = info->referenceSpaceType,
@@ -603,6 +606,9 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked) {
             *tracked = axr_backend_connected();
         } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL) {
             base = local_origin(sp->sess, t);
+        } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR) {
+            base = local_origin(sp->sess, t);   // LOCAL, dropped to the floor
+            base.position.y = 0;
         }
         *out = pmul(base, sp->offset);
         return true;
@@ -629,6 +635,23 @@ static XrResult xrLocateSpace_(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation
     if (ta && tb) loc->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     for (XrBaseOutStructure *n = loc->next; n; n = n->next)
         if (n->type == XR_TYPE_SPACE_VELOCITY) ((XrSpaceVelocity *)n)->velocityFlags = 0;
+    return XR_SUCCESS;
+}
+
+static XrResult xrLocateSpaces_(XrSession h, const XrSpacesLocateInfo *info, XrSpaceLocations *out) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (info->spaceCount != out->locationCount) return XR_ERROR_VALIDATION_FAILURE;
+    XrSpaceVelocities *vel = NULL;
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)out->next; n; n = n->next)
+        if (n->type == XR_TYPE_SPACE_VELOCITIES) vel = (XrSpaceVelocities *)n;
+    for (uint32_t i = 0; i < info->spaceCount; i++) {
+        XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+        XrResult r = xrLocateSpace_(info->spaces[i], info->baseSpace, info->time, &loc);
+        if (r != XR_SUCCESS) return r;
+        out->locations[i].locationFlags = loc.locationFlags;
+        out->locations[i].pose = loc.pose;
+        if (vel && i < vel->velocityCount) vel->velocities[i].velocityFlags = 0;
+    }
     return XR_SUCCESS;
 }
 
@@ -803,6 +826,7 @@ static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameSt
     (void)info;
     session *s = (session *)h;
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
+    axr_stat_wait++;
     st->predictedDisplayTime = axr_wait_frame();
     st->predictedDisplayPeriod = (XrDuration)(1e9 / axr_refresh_hz());
     st->shouldRender = s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED;
@@ -817,6 +841,7 @@ static XrResult xrBeginFrame_(XrSession h, const XrFrameBeginInfo *info) {
 
 static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
+    axr_stat_end++;
     session *s = (session *)h;
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
@@ -826,6 +851,7 @@ static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
         const XrCompositionLayerBaseHeader *l = info->layers[i];
         if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
         const XrCompositionLayerProjection *p = (const XrCompositionLayerProjection *)l;
+        axr_stat_projection++;
         if (p->viewCount != 2) return XR_ERROR_VALIDATION_FAILURE;
         axr_eye_image eyes[2];
         for (int e = 0; e < 2; e++) {
@@ -1205,7 +1231,7 @@ static XrResult xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceL
     X(xrStopHapticFeedback) X(xrGetMetalGraphicsRequirementsKHR) X(xrConvertTimespecTimeToTimeKHR)        \
     X(xrConvertTimeToTimespecTimeKHR) X(xrGetVulkanGraphicsRequirementsKHR) X(xrGetVulkanGraphicsRequirements2KHR)   \
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR)  \
-    X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR)
+    X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR) X(xrLocateSpaces)
 
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
 

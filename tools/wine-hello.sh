@@ -4,6 +4,7 @@
 # wineopenxr comes in through WINEDLLPATH and CrossOver's own DXVK is selected.
 #
 #   tools/wine-hello.sh [hello_xr args]     default: -g D3D11
+#   APP='C:\games\x\x.exe' tools/wine-hello.sh [args]   any other app in the prefix
 #
 # Overridable: RUNNER, PREFIX, WOX (dir with wineopenxr.dll and wineopenxr.so), HELLO (dir
 # with hello_xr.exe and libopenxr_loader.dll), ALVRXR_JSON.
@@ -79,8 +80,14 @@ mkdir -p "$app"
 cp -f "$HELLO/src/tests/hello_xr/hello_xr.exe" "$HELLO/src/loader/libopenxr_loader.dll" \
     "$MINGW/lib/libstdc++-6.dll" "$MINGW/lib/libgcc_s_seh-1.dll" "$MINGW/bin/libwinpthread-1.dll" "$app/"
 
-[ $# -gt 0 ] || set -- -g D3D11
-cd "$app"
+if [ -n "${APP:-}" ]; then
+    exe=$APP
+    cd "$PREFIX/drive_c"
+else
+    exe='C:\alvrxr-test\hello_xr.exe'
+    [ $# -gt 0 ] || set -- -g D3D11
+    cd "$app"
+fi
 export WINEDLLOVERRIDES="d3d11=n"
 # hello_xr quits on a key press; keep its stdin open.
-sleep 100000 | "$WINELOADER" 'C:\alvrxr-test\hello_xr.exe' "$@"
+sleep 100000 | "$WINELOADER" "$exe" "$@"

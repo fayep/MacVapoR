@@ -6,6 +6,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -156,6 +158,7 @@ static int64_t g_last_wait, g_last_display;
 
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_inputs;
 static uint64_t g_input_generation;
+static int g_snapshot_request, g_snapshot_done;   // tune.json "snapshot": n saves the next frame's eye images
 
 // --------------------------------------------------------------------------------- foveation
 
@@ -206,7 +209,8 @@ static NSMutableData *g_last_config;
 _Static_assert(sizeof(compose_uniform) == 80 && __builtin_offsetof(compose_uniform, ffr) == 40, "Compose layout");
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_pts_to_ts;
 static float g_bitrate = 30e6f;
-static unsigned g_stat_frames, g_stat_bytes;
+static unsigned g_stat_frames, g_stat_bytes, g_stat_submit_calls, g_stat_not_ready;
+unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;
 static int64_t g_stat_since;
 
 id<MTLDevice> axr_metal_device(void) {
@@ -339,10 +343,63 @@ static uint64_t client_ts_for(int64_t xr_time) {
     return best;
 }
 
+// Copies each eye's layer as the app submitted it and writes it as a PNG, to see what the app
+// actually rendered into each layer.
+static void snapshot_eyes(const axr_eye_image eyes[2], id<MTLCommandQueue> queue, int n) {
+    for (int e = 0; e < 2; e++) {
+        id<MTLTexture> src = eyes[e].texture;
+        axr_log("snapshot %d eye %d: type %lu, %lux%lu, %lu layers, format %lu, slice %u, rect %d,%d %dx%d", n, e,
+                (unsigned long)src.textureType, (unsigned long)src.width, (unsigned long)src.height,
+                (unsigned long)src.arrayLength, (unsigned long)src.pixelFormat, eyes[e].slice, eyes[e].x, eyes[e].y,
+                eyes[e].width, eyes[e].height);
+        MTLPixelFormat fmt = src.pixelFormat;
+        bool bgra = fmt == MTLPixelFormatBGRA8Unorm || fmt == MTLPixelFormatBGRA8Unorm_sRGB;
+        bool rgba = fmt == MTLPixelFormatRGBA8Unorm || fmt == MTLPixelFormatRGBA8Unorm_sRGB;
+        if (!bgra && !rgba) { axr_log("snapshot: format %lu not handled", (unsigned long)fmt); continue; }
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:eyes[e].width
+                                                                                    height:eyes[e].height mipmapped:NO];
+        d.storageMode = MTLStorageModeShared;
+        id<MTLTexture> dst = [src.device newTextureWithDescriptor:d];
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        [blit copyFromTexture:src sourceSlice:eyes[e].slice sourceLevel:0 sourceOrigin:MTLOriginMake(eyes[e].x, eyes[e].y, 0)
+                   sourceSize:MTLSizeMake(eyes[e].width, eyes[e].height, 1) toTexture:dst destinationSlice:0
+             destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [blit endEncoding];
+        NSString *path = [g_config_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"snapshot-%d-eye%d.png", n, e]];
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> _) {
+            size_t w = dst.width, h = dst.height, row = w * 4;
+            NSMutableData *px = [NSMutableData dataWithLength:row * h];
+            [dst getBytes:px.mutableBytes bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (CGBitmapInfo)kCGImageAlphaNoneSkipLast;
+            CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, w, h, 8, row, cs, info);
+            CGImageRef img = CGBitmapContextCreateImage(ctx);
+            CGImageDestinationRef out = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path],
+                                                                        CFSTR("public.png"), 1, NULL);
+            CGImageDestinationAddImage(out, img, NULL);
+            CGImageDestinationFinalize(out);
+            CFRelease(out); CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+            axr_log("snapshot written: %s", path.UTF8String);
+        }];
+        [cmd commit];
+    }
+}
+
 void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommandQueue> queue) {
+    pthread_mutex_lock(&g_lock);
+    int snap = g_snapshot_request > g_snapshot_done ? (g_snapshot_done = g_snapshot_request) : 0;
+    pthread_mutex_unlock(&g_lock);
+    if (snap) snapshot_eyes(eyes, queue, snap);
+
     pthread_mutex_lock(&g_lock);
     bool ready = (g_connected || g_dump) && g_encoder && g_pool;
     uint64_t ts = g_dump ? (uint64_t)display_time : client_ts_for(display_time);
+    // The client often sends no tracking until it has decoded a frame, so without this the
+    // first frames would have no sample to carry and it would never get one. It takes ours.
+    if (!ts && g_connected) ts = (uint64_t)display_time;
+    g_stat_submit_calls++;
+    if (!ready) g_stat_not_ready++;
     compose_uniform u = {.ffr = g_ffr};
     bool idr = g_force_idr;
     uint32_t out_w = g_out_w, out_h = g_out_h;
@@ -441,6 +498,8 @@ static bool finite_fov(const AlvrFov *f) {
     return true;
 }
 
+static void read_tune(void);
+
 static void *event_thread(void *arg) {
     (void)arg;
     AlvrEvent ev;
@@ -533,6 +592,7 @@ static void *event_thread(void *arg) {
         int64_t now = axr_now_ns();
         if (now - last_setup_check > 1000000000) {
             last_setup_check = now;
+            read_tune();
             // server_core only asks its own dashboard to restart after renegotiating, so restart
             // in place when the stream settings it saved change.
             if (![stream_setup_raw() isEqualToString:g_setup_raw]) {
@@ -543,12 +603,14 @@ static void *event_thread(void *arg) {
                 pthread_mutex_unlock(&g_lock);
                 start_core();
             }
-            if (g_stat_frames && now - g_stat_since > 5000000000LL) {
+            if (now - g_stat_since > 5000000000LL) {
                 double dt = (now - g_stat_since) / 1e9;
-                axr_log("%.0f fps, %.1f Mbps", g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6);
-                g_stat_frames = g_stat_bytes = 0;
-                g_stat_since = now;
-            } else if (!g_stat_frames) {
+                if (g_stat_frames || axr_stat_wait)
+                    axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready)",
+                            g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
+                            axr_stat_projection, g_stat_submit_calls, g_stat_not_ready);
+                g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
+                axr_stat_wait = axr_stat_end = axr_stat_projection = 0;
                 g_stat_since = now;
             }
         }
@@ -689,10 +751,39 @@ axr_motion axr_device_motion(int device, int64_t time) {
     return m;
 }
 
+// Stereo tuning, read from <config>/tune.json while running: {"ipd_scale":1, "fov_scale":1,
+// "swap_eyes":false}. For finding which of the client's view numbers the picture disagrees with.
+static float g_ipd_scale = 1, g_fov_scale = 1;
+static bool g_swap_eyes;
+
+static void read_tune(void) {
+    NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
+    NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    float ipd = t[@"ipd_scale"] ? [t[@"ipd_scale"] floatValue] : 1, fov = t[@"fov_scale"] ? [t[@"fov_scale"] floatValue] : 1;
+    bool swap = [t[@"swap_eyes"] boolValue];
+    int snap = [t[@"snapshot"] intValue];
+    pthread_mutex_lock(&g_lock);
+    g_snapshot_request = snap;
+    bool changed = ipd != g_ipd_scale || fov != g_fov_scale || swap != g_swap_eyes;
+    g_ipd_scale = ipd; g_fov_scale = fov; g_swap_eyes = swap;
+    pthread_mutex_unlock(&g_lock);
+    if (changed) axr_log("tune: ipd x%.3f, fov x%.3f%s", ipd, fov, swap ? ", eyes swapped" : "");
+}
+
 axr_views axr_current_views(void) {
     pthread_mutex_lock(&g_lock);
     axr_views v = g_views;
+    float ipd = g_ipd_scale, fov = g_fov_scale;
+    bool swap = g_swap_eyes;
     pthread_mutex_unlock(&g_lock);
+    for (int e = 0; e < 2; e++) {
+        for (int k = 0; k < 3; k++) v.eye_in_head[e].position[k] *= ipd;
+        for (int k = 0; k < 4; k++) v.fov[e][k] = atanf(tanf(v.fov[e][k]) * fov);
+    }
+    if (swap) {
+        axr_pose p = v.eye_in_head[0]; v.eye_in_head[0] = v.eye_in_head[1]; v.eye_in_head[1] = p;
+        float f[4]; memcpy(f, v.fov[0], sizeof f); memcpy(v.fov[0], v.fov[1], sizeof f); memcpy(v.fov[1], f, sizeof f);
+    }
     return v;
 }
 
