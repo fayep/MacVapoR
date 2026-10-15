@@ -7,6 +7,9 @@
 #   tools/notproton-vr-setup.sh --undo APPID 'Game.exe'
 #   GFX=dxmt tools/notproton-vr-setup.sh APPID 'Game.exe'   D3D11 games on CrossOver's DXMT,
 #       chosen with the game's graphics option in NotProton; no DXVK is put in place
+#   OC=/path/to/openvr_api.dll tools/notproton-vr-setup.sh APPID 'Game.exe'
+#       an OpenVR game: OpenComposite's 64-bit openvr_api.dll replaces the game's own, which is
+#       kept as openvr_api.dll.orig and put back by --undo
 #
 # What goes where, and why (NotProton 1.0.3's run script):
 #   - wineopenxr goes into aarch64-windows/ and aarch64-unix/ under the prefix's Steam staging
@@ -18,6 +21,8 @@
 #   - Unless GFX=dxmt, DXVK's d3d11 goes beside the game with its builtin marker cleared, and
 #     an AppDefaults override makes the game load it: on the FEX runner CrossOver's own DXVK
 #     switch never reaches an ARM64EC process. DXMT's switch does, as it is ARM64 itself.
+#   - OpenComposite gets initUsingVulkan=false, so its session before the game's first frame is
+#     a D3D11 one like the game's, rather than Windows Vulkan through wineopenxr.
 #   - The native OpenXR loader inside wineopenxr finds alvrxr through the per-user
 #     ~/.config/openxr/1/active_runtime.json, since the run script passes no XR_* variables.
 #
@@ -58,7 +63,23 @@ fi
 
 reg() { "$WINELOADER" reg "$@" >/dev/null; }
 
+# The game's own 64-bit openvr_api.dlls, or their kept originals.
+openvr_dlls() {
+    find "$game" \( -iname openvr_api.dll -o -iname openvr_api.dll.orig \) | sed 's/\.orig$//' | sort -u |
+        while IFS= read -r f; do
+            orig=$f.orig
+            [ -f "$orig" ] || orig=$f
+            file "$orig" | grep -q "PE32+" && printf '%s\n' "$f"
+        done
+}
+
 if [ $undo -eq 1 ]; then
+    openvr_dlls | while IFS= read -r f; do
+        if [ -f "$f.orig" ]; then
+            mv -f "$f.orig" "$f"
+            rm -f "$(dirname "$f")/opencomposite.ini"
+        fi
+    done
     rm -rf "$staging/aarch64-windows/wineopenxr.dll" "$staging/aarch64-unix/wineopenxr.so" \
         "$staging/aarch64-unix/libopenxr_loader.dylib" "$sys32/wineopenxr.dll" "$sys32/wineopenxr64.json" \
         "$game/d3d11.dll"
@@ -92,6 +113,21 @@ b[0x40:0x50] = bytes(16)
 open(sys.argv[2], "wb").write(b)
 PY
 reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /t REG_SZ /d native /f
+fi
+
+if [ -n "${OC:-}" ]; then
+    file "$OC" | grep -q "PE32+" || { echo "$OC is not a 64-bit DLL" >&2; exit 1; }
+    strings "$OC" | grep -q "IVRCompositor_" || { echo "$OC does not look like OpenComposite" >&2; exit 1; }
+    list=$(mktemp)
+    openvr_dlls > "$list"
+    [ -s "$list" ] || { rm -f "$list"; echo "no 64-bit openvr_api.dll in $game" >&2; exit 1; }
+    while IFS= read -r f; do
+        [ -f "$f.orig" ] || cp -p "$f" "$f.orig"
+        cp -f "$OC" "$f"
+        printf 'initUsingVulkan=false\n' > "$(dirname "$f")/opencomposite.ini"
+        echo "OpenComposite in place of ${f#"$game"/}"
+    done < "$list"
+    rm -f "$list"
 fi
 
 reg add 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /t REG_SZ /d 'C:\windows\system32\wineopenxr64.json' /f
