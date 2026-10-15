@@ -41,10 +41,18 @@ WOX=${WOX:-$HOME/Source/NotProton/build/wineopenxr-out}
 ALVRXR_JSON=${ALVRXR_JSON:-$here/out/alvrxr.json}
 STEAM=${STEAM:-$HOME/Library/Application Support/Steam}
 
-prefix="$STEAM/steamapps/compatdata/$appid/pfx"
-[ -f "$prefix/system.reg" ] || { echo "no prefix at $prefix; launch the game once first" >&2; exit 1; }
-game_dir=$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$STEAM/steamapps/appmanifest_$appid.acf")
-game="$STEAM/steamapps/common/$game_dir"
+# The game may be in any Steam library; its prefix is in that library's compatdata or the main one's.
+library=
+for lib in "$STEAM" $(sed -n 's/.*"path"[[:space:]]*"\(.*\)".*/\1/p' "$STEAM/steamapps/libraryfolders.vdf" | tr ' ' '\001'); do
+    lib=$(printf '%s' "$lib" | tr '\001' ' ')
+    [ -f "$lib/steamapps/appmanifest_$appid.acf" ] && { library=$lib; break; }
+done
+[ -n "$library" ] || { echo "app $appid is not installed in any Steam library" >&2; exit 1; }
+prefix="$library/steamapps/compatdata/$appid/pfx"
+[ -f "$prefix/system.reg" ] || prefix="$STEAM/steamapps/compatdata/$appid/pfx"
+[ -f "$prefix/system.reg" ] || { echo "no prefix for $appid; launch the game once first" >&2; exit 1; }
+game_dir=$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$library/steamapps/appmanifest_$appid.acf")
+game="$library/steamapps/common/$game_dir"
 [ -f "$game/$exe" ] || { echo "no $exe in $game" >&2; exit 1; }
 staging="$prefix/drive_c/Program Files (x86)/Steam"
 sys32="$prefix/drive_c/windows/system32"
