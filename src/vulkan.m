@@ -8,12 +8,30 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <string.h>
 
 #include "vk.h"
 
 static PFN_vkGetInstanceProcAddr g_gipa;
 static VkInstance g_instance;
+
+// Talking to MoltenVK with no loader in between, as under CrossOver. Wine only lets a Windows
+// app enable extensions it knows how to wrap, so VK_EXT_metal_objects is out of reach there;
+// MoltenVK's own exports give the same objects for any image or queue.
+static bool g_mvk_direct, g_in_wine;
+static VkResult (*p_vkGetMTLTextureMVK)(VkImage, id<MTLTexture> __autoreleasing *);
+static VkResult (*p_vkGetMTLCommandQueueMVK)(VkQueue, id<MTLCommandQueue> __autoreleasing *);
+
+static void detect_direct(void) {
+    Dl_info info;
+    if (!dladdr((void *)g_gipa, &info) || !info.dli_fname || !strstr(info.dli_fname, "MoltenVK")) return;
+    void *h = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    p_vkGetMTLTextureMVK = h ? dlsym(h, "vkGetMTLTextureMVK") : NULL;
+    p_vkGetMTLCommandQueueMVK = h ? dlsym(h, "vkGetMTLCommandQueueMVK") : NULL;
+    g_mvk_direct = p_vkGetMTLTextureMVK && p_vkGetMTLCommandQueueMVK;
+    if (g_mvk_direct) axr_log("vulkan: MoltenVK without a loader, using its own Metal exports");
+}
 
 #define INSTANCE_FN(name) static PFN_##name name##_
 INSTANCE_FN(vkCreateInstance);
@@ -37,12 +55,28 @@ static struct {
 } g_dev;
 
 bool axr_vk_load(PFN_vkGetInstanceProcAddr gipa) {
-    if (gipa) { g_gipa = gipa; return true; }
+    if (gipa) { g_gipa = gipa; detect_direct(); return true; }
     if (g_gipa) return true;
     // A library the process already has, loader first: a native app's handles are the loader's.
     NSString *env = NSProcessInfo.processInfo.environment[@"ALVRXR_VULKAN_LIBRARY"];
-    const char *candidates[] = {env.UTF8String, "libvulkan.1.dylib", "/opt/homebrew/lib/libvulkan.1.dylib",
-                                "libMoltenVK.dylib", NULL};
+    // Inside Wine the app's Vulkan is winevulkan on top of MoltenVK, which Wine loads by name
+    // with no loader; it may not be loaded yet, and the same name finds the same library.
+    void *wine_dbg = dlsym(RTLD_DEFAULT, "__wine_dbg_output");
+    g_in_wine = wine_dbg != NULL;
+    // CrossOver keeps it beside the wine directory: lib/wine/<arch>-unix/ntdll.so, lib/<arch>/.
+    char beside_wine[PATH_MAX] = "";
+    Dl_info ntdll;
+    if (g_in_wine && dladdr(wine_dbg, &ntdll) && ntdll.dli_fname) {
+        NSString *lib = @(ntdll.dli_fname).stringByDeletingLastPathComponent.stringByDeletingLastPathComponent
+                            .stringByDeletingLastPathComponent;
+        NSString *arch = [@(ntdll.dli_fname).stringByDeletingLastPathComponent.lastPathComponent
+            hasPrefix:@"aarch64"] ? @"aarch64" : @"x86_64";
+        snprintf(beside_wine, sizeof beside_wine, "%s/%s/libMoltenVK.dylib", lib.UTF8String, arch.UTF8String);
+    }
+    const char *native[] = {env.UTF8String, "libvulkan.1.dylib", "/opt/homebrew/lib/libvulkan.1.dylib",
+                            "libMoltenVK.dylib", NULL};
+    const char *wine[] = {env.UTF8String, "libMoltenVK.dylib", beside_wine[0] ? beside_wine : NULL, NULL, NULL};
+    const char **candidates = g_in_wine ? wine : native;
     for (int pass = 0; pass < 2 && !g_gipa; pass++) {
         for (int i = 0; i < 4 && !g_gipa; i++) {
             if (!candidates[i]) continue;
@@ -54,6 +88,7 @@ bool axr_vk_load(PFN_vkGetInstanceProcAddr gipa) {
         }
     }
     if (!g_gipa) axr_log("vulkan: no Vulkan library found");
+    else detect_direct();
     return g_gipa != NULL;
 }
 
@@ -79,12 +114,19 @@ static void load_device(VkDevice dev) {
     DLOAD(bind, vkBindImageMemory);
     DLOAD(get_queue, vkGetDeviceQueue);
     DLOAD(export_objects, vkExportMetalObjectsEXT);
-    if (!g_dev.export_objects) axr_log("vulkan: the device lacks VK_EXT_metal_objects; frames cannot be shown");
+    if (!g_dev.export_objects && !g_mvk_direct) axr_log("vulkan: the device lacks VK_EXT_metal_objects; frames cannot be shown");
 }
 
 // XR_KHR_vulkan_enable's extension lists. Portability is for MoltenVK behind a loader.
-const char *axr_vk_instance_extensions(void) { return "VK_KHR_portability_enumeration"; }
-const char *axr_vk_device_extensions(void) { return "VK_EXT_metal_objects VK_KHR_portability_subset"; }
+const char *axr_vk_instance_extensions(void) {
+    axr_vk_load(NULL);
+    // Never empty: wineopenxr and DXVK both split "" into one empty extension name.
+    return g_mvk_direct || g_in_wine ? "VK_KHR_get_physical_device_properties2" : "VK_KHR_portability_enumeration";
+}
+const char *axr_vk_device_extensions(void) {
+    axr_vk_load(NULL);
+    return g_mvk_direct || g_in_wine ? "VK_KHR_maintenance1" : "VK_EXT_metal_objects VK_KHR_portability_subset";
+}
 
 VkResult axr_vk_physical_device(VkInstance inst, VkPhysicalDevice *out) {
     if (!axr_vk_load(NULL)) return VK_ERROR_INITIALIZATION_FAILED;
@@ -158,9 +200,14 @@ id<MTLCommandQueue> axr_vk_session_queue(VkInstance inst, VkDevice dev, uint32_t
     if (!axr_vk_load(NULL)) return nil;
     if (inst != g_instance) load_instance(inst);
     load_device(dev);
-    if (!g_dev.export_objects) return nil;
     VkQueue q = VK_NULL_HANDLE;
     g_dev.get_queue(dev, family, index, &q);
+    if (g_mvk_direct) {
+        id<MTLCommandQueue> mq = nil;
+        p_vkGetMTLCommandQueueMVK(q, &mq);
+        return mq;
+    }
+    if (!g_dev.export_objects) return nil;
     VkExportMetalDeviceInfoEXT di = {VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT};
     VkExportMetalCommandQueueInfoEXT qi = {VK_STRUCTURE_TYPE_EXPORT_METAL_COMMAND_QUEUE_INFO_EXT, &di, q};
     VkExportMetalObjectsInfoEXT objs = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &qi};
@@ -177,7 +224,7 @@ static bool is_depth(int64_t f) {
 
 id<MTLTexture> axr_vk_create_image(VkDevice dev, const XrSwapchainCreateInfo *ci, VkImage *image, VkDeviceMemory *memory) {
     load_device(dev);
-    if (!g_dev.export_objects) return nil;
+    if (!g_dev.export_objects && !g_mvk_direct) return nil;
     bool depth = is_depth(ci->format);
     VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT;   // the compositor samples every image
     if (ci->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -192,7 +239,7 @@ id<MTLTexture> axr_vk_create_image(VkDevice dev, const XrSwapchainCreateInfo *ci
                                            VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT};
     VkImageCreateInfo ii = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = &ex,
+        .pNext = g_mvk_direct ? NULL : &ex,
         .flags = (ci->usageFlags & XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = (VkFormat)ci->format,
@@ -223,6 +270,11 @@ id<MTLTexture> axr_vk_create_image(VkDevice dev, const XrSwapchainCreateInfo *ci
         return nil;
     }
     g_dev.bind(dev, *image, *memory, 0);
+    if (g_mvk_direct) {
+        id<MTLTexture> tex = nil;
+        p_vkGetMTLTextureMVK(*image, &tex);
+        return tex;
+    }
     VkExportMetalTextureInfoEXT ti = {VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT, NULL, *image, VK_NULL_HANDLE,
                                       VK_NULL_HANDLE, VK_IMAGE_ASPECT_PLANE_0_BIT};
     VkExportMetalObjectsInfoEXT objs = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &ti};
