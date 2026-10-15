@@ -4,6 +4,7 @@
 # launched once so its prefix exists.
 #
 #   tools/notproton-vr-setup.sh APPID 'Game.exe'      e.g. 620980 'Beat Saber.exe'
+#       (the executable's path inside the game folder, e.g. 450390 TheLab/win64/TheLab.exe)
 #   tools/notproton-vr-setup.sh --undo APPID 'Game.exe'
 #   GFX=dxmt tools/notproton-vr-setup.sh APPID 'Game.exe'   D3D11 games on CrossOver's DXMT,
 #       chosen with the game's graphics option in NotProton; no DXVK is put in place
@@ -54,6 +55,10 @@ prefix="$library/steamapps/compatdata/$appid/pfx"
 game_dir=$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$library/steamapps/appmanifest_$appid.acf")
 game="$library/steamapps/common/$game_dir"
 [ -f "$game/$exe" ] || { echo "no $exe in $game" >&2; exit 1; }
+# The executable may be in a subfolder, as The Lab's TheLab/win64/TheLab.exe; Wine's per-app
+# settings go by its name, and DXVK's d3d11 goes beside it.
+exe_name=$(basename "$exe")
+exe_dir=$(dirname "$game/$exe")
 staging="$prefix/drive_c/Program Files (x86)/Steam"
 sys32="$prefix/drive_c/windows/system32"
 
@@ -64,7 +69,7 @@ export WINESERVER="$RUNNER/bin/wineserver-arm64"
 export WINEDLLPATH="$RUNNER/lib/wine/x86_64-windows:$wine_unix"
 export WINEPREFIX="$prefix" WINEDEBUG=-all
 # The game's own process; matching the prefix path would also catch anything tailing its logs.
-if pgrep -fi "$exe" >/dev/null 2>&1; then
+if pgrep -fi "$exe_name" >/dev/null 2>&1; then
     echo "close the game first" >&2
     exit 1
 fi
@@ -90,9 +95,9 @@ if [ $undo -eq 1 ]; then
     done
     rm -rf "$staging/aarch64-windows/wineopenxr.dll" "$staging/aarch64-unix/wineopenxr.so" \
         "$staging/aarch64-unix/libopenxr_loader.dylib" "$sys32/wineopenxr.dll" "$sys32/wineopenxr64.json" \
-        "$game/d3d11.dll"
+        "$exe_dir/d3d11.dll"
     reg delete 'HKCU\Software\Wine\VR' /f || true
-    reg delete "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /f || true
+    reg delete "HKCU\\Software\\Wine\\AppDefaults\\$exe_name\\DllOverrides" /v d3d11 /f || true
     reg delete 'HKLM\Software\Khronos\OpenXR\1' /v ActiveRuntime /f || true
     "$WINESERVER" -w
     echo "removed from $prefix (left ~/.config/openxr/1/active_runtime.json in place)"
@@ -110,17 +115,17 @@ cp -f "$WOX/aarch64-unix/wineopenxr.so" "$WOX/aarch64-unix/libopenxr_loader.dyli
 cp -f "$WOX/x86_64-windows/wineopenxr.dll" "$WOX/wineopenxr64.json" "$sys32/"
 
 if [ "${GFX:-dxvk}" = dxmt ]; then
-    rm -f "$game/d3d11.dll"
-    reg delete "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /f 2>/dev/null || true
+    rm -f "$exe_dir/d3d11.dll"
+    reg delete "HKCU\\Software\\Wine\\AppDefaults\\$exe_name\\DllOverrides" /v d3d11 /f 2>/dev/null || true
 else
-python3 -I - "$RUNNER/lib/dxvk/x86_64-windows/d3d11.dll" "$game/d3d11.dll" <<'PY'
+python3 -I - "$RUNNER/lib/dxvk/x86_64-windows/d3d11.dll" "$exe_dir/d3d11.dll" <<'PY'
 import sys
 b = bytearray(open(sys.argv[1], "rb").read())
 assert b[0x40:0x50] == b"Wine builtin DLL", "not CrossOver's DXVK d3d11"
 b[0x40:0x50] = bytes(16)
 open(sys.argv[2], "wb").write(b)
 PY
-reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe\\DllOverrides" /v d3d11 /t REG_SZ /d native /f
+reg add "HKCU\\Software\\Wine\\AppDefaults\\$exe_name\\DllOverrides" /v d3d11 /t REG_SZ /d native /f
 fi
 
 if [ -n "${OC:-}" ]; then
