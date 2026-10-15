@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sys/time.h>
 
 #include "alvr_capi.h"
 #include "alvrxr.h"
@@ -154,7 +155,10 @@ static bool g_have_offset;
 enum { FRAME_RING = 32 };
 static struct { int64_t xr_time; uint64_t client_ts; } g_frames[FRAME_RING];
 static unsigned g_frame_next;
-static int64_t g_last_wait, g_last_display;
+static int64_t g_last_wait, g_last_display, g_last_sample_ns;
+static uint64_t g_last_frame_ts;
+static pthread_cond_t g_sample_cond = PTHREAD_COND_INITIALIZER;
+unsigned axr_stat_reused;
 
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_inputs;
 static uint64_t g_input_generation;
@@ -544,6 +548,8 @@ static void *event_thread(void *arg) {
                 double offset = (double)axr_now_ns() - (double)ts;
                 pthread_mutex_lock(&g_lock);
                 if (ts > g_newest_ts) g_newest_ts = ts;
+                g_last_sample_ns = axr_now_ns();
+                pthread_cond_broadcast(&g_sample_cond);
                 if (g_tracking_real) g_samples_since_real++;
                 // Smoothed, since each sample's arrival carries network jitter.
                 g_clock_offset = g_have_offset ? g_clock_offset + (offset - g_clock_offset) * 0.05 : offset;
@@ -606,11 +612,11 @@ static void *event_thread(void *arg) {
             if (now - g_stat_since > 5000000000LL) {
                 double dt = (now - g_stat_since) / 1e9;
                 if (g_stat_frames || axr_stat_wait)
-                    axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready)",
+                    axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
-                            axr_stat_projection, g_stat_submit_calls, g_stat_not_ready);
+                            axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused);
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
-                axr_stat_wait = axr_stat_end = axr_stat_projection = 0;
+                axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
                 g_stat_since = now;
             }
         }
@@ -697,25 +703,50 @@ void axr_recommended_eye_size(uint32_t *w, uint32_t *h) {
 
 // ------------------------------------------------------------------------------ frame timing
 
+// Paced by the headset: the client sends one tracking sample per frame it displays, so a frame
+// starts when a sample newer than the last frame's arrives, and every frame gets its own
+// sample. Without samples (no headset, or the client not tracking yet) a plain timer paces.
 int64_t axr_wait_frame(void) {
     int64_t period = (int64_t)(1e9 / axr_refresh_hz());
-    int64_t now = axr_now_ns();
-    int64_t next = g_last_wait + period;
-    if (next < now - period) next = now;   // fell behind: start again from now
-    if (next > now) {
-        struct timespec d = {(next - now) / 1000000000, (next - now) % 1000000000};
-        nanosleep(&d, NULL);
+    pthread_mutex_lock(&g_lock);
+    bool tracking = g_connected && g_have_offset && axr_now_ns() - g_last_sample_ns < 100000000;
+    if (tracking) {
+        // Up to a frame and a half; a late sample is better met with the newest we have.
+        int64_t deadline = axr_now_ns() + period * 3 / 2;
+        while (g_newest_ts <= g_last_frame_ts) {
+            int64_t left = deadline - axr_now_ns();
+            if (left <= 0) break;
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            int64_t abs_ns = (int64_t)tv.tv_sec * 1000000000 + tv.tv_usec * 1000 + left;
+            struct timespec until = {abs_ns / 1000000000, abs_ns % 1000000000};
+            pthread_cond_timedwait(&g_sample_cond, &g_lock, &until);
+        }
+        g_last_wait = axr_now_ns();
     }
-    g_last_wait = next;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!tracking) {
+        int64_t now = axr_now_ns();
+        int64_t next = g_last_wait + period;
+        if (next < now - period) next = now;   // fell behind: start again from now
+        if (next > now) {
+            struct timespec d = {(next - now) / 1000000000, (next - now) % 1000000000};
+            nanosleep(&d, NULL);
+        }
+        g_last_wait = next;
+    }
 
     pthread_mutex_lock(&g_lock);
     int64_t display;
     uint64_t ts = 0;
     if (g_connected && g_have_offset && g_newest_ts) {
         ts = g_newest_ts;
+        if (ts == g_last_frame_ts) axr_stat_reused++;
+        g_last_frame_ts = ts;
         display = (int64_t)((double)ts + g_clock_offset);
     } else {
-        display = next + 2 * period;
+        display = g_last_wait + 2 * period;
     }
     if (display <= g_last_display) display = g_last_display + 1;   // display times must rise
     g_last_display = display;
