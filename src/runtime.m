@@ -85,7 +85,7 @@ struct session {
     bool running, exit_requested;
     NSMutableArray<NSValue *> *action_sets;
     XrPath profile;                          // active interaction profile
-    float local_height;                      // LOCAL's origin above STAGE's
+    XrPosef local;                           // LOCAL's origin in STAGE
     bool local_from_headset;
 };
 
@@ -423,7 +423,7 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     s->vulkan = vk != NULL;
     s->vk_device = vk ? vk->device : VK_NULL_HANDLE;
     s->action_sets = [NSMutableArray array];
-    s->local_height = 1.6f;
+    s->local = (XrPosef){{0, 0, 0, 1}, {0, 1.6f, 0}};
     g_session = s;
     set_state(s, XR_SESSION_STATE_IDLE);
     set_state(s, XR_SESSION_STATE_READY);
@@ -565,20 +565,31 @@ static XrResult xrDestroySpace_(XrSpace h) {
     return XR_SUCCESS;
 }
 
-// LOCAL sits at the user's eye height above STAGE's floor origin. Until the headset reports a
-// real pose that height is a guess, so it is taken once from the first real head pose.
-static float local_height(session *s, XrTime t) {
+// LOCAL is where the user's head was, facing where it faced but level. Until the headset reports
+// a real pose that is a guess, so it is taken once from the first real head pose, and the app is
+// told the space moved.
+static XrPosef local_origin(session *s, XrTime t) {
     if (!s->local_from_headset && axr_backend_tracking()) {
         axr_motion head = axr_device_motion(AXR_HEAD, t);
         bool placeholder = head.pose.position[0] == 0 && head.pose.position[1] == 1.2f && head.pose.position[2] == 0;
         if (head.valid && head.pose.position[1] > 0.3f && !placeholder) {
-            s->local_height = head.pose.position[1];
+            XrPosef h = from_axr(head.pose);
+            XrVector3f fwd = qrot(h.orientation, (XrVector3f){0, 0, -1});
+            float yaw = atan2f(-fwd.x, -fwd.z);
+            XrPosef origin = {{0, sinf(yaw / 2), 0, cosf(yaw / 2)}, h.position};
+            XrEventDataReferenceSpaceChangePending ev = {XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING, NULL,
+                                                         (XrSession)s, XR_REFERENCE_SPACE_TYPE_LOCAL, t, XR_TRUE,
+                                                         pmul(pinv(s->local), origin)};
+            pthread_mutex_lock(&g_lock);
+            push_event(&ev, sizeof ev);
+            pthread_mutex_unlock(&g_lock);
+            s->local = origin;
             s->local_from_headset = true;
-            axr_log("LOCAL space at %.3f m above the floor (head at %.3f, %.3f)", s->local_height,
-                    head.pose.position[0], head.pose.position[2]);
+            axr_log("LOCAL space at the head: (%.3f, %.3f, %.3f), yaw %.0f deg", origin.position.x, origin.position.y,
+                    origin.position.z, yaw * 180 / M_PI);
         }
     }
-    return s->local_height;
+    return s->local;
 }
 
 // A space's pose in STAGE, and whether it is tracked right now.
@@ -591,7 +602,7 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked) {
             base = from_axr(head.pose);
             *tracked = axr_backend_connected();
         } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL) {
-            base.position.y = local_height(sp->sess, t);
+            base = local_origin(sp->sess, t);
         }
         *out = pmul(base, sp->offset);
         return true;
