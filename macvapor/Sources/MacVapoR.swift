@@ -13,6 +13,7 @@ enum Paths {
     static let version = support.appending(path: "version")
     static let openComposite = support.appending(path: "opencomposite/openvr_api.dll")
     static let session = home.appending(path: "Library/Application Support/alvrxr/session.json")
+    static let height = home.appending(path: "Library/Application Support/alvrxr/height.json")
     static let activeRuntime = home.appending(path: ".config/openxr/1/active_runtime.json")
     static let runner = home.appending(path: "Library/Application Support/notproton/runners/current")
     static let steam = home.appending(path: "Library/Application Support/Steam")
@@ -142,10 +143,9 @@ final class Model: ObservableObject {
             headsets = []
             return
         }
-        let mode = ((json["session_settings"] as? [String: Any])?["headset"] as? [String: Any])?["position_recentering_mode"]
-            as? [String: Any]
-        seatedEyeHeight = mode?["variant"] as? String == "Local"
-            ? ((mode?["Local"] as? [String: Any])?["view_height"] as? Double ?? 1.5) : nil
+        seatedEyeHeight = (try? Data(contentsOf: Paths.height))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            .flatMap { $0["eye_height"] as? Double }
         guard let clients = json["client_connections"] as? [String: [String: Any]] else {
             headsets = []
             return
@@ -155,18 +155,21 @@ final class Model: ObservableObject {
         }.sorted { $0.id < $1.id }
     }
 
-    /// ALVR's position recentering: the real floor for standing play, or the head put at a fixed
-    /// height for seated play. Read when a game starts.
+    /// The real floor for standing play, or the eyes put at a fixed height for seated play. The
+    /// runtime applies it, from height.json, when a game starts: ALVR's own recentering does not
+    /// run with the visionOS client, so ALVR is left on the real floor.
     func setSeatedEyeHeight(_ height: Double?) {
+        if let height {
+            try? JSONSerialization.data(withJSONObject: ["eye_height": height]).write(to: Paths.height, options: .atomic)
+        } else {
+            try? FileManager.default.removeItem(at: Paths.height)
+        }
         guard let data = try? Data(contentsOf: Paths.session),
               var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               var settings = json["session_settings"] as? [String: Any],
               var headset = settings["headset"] as? [String: Any],
               var mode = headset["position_recentering_mode"] as? [String: Any] else { return }
-        mode["variant"] = height == nil ? "LocalFloor" : "Local"
-        var local = mode["Local"] as? [String: Any] ?? [:]
-        if let height { local["view_height"] = height }
-        mode["Local"] = local
+        mode["variant"] = "LocalFloor"
         headset["position_recentering_mode"] = mode
         settings["headset"] = headset
         json["session_settings"] = settings

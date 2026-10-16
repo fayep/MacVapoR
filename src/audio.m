@@ -17,6 +17,10 @@ static AudioObjectID g_aggregate = kAudioObjectUnknown;
 static AudioDeviceIOProcID g_sink;
 static dispatch_source_t g_retry;
 
+NSString *axr_game_audio_device_name(void) {
+    return [NSString stringWithFormat:@"%s %d", AXR_GAME_AUDIO_DEVICE, getpid()];
+}
+
 static AudioObjectID own_process_object(void) {
     AudioObjectPropertyAddress a = {kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal,
                                     kAudioObjectPropertyElementMain};
@@ -48,7 +52,7 @@ static bool try_tap(void) {
     if (process == kAudioObjectUnknown) return false;
 
     CATapDescription *tap = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[ @(process) ]];
-    tap.name = @AXR_GAME_AUDIO_DEVICE;
+    tap.name = axr_game_audio_device_name();
     tap.privateTap = YES;
     tap.muteBehavior = CATapMutedWhenTapped;
     OSStatus st = AudioHardwareCreateProcessTap(tap, &g_tap);
@@ -59,7 +63,7 @@ static bool try_tap(void) {
 
     NSString *output = default_output_uid();
     NSMutableDictionary *agg = [@{
-        @kAudioAggregateDeviceNameKey : @AXR_GAME_AUDIO_DEVICE,
+        @kAudioAggregateDeviceNameKey : axr_game_audio_device_name(),
         @kAudioAggregateDeviceUIDKey : [NSUUID UUID].UUIDString,
         @kAudioAggregateDeviceIsPrivateKey : @YES,
         @kAudioAggregateDeviceTapAutoStartKey : @YES,

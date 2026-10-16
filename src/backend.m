@@ -83,7 +83,7 @@ static void prepare_session(void) {
     game_audio[@"enabled"] = @YES;
     game_audio[@"content"][@"device"] = [@{
         @"set" : @YES,
-        @"content" : [@{@"variant" : @"NameSubstring", @"NameSubstring" : @AXR_GAME_AUDIO_DEVICE, @"Index" : @0} mutableCopy],
+        @"content" : [@{@"variant" : @"NameSubstring", @"NameSubstring" : axr_game_audio_device_name(), @"Index" : @0} mutableCopy],
     } mutableCopy];
     NSMutableDictionary *conn = s[@"session_settings"][@"connection"];
     for (NSString *k in @[ @"server_send_buffer_bytes", @"server_recv_buffer_bytes", @"client_send_buffer_bytes",
@@ -169,6 +169,22 @@ unsigned axr_stat_reused;
 
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_inputs;
 static uint64_t g_input_generation;
+
+// Seated play: <config>/height.json {"eye_height": 1.6}, written by MacVapoR, puts the eyes at
+// that height above the floor. ALVR's own recentering only runs when the client syncs its
+// playspace, which the visionOS client does not do, so the runtime moves every pose itself, by
+// what the first head pose of each connection says.
+static float g_eye_height;
+static float g_height_offset;
+static bool g_height_offset_set;
+
+static void read_eye_height(void) {
+    NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"height.json"]];
+    NSDictionary *h = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    g_eye_height = [h isKindOfClass:NSDictionary.class] ? [h[@"eye_height"] floatValue] : 0;
+    if (g_eye_height > 0) axr_log("seated: eye height %.2f m", g_eye_height);
+}
+
 static int g_snapshot_request, g_snapshot_done;   // tune.json "snapshot": n saves the next frame's eye images
 
 // --------------------------------------------------------------------------------- foveation
@@ -523,6 +539,8 @@ static void *event_thread(void *arg) {
             case ALVR_EVENT_CLIENT_CONNECTED:
                 pthread_mutex_lock(&g_lock);
                 g_connected = true;
+                g_height_offset_set = false;
+                g_height_offset = 0;
                 g_force_idr = true;
                 g_have_offset = false;
                 g_tracking_real = false;
@@ -647,6 +665,7 @@ void axr_backend_start(void) {
     NSString *env = NSProcessInfo.processInfo.environment[@"ALVRXR_CONFIG_DIR"];
     g_config_dir = env ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
     prepare_session();
+    read_eye_height();
     NSString *dump = NSProcessInfo.processInfo.environment[@"ALVRXR_DUMP"];
     if (dump) g_dump = fopen(dump.fileSystemRepresentation, "wb");
     alvr_initialize_environment(g_config_dir.fileSystemRepresentation, g_config_dir.fileSystemRepresentation);
@@ -792,6 +811,14 @@ axr_motion axr_device_motion(int device, int64_t time) {
     AlvrDeviceMotion am;
     if (connected && ts && alvr_get_device_motion(g_device_id[device], ts, &am)) {
         m.pose = from_alvr(am.pose);
+        if (g_eye_height > 0) {
+            if (!g_height_offset_set && device == AXR_HEAD && m.pose.position[1] > 0.3f) {
+                g_height_offset = g_eye_height - m.pose.position[1];
+                g_height_offset_set = true;
+                axr_log("seated: head at %.2f m, raised %.2f m", m.pose.position[1], g_height_offset);
+            }
+            m.pose.position[1] += g_height_offset;
+        }
         memcpy(m.linear_velocity, am.linear_velocity, sizeof m.linear_velocity);
         memcpy(m.angular_velocity, am.angular_velocity, sizeof m.angular_velocity);
         m.valid = true;
