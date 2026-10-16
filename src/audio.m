@@ -1,7 +1,8 @@
 // Game audio for ALVR. macOS cannot record an output device the way ALVR's loopback capture
 // expects, so the runtime taps its own process, the game's, whose audio Wine plays from
 // in-process, and puts the tap in a private aggregate device that ALVR records as its game
-// audio device (see prepare_session). While the tap is read the Mac's own output is muted.
+// audio device (see prepare_session). The tap is read for as long as the game runs, so the Mac's
+// own output stays muted whether or not a headset is connected to hear it.
 
 #import <CoreAudio/AudioHardware.h>
 #import <CoreAudio/AudioHardwareTapping.h>
@@ -13,6 +14,7 @@
 
 static AudioObjectID g_tap = kAudioObjectUnknown;
 static AudioObjectID g_aggregate = kAudioObjectUnknown;
+static AudioDeviceIOProcID g_sink;
 static dispatch_source_t g_retry;
 
 static AudioObjectID own_process_object(void) {
@@ -78,6 +80,13 @@ static bool try_tap(void) {
         g_tap = kAudioObjectUnknown;
         return true;
     }
+    // A reader that drops the audio, so the tap is read, and the Mac muted, without ALVR too.
+    st = AudioDeviceCreateIOProcIDWithBlock(&g_sink, g_aggregate, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                                            ^(const AudioTimeStamp *now, const AudioBufferList *in,
+                                              const AudioTimeStamp *in_time, AudioBufferList *out,
+                                              const AudioTimeStamp *out_time) {});
+    if (st == noErr) st = AudioDeviceStart(g_aggregate, g_sink);
+    if (st != noErr) axr_log("audio: could not keep the Mac muted (%d)", (int)st);
     axr_log("audio: game audio tapped for ALVR (process object %u)", process);
     return true;
 }

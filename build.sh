@@ -9,6 +9,10 @@ MIN_VER=${MIN_VER:-15.0}
 export MACOSX_DEPLOYMENT_TARGET=$MIN_VER
 out="$here/out"
 mkdir -p "$out" "$here/build"
+# ALVR fixes the runtime needs, each applied once (see patches/).
+for p in "$here"/patches/alvr-*.patch; do
+    ( cd "$ALVR" && { git apply --reverse --check "$p" 2>/dev/null || git apply "$p"; } )
+done
 ( cd "$ALVR" && cargo build -q -p alvr_server_core --release )
 cp "$ALVR/target/release/libalvr_server_core.dylib" "$out/"
 install_name_tool -id @rpath/libalvr_server_core.dylib "$out/libalvr_server_core.dylib"

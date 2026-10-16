@@ -1,0 +1,21 @@
+diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
+index 3144dfe..dc0e869 100644
+--- a/alvr/server_core/src/connection.rs
++++ b/alvr/server_core/src/connection.rs
+@@ -56,9 +56,14 @@ fn align32(value: f32) -> u32 {
+     ((value / 32.).floor() * 32.) as u32
+ }
+ 
++// Asked from the audio device's real-time callback. Waiting there for the session lock can
++// deadlock: on macOS a new connection queries that same device while holding the lock, and Core
++// Audio waits for the callback to return. A busy lock reads as still streaming.
+ fn is_streaming(client_hostname: &str) -> bool {
+-    SESSION_MANAGER
+-        .read()
++    let Some(session_manager) = SESSION_MANAGER.try_read() else {
++        return true;
++    };
++    session_manager
+         .client_list()
+         .get(client_hostname)
+         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
