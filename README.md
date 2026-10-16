@@ -23,6 +23,9 @@ Vulkan and D3D12 games are not supported yet.
 
 ## Install
 
+**Install [NotProton](https://github.com/NotProtonNot/NotProton) first**, and play a game through it
+once, so its CrossOver runner is in place. MacVapoR builds on NotProton and does nothing without it.
+
 1. Download the DMG from the [releases](https://github.com/fayep/MacVapoR/releases), open
    it, and drag MacVapoR to Applications. It is signed and notarized.
 2. Open MacVapoR and click **Install**: the runtime goes into
