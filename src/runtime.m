@@ -596,15 +596,34 @@ static XrPosef local_origin(session *s, XrTime t) {
     return s->local;
 }
 
+static XrVector3f vsub(XrVector3f a, XrVector3f b) { return (XrVector3f){a.x - b.x, a.y - b.y, a.z - b.z}; }
+static XrVector3f vadd(XrVector3f a, XrVector3f b) { return (XrVector3f){a.x + b.x, a.y + b.y, a.z + b.z}; }
+static XrVector3f vcross(XrVector3f a, XrVector3f b) {
+    return (XrVector3f){a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+// A space's motion in STAGE: linear velocity of its origin and angular velocity. ALVR reports
+// device velocities in its own (STAGE) frame; a space offset from a device moves with its
+// rotation too. Reference spaces other than VIEW stand still.
+typedef struct {
+    XrVector3f linear, angular;
+} space_motion;
+
 // A space's pose in STAGE, and whether it is tracked right now.
-static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked) {
+static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, space_motion *motion) {
     *tracked = true;
+    if (motion) *motion = (space_motion){0};
     if (sp->kind == SPACE_REFERENCE) {
         XrPosef base = IDENTITY;
         if (sp->ref == XR_REFERENCE_SPACE_TYPE_VIEW) {
             axr_motion head = axr_device_motion(AXR_HEAD, t);
             base = from_axr(head.pose);
             *tracked = axr_backend_connected();
+            if (motion) {
+                motion->angular = (XrVector3f){head.angular_velocity[0], head.angular_velocity[1], head.angular_velocity[2]};
+                motion->linear = vadd((XrVector3f){head.linear_velocity[0], head.linear_velocity[1], head.linear_velocity[2]},
+                                      vcross(motion->angular, qrot(base.orientation, sp->offset.position)));
+            }
         } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL) {
             base = local_origin(sp->sess, t);
         } else if (sp->ref == XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR) {
@@ -616,27 +635,50 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked) {
     }
     axr_motion m = axr_device_motion(sp->hand, t);
     if (!m.valid) return false;
-    *out = pmul(from_axr(m.pose), sp->offset);
+    XrPosef device = from_axr(m.pose);
+    *out = pmul(device, sp->offset);
+    if (motion) {
+        motion->angular = (XrVector3f){m.angular_velocity[0], m.angular_velocity[1], m.angular_velocity[2]};
+        motion->linear = vadd((XrVector3f){m.linear_velocity[0], m.linear_velocity[1], m.linear_velocity[2]},
+                              vcross(motion->angular, qrot(device.orientation, sp->offset.position)));
+    }
     return true;
 }
 
-static XrResult xrLocateSpace_(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation *loc) {
+// The space's pose, and motion, in the base space's frame. Unity asks for time 0, meaning now.
+static XrResult locate(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation *loc, XrSpaceVelocity *vel) {
     CHECK_HANDLE(hs, space, MAGIC_SPACE);
     CHECK_HANDLE(hb, space, MAGIC_SPACE);
-    if (t <= 0) return XR_ERROR_TIME_INVALID;
+    if (t < 0) return XR_ERROR_TIME_INVALID;
+    if (t == 0) t = axr_now_ns();
     XrPosef a, b;
     bool ta, tb;
+    space_motion ma, mb;
     loc->locationFlags = 0;
-    if (!space_in_stage((space *)hs, t, &a, &ta) || !space_in_stage((space *)hb, t, &b, &tb)) {
+    if (vel) vel->velocityFlags = 0;
+    if (!space_in_stage((space *)hs, t, &a, &ta, &ma) || !space_in_stage((space *)hb, t, &b, &tb, &mb)) {
         loc->pose = IDENTITY;
         return XR_SUCCESS;
     }
     loc->pose = pmul(pinv(b), a);
     loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
     if (ta && tb) loc->locationFlags |= XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-    for (XrBaseOutStructure *n = loc->next; n; n = n->next)
-        if (n->type == XR_TYPE_SPACE_VELOCITY) ((XrSpaceVelocity *)n)->velocityFlags = 0;
+    if (vel && ta && tb) {
+        // Relative to a base that may itself move (VIEW), seen in the base's frame.
+        XrQuaternionf inv_b = pinv(b).orientation;
+        XrVector3f arm = vsub(a.position, b.position);
+        vel->linearVelocity = qrot(inv_b, vsub(vsub(ma.linear, mb.linear), vcross(mb.angular, arm)));
+        vel->angularVelocity = qrot(inv_b, vsub(ma.angular, mb.angular));
+        vel->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+    }
     return XR_SUCCESS;
+}
+
+static XrResult xrLocateSpace_(XrSpace hs, XrSpace hb, XrTime t, XrSpaceLocation *loc) {
+    XrSpaceVelocity *vel = NULL;
+    for (XrBaseOutStructure *n = loc->next; n; n = n->next)
+        if (n->type == XR_TYPE_SPACE_VELOCITY) vel = (XrSpaceVelocity *)n;
+    return locate(hs, hb, t, loc, vel);
 }
 
 static XrResult xrLocateSpaces_(XrSession h, const XrSpacesLocateInfo *info, XrSpaceLocations *out) {
@@ -647,11 +689,16 @@ static XrResult xrLocateSpaces_(XrSession h, const XrSpacesLocateInfo *info, XrS
         if (n->type == XR_TYPE_SPACE_VELOCITIES) vel = (XrSpaceVelocities *)n;
     for (uint32_t i = 0; i < info->spaceCount; i++) {
         XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
-        XrResult r = xrLocateSpace_(info->spaces[i], info->baseSpace, info->time, &loc);
+        XrSpaceVelocity v = {XR_TYPE_SPACE_VELOCITY};
+        XrResult r = locate(info->spaces[i], info->baseSpace, info->time, &loc, &v);
         if (r != XR_SUCCESS) return r;
         out->locations[i].locationFlags = loc.locationFlags;
         out->locations[i].pose = loc.pose;
-        if (vel && i < vel->velocityCount) vel->velocities[i].velocityFlags = 0;
+        if (vel && i < vel->velocityCount) {
+            vel->velocities[i].velocityFlags = v.velocityFlags;
+            vel->velocities[i].linearVelocity = v.linearVelocity;
+            vel->velocities[i].angularVelocity = v.angularVelocity;
+        }
     }
     return XR_SUCCESS;
 }
@@ -668,7 +715,7 @@ static XrResult xrLocateViews_(XrSession h, const XrViewLocateInfo *info, XrView
     if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
     XrPosef base;
     bool tracked;
-    space_in_stage((space *)info->space, info->displayTime, &base, &tracked);
+    space_in_stage((space *)info->space, info->displayTime, &base, &tracked, NULL);
     XrPosef head = from_axr(axr_device_motion(AXR_HEAD, info->displayTime).pose);
     axr_views v = axr_current_views();
     XrPosef head_in_base = pmul(pinv(base), head);
