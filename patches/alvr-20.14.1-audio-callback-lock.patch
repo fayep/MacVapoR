@@ -1,21 +1,40 @@
-diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
-index 3144dfe..dc0e869 100644
---- a/alvr/server_core/src/connection.rs
-+++ b/alvr/server_core/src/connection.rs
-@@ -56,9 +56,14 @@ fn align32(value: f32) -> u32 {
-     ((value / 32.).floor() * 32.) as u32
- }
+diff --git a/alvr/audio/src/lib.rs b/alvr/audio/src/lib.rs
+index ca76d26..a07448d 100644
+--- a/alvr/audio/src/lib.rs
++++ b/alvr/audio/src/lib.rs
+@@ -331,13 +331,17 @@ pub fn record_audio_blocking(
+     };
  
-+// Asked from the audio device's real-time callback. Waiting there for the session lock can
-+// deadlock: on macOS a new connection queries that same device while holding the lock, and Core
-+// Audio waits for the callback to return. A busy lock reads as still streaming.
- fn is_streaming(client_hostname: &str) -> bool {
--    SESSION_MANAGER
--        .read()
-+    let Some(session_manager) = SESSION_MANAGER.try_read() else {
-+        return true;
-+    };
-+    session_manager
-         .client_list()
-         .get(client_hostname)
-         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
+     let state = Arc::new(Mutex::new(AudioRecordState::Recording));
++    // is_running() takes the session lock, which must not be waited for in the real-time callback:
++    // on macOS a new connection queries this device while holding it, and Core Audio waits for
++    // the callback to return. The loop below asks instead and tells the callback through this.
++    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+ 
+     let stream = device.inner.build_input_stream_raw(
+         &stream_config,
+         config.sample_format(),
+         {
+             let state = Arc::clone(&state);
+-            let is_running = Arc::clone(&is_running);
++            let running = Arc::clone(&running);
+             move |data, _| {
+                 let data = if config.sample_format() == SampleFormat::F32 {
+                     data.bytes()
+@@ -355,7 +359,7 @@ pub fn record_audio_blocking(
+ 
+                 let data = downmix_audio(data, config.channels(), channels_count);
+ 
+-                if is_running() {
++                if running.load(std::sync::atomic::Ordering::Relaxed) {
+                     let mut buffer = sender.get_buffer(&()).unwrap();
+                     buffer.get_range_mut(0, data.len()).copy_from_slice(&data);
+                     sender.send(buffer).ok();
+@@ -382,6 +386,7 @@ pub fn record_audio_blocking(
+         while matches!(*state.lock(), AudioRecordState::Recording) && is_running() {
+             thread::sleep(Duration::from_millis(500))
+         }
++        running.store(false, std::sync::atomic::Ordering::Relaxed);
+ 
+         if let AudioRecordState::Err(e) = &mut *state.lock() {
+             res = Err(e.take().unwrap());
