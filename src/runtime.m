@@ -52,6 +52,10 @@ typedef struct action {
     float value[SUB_COUNT][2];
     bool active[SUB_COUNT], changed[SUB_COUNT];
     XrTime change_time[SUB_COUNT];
+    // OpenComposite's double press detection counts a press on every read, and Unity reads each
+    // action once per input source, so one press made a double. For those actions a change is
+    // reported to the first read after a sync only.
+    bool once_per_sync, change_read;
 } action;
 
 typedef struct swapchain {
@@ -948,6 +952,8 @@ static XrResult xrCreateAction_(XrActionSet h, const XrActionCreateInfo *info, X
     a->set = as;
     a->type = info->actionType;
     snprintf(a->name, sizeof a->name, "%s", info->actionName);
+    size_t len = strlen(a->name), tail = strlen("-double-click");
+    a->once_per_sync = len > tail && !strcmp(a->name + len - tail, "-double-click");
     a->bindings = [NSMutableArray array];
     CFRetain((__bridge CFTypeRef)a->bindings);
     *out = (XrAction)a;
@@ -1113,6 +1119,7 @@ static XrResult xrSyncActions_(XrSession h, const XrActionsSyncInfo *info) {
                 }
                 any[u] = any[SUB_NONE] = true;
             }
+            a->change_read = false;
             for (int u = 0; u < SUB_COUNT; u++) {
                 bool was = a->active[u];
                 a->changed[u] = was && any[u] && (v[u][0] != a->value[u][0] || v[u][1] != a->value[u][1]);
@@ -1146,6 +1153,10 @@ static XrResult xrGetActionStateBoolean_(XrSession h, const XrActionStateGetInfo
     st->currentState = a->value[u][0] > 0.5f;
     if (st->currentState) axr_stat_pressed++;
     st->changedSinceLastSync = a->changed[u];
+    if (a->once_per_sync && a->changed[u]) {
+        st->changedSinceLastSync = !a->change_read;
+        a->change_read = true;
+    }
     st->lastChangeTime = a->change_time[u];
     st->isActive = a->active[u];
     return XR_SUCCESS;

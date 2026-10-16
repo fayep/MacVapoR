@@ -1,0 +1,30 @@
+diff --git a/OpenOVR/Reimpl/BaseInput.cpp b/OpenOVR/Reimpl/BaseInput.cpp
+index 1091a21..29e802f 100644
+--- a/OpenOVR/Reimpl/BaseInput.cpp
++++ b/OpenOVR/Reimpl/BaseInput.cpp
+@@ -1466,6 +1466,11 @@ XrResult BaseInput::getBooleanOrDpadData(const InteractionProfile* profile, Acti
+ 			if (!click_state.changedSinceLastSync || !click_state.currentState)
+ 				continue;
+ 
++			// Games may read an action more than once per frame (e.g. once per input source); count each press once
++			if (click_state.lastChangeTime == dclick_info.last_press_time)
++				continue;
++			dclick_info.last_press_time = click_state.lastChangeTime;
++
+ 			if (!dclick_info.first_click_time) {
+ 				// first click, record the timestamp
+ 				dclick_info.first_click_time = click_state.lastChangeTime;
+diff --git a/OpenOVR/Reimpl/BaseInput.h b/OpenOVR/Reimpl/BaseInput.h
+index 09286c4..54cdb7d 100644
+--- a/OpenOVR/Reimpl/BaseInput.h
++++ b/OpenOVR/Reimpl/BaseInput.h
+@@ -566,6 +566,9 @@ private:
+ 
+ 		// the previous state of the double click binding
+ 		bool last_state;
++
++		// the timestamp of the last press counted, so a press read twice in one frame counts once
++		XrTime last_press_time = 0;
+ 	};
+ 
+ 	enum class PoseBindingPoint {
