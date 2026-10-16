@@ -8,6 +8,8 @@
 #import <CoreAudio/AudioHardwareTapping.h>
 #import <CoreAudio/CATapDescription.h>
 #import <Foundation/Foundation.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <unistd.h>
 
 #include "alvrxr.h"
@@ -15,6 +17,14 @@
 static AudioObjectID g_tap = kAudioObjectUnknown;
 static AudioObjectID g_aggregate = kAudioObjectUnknown;
 static AudioDeviceIOProcID g_sink;
+// For the frame summary: what the sink has read since the last one, and how loud it was.
+static _Atomic uint64_t g_tapped_frames;
+static _Atomic uint32_t g_tapped_peak;   // x 1000
+
+void axr_audio_stats(uint64_t *frames, float *peak) {
+    *frames = atomic_exchange(&g_tapped_frames, 0);
+    *peak = atomic_exchange(&g_tapped_peak, 0) / 1000.0f;
+}
 static dispatch_source_t g_retry;
 
 NSString *axr_game_audio_device_name(void) {
@@ -53,6 +63,9 @@ static bool try_tap(void) {
 
     CATapDescription *tap = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[ @(process) ]];
     tap.name = axr_game_audio_device_name();
+    // Its own UUID, which is how the aggregate device below names it; taps outlive their process,
+    // and one left with the same UUID would be the one used.
+    tap.UUID = [NSUUID UUID];
     tap.privateTap = YES;
     tap.muteBehavior = CATapMutedWhenTapped;
     OSStatus st = AudioHardwareCreateProcessTap(tap, &g_tap);
@@ -88,7 +101,17 @@ static bool try_tap(void) {
     st = AudioDeviceCreateIOProcIDWithBlock(&g_sink, g_aggregate, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                                             ^(const AudioTimeStamp *now, const AudioBufferList *in,
                                               const AudioTimeStamp *in_time, AudioBufferList *out,
-                                              const AudioTimeStamp *out_time) {});
+                                              const AudioTimeStamp *out_time) {
+        for (UInt32 b = 0; in && b < in->mNumberBuffers; b++) {
+            const float *x = in->mBuffers[b].mData;
+            UInt32 n = in->mBuffers[b].mDataByteSize / sizeof(float);
+            float peak = 0;
+            for (UInt32 i = 0; x && i < n; i++) peak = fmaxf(peak, fabsf(x[i]));
+            uint32_t p = (uint32_t)(peak * 1000), old = atomic_load(&g_tapped_peak);
+            while (p > old && !atomic_compare_exchange_weak(&g_tapped_peak, &old, p)) {}
+            if (b == 0) atomic_fetch_add(&g_tapped_frames, n / (in->mBuffers[b].mNumberChannels ?: 1));
+        }
+    });
     if (st == noErr) st = AudioDeviceStart(g_aggregate, g_sink);
     if (st != noErr) axr_log("audio: could not keep the Mac muted (%d)", (int)st);
     axr_log("audio: game audio tapped for ALVR (process object %u)", process);

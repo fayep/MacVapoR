@@ -639,13 +639,18 @@ static void *event_thread(void *arg) {
             }
             if (now - g_stat_since > 5000000000LL) {
                 double dt = (now - g_stat_since) / 1e9;
+                uint64_t audio_frames;
+                float audio_peak;
+                axr_audio_stats(&audio_frames, &audio_peak);
                 if (g_stat_frames || axr_stat_wait)
                     axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
-                            " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads",
+                            " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads"
+                            " | audio: %llu frames tapped, peak %.3f",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
                             axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
                             g_stat_button_events, (unsigned long)g_inputs.count, axr_stat_syncs,
-                            axr_stat_unfocused_syncs, axr_stat_pressed);
+                            axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
+                            audio_peak);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
                 axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;

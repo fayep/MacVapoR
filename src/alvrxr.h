@@ -47,6 +47,7 @@ void axr_backend_start(void);
 NSString *axr_game_audio_device_name(void);
 #endif
 void axr_audio_start(void);
+void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
 bool axr_backend_connected(void);
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
 double axr_refresh_hz(void);
