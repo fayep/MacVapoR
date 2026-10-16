@@ -27,6 +27,8 @@ Vulkan and D3D12 games are not supported yet.
    it, and drag MacVapoR to Applications. It is signed and notarized.
 2. Open MacVapoR and click **Install**: the runtime goes into
    `~/Library/Application Support/MacVapoR`.
+3. macOS asks whether **MacVapoR Audio** may record audio: allow it. It sends each game's sound to
+   the headset, and keeps the game quiet on the Mac. MacVapoR shows whether it is allowed.
 
 ## Set a game up
 
@@ -36,8 +38,6 @@ Vulkan and D3D12 games are not supported yet.
    For an OpenVR game, click **Download OpenComposite** first.
 4. Wake the controllers, open ALVR on the Vision Pro, and launch the game.
 5. The first time, the headset appears under **Headsets**: trust it, then restart the game.
-6. The first time each game runs, macOS asks to let it (e.g. "Beat Saber.exe") record audio:
-   allow it, so the game's sound reaches the headset.
 
 Playing seated? Under **Headsets**, choose **Seated: fixed eye height**, so standing games put your eyes
 at that height instead of your real one.
