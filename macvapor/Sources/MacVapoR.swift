@@ -87,11 +87,24 @@ final class Model: ObservableObject {
             }
             try writeActiveRuntime()
             try bundleVersion.write(to: Paths.version, atomically: true, encoding: .utf8)
+            Self.clearQuarantine(Paths.support)
             output = "Runtime \(bundleVersion) installed."
         } catch {
             output = "Install failed: \(error.localizedDescription)"
         }
         refresh()
+    }
+
+    /// Copies out of an app that came from a download keep its quarantine flag, and the setup
+    /// script's cp carries it into every game's prefix. These files are part of the notarized
+    /// app, so they are installed as trusted, the way an installer would.
+    static func clearQuarantine(_ dir: URL) {
+        let fm = FileManager.default
+        var paths = [dir.path]
+        if let walker = fm.enumerator(atPath: dir.path) {
+            for case let rel as String in walker { paths.append(dir.appending(path: rel).path) }
+        }
+        for path in paths { removexattr(path, "com.apple.quarantine", XATTR_NOFOLLOW) }
     }
 
     private func writeActiveRuntime() throws {
@@ -205,6 +218,7 @@ final class Model: ObservableObject {
                 let fm = FileManager.default
                 try fm.createDirectory(at: Paths.openComposite.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try data.write(to: Paths.openComposite, options: .atomic)
+                Model.clearQuarantine(Paths.openComposite.deletingLastPathComponent())
                 output = "OpenComposite downloaded (\(data.count / 1024) KB)."
             } catch {
                 output = "OpenComposite download failed: \(error.localizedDescription)"
