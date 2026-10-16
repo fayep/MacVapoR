@@ -45,6 +45,9 @@ Vulkan and D3D12 games are not supported yet.
   buttons stop working until ALVR is reopened. A fix for the ALVR app is waiting upstream.
 - The controllers must be awake when ALVR connects, or their buttons may not come through.
 - Loading screens hold the last frame; there is no compositor scene in between.
+- The Lab's Secret Shop runs at about 1 fps: its game code is slow under the x86 emulation of
+  NotProton's runner. The VR pipeline is not the cause; the hub and Beat Saber run at full rate.
+- ALVR's "Stream refresh rate" setting limits the frame rate; set it to 120 Hz.
 
 # alvrxr, the runtime
 
