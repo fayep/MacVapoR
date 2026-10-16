@@ -47,6 +47,8 @@ struct Game: Identifiable {
 final class Model: ObservableObject {
     @Published var installedVersion: String?
     @Published var headsets: [Headset] = []
+    /// nil: the real floor (ALVR's LocalFloor); otherwise a fixed eye height in metres (Local).
+    @Published var seatedEyeHeight: Double?
     @Published var games: [Game] = []
     @Published var output = ""
     @Published var busy = false
@@ -136,14 +138,42 @@ final class Model: ObservableObject {
 
     func loadHeadsets() {
         guard let data = try? Data(contentsOf: Paths.session),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let clients = json["client_connections"] as? [String: [String: Any]] else {
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            headsets = []
+            return
+        }
+        let mode = ((json["session_settings"] as? [String: Any])?["headset"] as? [String: Any])?["position_recentering_mode"]
+            as? [String: Any]
+        seatedEyeHeight = mode?["variant"] as? String == "Local"
+            ? ((mode?["Local"] as? [String: Any])?["view_height"] as? Double ?? 1.5) : nil
+        guard let clients = json["client_connections"] as? [String: [String: Any]] else {
             headsets = []
             return
         }
         headsets = clients.map { id, c in
             Headset(id: id, name: c["display_name"] as? String ?? id, trusted: c["trusted"] as? Bool ?? false)
         }.sorted { $0.id < $1.id }
+    }
+
+    /// ALVR's position recentering: the real floor for standing play, or the head put at a fixed
+    /// height for seated play. Read when a game starts.
+    func setSeatedEyeHeight(_ height: Double?) {
+        guard let data = try? Data(contentsOf: Paths.session),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var settings = json["session_settings"] as? [String: Any],
+              var headset = settings["headset"] as? [String: Any],
+              var mode = headset["position_recentering_mode"] as? [String: Any] else { return }
+        mode["variant"] = height == nil ? "LocalFloor" : "Local"
+        var local = mode["Local"] as? [String: Any] ?? [:]
+        if let height { local["view_height"] = height }
+        mode["Local"] = local
+        headset["position_recentering_mode"] = mode
+        settings["headset"] = headset
+        json["session_settings"] = settings
+        if let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
+            try? out.write(to: Paths.session, options: .atomic)
+        }
+        loadHeadsets()
     }
 
     func setTrusted(_ id: String, _ trusted: Bool) {
@@ -419,6 +449,22 @@ struct ContentView: View {
                 if model.headsets.isEmpty {
                     Text("No headsets yet.")
                 }
+                Picker("Height", selection: Binding(get: { model.seatedEyeHeight == nil ? 0 : 1 },
+                                                    set: { model.setSeatedEyeHeight($0 == 0 ? nil : 1.5) })) {
+                    Text("Real floor (standing)").tag(0)
+                    Text("Seated: fixed eye height").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 420)
+                if let height = model.seatedEyeHeight {
+                    HStack {
+                        Slider(value: Binding(get: { height }, set: { model.setSeatedEyeHeight(($0 * 20).rounded() / 20) }),
+                               in: 1.0...2.0)
+                            .frame(maxWidth: 300)
+                        Text(String(format: "%.2f m", height)).monospacedDigit()
+                    }
+                }
+                Text("Takes effect the next time a game starts.").font(.caption).foregroundStyle(.secondary)
                 ForEach(model.headsets) { h in
                     Toggle(isOn: Binding(get: { h.trusted }, set: { model.setTrusted(h.id, $0) })) {
                         HStack {

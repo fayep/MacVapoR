@@ -39,6 +39,9 @@ Vulkan and D3D12 games are not supported yet.
 6. The first time each game runs, macOS asks to let it (e.g. "Beat Saber.exe") record audio:
    allow it, so the game's sound reaches the headset.
 
+Playing seated? Under **Headsets**, choose **Seated: fixed eye height**, so standing games put your eyes
+at that height instead of your real one.
+
 **Undo** puts a game back as it was. The runtime's log is at `~/Library/Logs/alvrxr.log`.
 
 ## Known issues
