@@ -311,7 +311,8 @@ enum OpenComposite {
 
 enum GameScanner {
     // Executables that are never the game.
-    static let notGames = ["unitycrashhandler", "unins", "vcredist", "dxsetup", "crashreport", "vconsole", "vrstartup"]
+    static let notGames = ["unitycrashhandler", "unins", "vcredist", "dxsetup", "crashreport", "vconsole", "vrstartup",
+                           "unrealcefsubprocess", "ue4prereqsetup", "ueprereqsetup"]
 
     static func libraries() -> [URL] {
         var libs = [Paths.steam]
@@ -403,7 +404,8 @@ enum GameScanner {
                 var kind = Game.Kind.other
                 if let walker = fm.enumerator(at: dir, includingPropertiesForKeys: nil) {
                     for case let url as URL in walker {
-                        if walker.level > 5 { walker.skipDescendants(); continue }
+                        // Unreal keeps openvr_api.dll seven levels down, in Engine/Binaries/ThirdParty/OpenVR/....
+                        if walker.level > 8 { walker.skipDescendants(); continue }
                         let file = url.lastPathComponent.lowercased()
                         if file == "openvr_api.dll" { kind = .openVR }
                         if file == "openxr_loader.dll" && kind == .other { kind = .openXR }
