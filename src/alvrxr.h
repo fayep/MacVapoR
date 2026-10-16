@@ -37,6 +37,10 @@ int64_t axr_now_ns(void);              // XrTime: CLOCK_MONOTONIC nanoseconds
 // Starts ALVR (idempotent). The runtime works with no headset connected: frames are composed
 // and dropped, and poses fall back to a standing default.
 void axr_backend_start(void);
+
+// The game's own audio, tapped for ALVR to stream (audio.m).
+#define AXR_GAME_AUDIO_DEVICE "alvrxr game audio"
+void axr_audio_start(void);
 bool axr_backend_connected(void);
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
 double axr_refresh_hz(void);

@@ -78,6 +78,13 @@ static void prepare_session(void) {
     NSMutableDictionary *video = s[@"session_settings"][@"video"];
     video[@"preferred_codec"][@"variant"] = @"Hevc";
     video[@"foveated_encoding"][@"enabled"] = @YES;
+    // ALVR streams the game's audio from the device audio.m makes; macOS has no loopback for it.
+    NSMutableDictionary *game_audio = s[@"session_settings"][@"audio"][@"game_audio"];
+    game_audio[@"enabled"] = @YES;
+    game_audio[@"content"][@"device"] = [@{
+        @"set" : @YES,
+        @"content" : [@{@"variant" : @"NameSubstring", @"NameSubstring" : @AXR_GAME_AUDIO_DEVICE, @"Index" : @0} mutableCopy],
+    } mutableCopy];
     NSMutableDictionary *conn = s[@"session_settings"][@"connection"];
     for (NSString *k in @[ @"server_send_buffer_bytes", @"server_recv_buffer_bytes", @"client_send_buffer_bytes",
                            @"client_recv_buffer_bytes" ]) {
@@ -643,6 +650,11 @@ void axr_backend_start(void) {
     NSString *dump = NSProcessInfo.processInfo.environment[@"ALVRXR_DUMP"];
     if (dump) g_dump = fopen(dump.fileSystemRepresentation, "wb");
     alvr_initialize_environment(g_config_dir.fileSystemRepresentation, g_config_dir.fileSystemRepresentation);
+    // server_core appends forever; keep one launch back.
+    NSString *session_log = [g_config_dir stringByAppendingPathComponent:@"session_log.txt"];
+    NSString *old_log = [g_config_dir stringByAppendingPathComponent:@"session_log.old.txt"];
+    [NSFileManager.defaultManager removeItemAtPath:old_log error:nil];
+    [NSFileManager.defaultManager moveItemAtPath:session_log toPath:old_log error:nil];
     alvr_initialize_logging([[g_config_dir stringByAppendingPathComponent:@"session_log.txt"] fileSystemRepresentation],
                             [[g_config_dir stringByAppendingPathComponent:@"crash_log.txt"] fileSystemRepresentation]);
 
@@ -673,6 +685,7 @@ void axr_backend_start(void) {
     CVMetalTextureCacheCreate(NULL, NULL, dev, NULL, &g_texture_cache);
 
     start_core();
+    axr_audio_start();
     pthread_t t;
     pthread_create(&t, NULL, event_thread, NULL);
     pthread_detach(t);
