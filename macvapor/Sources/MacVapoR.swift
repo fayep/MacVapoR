@@ -38,6 +38,9 @@ struct Game: Identifiable {
     let exes: [String]
     let kind: Kind
     var configured: Bool
+    /// CX_GRAPHICS_BACKEND from the game's launch options, which NotProton's Compatibility
+    /// page writes; nil when none is set.
+    let graphics: String?
 }
 
 @MainActor
@@ -268,9 +271,56 @@ enum GameScanner {
         return nil
     }
 
+    /// Launch options per app ID from the most recently used Steam account's localconfig.vdf:
+    /// UserLocalConfigStore > Software > Valve > Steam > apps > <appid> > LaunchOptions.
+    static func launchOptions() -> [String: String] {
+        let fm = FileManager.default
+        let userdata = Paths.steam.appending(path: "userdata")
+        let configs = ((try? fm.contentsOfDirectory(atPath: userdata.path)) ?? []).map {
+            userdata.appending(path: "\($0)/config/localconfig.vdf")
+        }.filter { fm.fileExists(atPath: $0.path) }
+        func modified(_ url: URL) -> Date {
+            (try? fm.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
+        }
+        guard let newest = configs.max(by: { modified($0) < modified($1) }),
+              let text = try? String(contentsOf: newest, encoding: .utf8) else { return [:] }
+        var path: [String] = []
+        var pending: String?
+        var options: [String: String] = [:]
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line == "{" {
+                path.append(pending ?? "")
+                pending = nil
+            } else if line == "}" {
+                _ = path.popLast()
+            } else {
+                let parts = line.split(separator: "\"", omittingEmptySubsequences: false)
+                if parts.count >= 5 {
+                    let key = String(parts[1]), value = String(parts[3])
+                    if key == "LaunchOptions", path.count >= 2, path[path.count - 2].lowercased() == "apps" {
+                        options[path[path.count - 1]] = value
+                    }
+                } else if parts.count >= 3 {
+                    pending = String(parts[1])
+                }
+            }
+        }
+        return options
+    }
+
+    static func graphics(in options: String?) -> String? {
+        guard let options else { return nil }
+        for word in options.split(separator: " ") where word.hasPrefix("CX_GRAPHICS_BACKEND=") {
+            return String(word.dropFirst("CX_GRAPHICS_BACKEND=".count))
+        }
+        return nil
+    }
+
     static func scan() -> [Game] {
         let fm = FileManager.default
         var games: [Game] = []
+        let options = launchOptions()
         for lib in libraries() {
             let apps = lib.appending(path: "steamapps")
             guard let items = try? fm.contentsOfDirectory(atPath: apps.path) else { continue }
@@ -301,7 +351,8 @@ enum GameScanner {
                 let configured = prefix.map {
                     fm.fileExists(atPath: $0.appending(path: "drive_c/Program Files (x86)/Steam/aarch64-windows/wineopenxr.dll").path)
                 } ?? false
-                games.append(Game(id: id, name: name, dir: dir, prefix: prefix, exes: exes, kind: kind, configured: configured))
+                games.append(Game(id: id, name: name, dir: dir, prefix: prefix, exes: exes, kind: kind,
+                                  configured: configured, graphics: graphics(in: options[id])))
             }
         }
         return games.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -426,6 +477,16 @@ struct GameRow: View {
                     }
                     if game.configured {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                }
+                if game.kind != .other {
+                    if game.graphics?.lowercased() == "dxmt" {
+                        Label("DXMT", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Label("Graphics is \(game.graphics ?? "NotProton's default"): choose DXMT on its Compatibility page in NotProton",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
                     }
                 }
                 if game.prefix == nil {
