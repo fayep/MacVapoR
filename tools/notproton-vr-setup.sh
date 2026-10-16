@@ -27,7 +27,9 @@
 #   - The native OpenXR loader inside wineopenxr finds alvrxr through the per-user
 #     ~/.config/openxr/1/active_runtime.json, since the run script passes no XR_* variables.
 #
-# Overridable: RUNNER, WOX (wineopenxr build output), ALVRXR_JSON, STEAM
+# Overridable: RUNNER, WOX (wineopenxr build output), ALVRXR_LIB (the runtime), STEAM
+#
+# Only tools a Mac has without the Command Line Tools, except python3 for DXVK mode.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 undo=0
@@ -39,7 +41,7 @@ case "$appid" in ''|*[!0-9]*) echo "not an app id: $appid" >&2; exit 2 ;; esac
 
 RUNNER=${RUNNER:-$HOME/Library/Application Support/notproton/runners/current}
 WOX=${WOX:-$HOME/Source/NotProton/build/wineopenxr-out}
-ALVRXR_JSON=${ALVRXR_JSON:-$here/out/alvrxr.json}
+ALVRXR_LIB=${ALVRXR_LIB:-$here/out/libalvrxr.dylib}
 STEAM=${STEAM:-$HOME/Library/Application Support/Steam}
 
 # The game may be in any Steam library; its prefix is in that library's compatdata or the main one's.
@@ -130,7 +132,7 @@ fi
 
 if [ -n "${OC:-}" ]; then
     file "$OC" | grep -q "PE32+" || { echo "$OC is not a 64-bit DLL" >&2; exit 1; }
-    strings "$OC" | grep -q "IVRCompositor_" || { echo "$OC does not look like OpenComposite" >&2; exit 1; }
+    grep -aq "IVRCompositor_" "$OC" || { echo "$OC does not look like OpenComposite" >&2; exit 1; }
     list=$(mktemp)
     openvr_dlls > "$list"
     [ -s "$list" ] || { rm -f "$list"; echo "no 64-bit openvr_api.dll in $game" >&2; exit 1; }
@@ -156,16 +158,18 @@ reg add 'HKCU\Software\Wine\VR' /v openxr_vulkan_device_pid /t REG_DWORD /d 0x1b
 
 mkdir -p "$HOME/.config/openxr/1"
 active="$HOME/.config/openxr/1/active_runtime.json"
-if [ -e "$active" ] && ! cmp -s "$ALVRXR_JSON" "$active"; then
-    echo "note: $active exists and differs; leaving it" >&2
+# Another runtime's manifest is left alone; an earlier alvrxr one is pointed at this runtime.
+if [ -e "$active" ] && ! grep -q "libalvrxr.dylib" "$active"; then
+    echo "note: $active names another runtime; leaving it" >&2
 else
-    cp -f "$ALVRXR_JSON" "$active"
-    # The manifest's library path is relative to the manifest, so point it at the build.
-    python3 -I - "$active" "$here/out/libalvrxr.dylib" <<'PY'
-import json, sys
-m = json.load(open(sys.argv[1]))
-m["runtime"]["library_path"] = sys.argv[2]
-json.dump(m, open(sys.argv[1], "w"), indent=4)
-PY
+    cat > "$active" <<JSON
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "alvrxr",
+        "library_path": "$ALVRXR_LIB"
+    }
+}
+JSON
 fi
 echo "set up $prefix for OpenXR ($exe)"

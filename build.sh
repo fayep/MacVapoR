@@ -4,6 +4,9 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 ALVR=${ALVR:-$HOME/Source/ALVR-20.14.1}
 OPENXR=${OPENXR:-$HOME/Source/OpenXR-SDK-Source}
+# The oldest macOS a release supports; without it everything targets the build machine's.
+MIN_VER=${MIN_VER:-15.0}
+export MACOSX_DEPLOYMENT_TARGET=$MIN_VER
 out="$here/out"
 mkdir -p "$out" "$here/build"
 ( cd "$ALVR" && cargo build -q -p alvr_server_core --release )
@@ -12,7 +15,7 @@ install_name_tool -id @rpath/libalvr_server_core.dylib "$out/libalvr_server_core
 codesign -f -s - "$out/libalvr_server_core.dylib" 2>/dev/null
 { printf 'static const char compose_metal[] =\n'; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/\\n"/' "$here/src/compose.metal"; printf ';\n'; } \
     > "$here/build/compose_metal.h"
-clang -dynamiclib -fobjc-arc -O2 -g -Wall -Wno-unused-function -fvisibility=hidden \
+clang -dynamiclib -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall -Wno-unused-function -fvisibility=hidden \
     -I "$here/src" -I "$here/build" -I "$OPENXR/build/include" -I /opt/homebrew/include \
     "$here/src/runtime.m" "$here/src/backend.m" "$here/src/vulkan.m" \
     -framework Foundation -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework ImageIO -framework CoreGraphics \
