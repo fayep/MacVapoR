@@ -1,0 +1,23 @@
+MacVapoR bundles software from several projects, each under its own licence.
+
+alvrxr (the OpenXR runtime, libalvrxr.dylib) and the MacVapoR app
+  https://github.com/fayep/alvrxr
+  MIT licence, see MacVapoR-MIT.txt.
+
+ALVR server_core (libalvr_server_core.dylib), ALVR 20.14.1
+  https://github.com/alvr-org/ALVR
+  MIT licence, see ALVR-MIT.txt. It is built from Rust crates under their own permissive
+  licences (MIT, Apache-2.0 and similar), listed in ALVR's Cargo.lock.
+
+OpenXR loader (libopenxr_loader.dylib), from the Khronos OpenXR-SDK-Source
+  https://github.com/KhronosGroup/OpenXR-SDK-Source, with the patch in
+  https://github.com/fayep/OpenXR-SDK-Source/tree/macos-alvrxr
+  Apache-2.0, see OpenXR-loader-Apache-2.0.txt.
+
+wineopenxr (wineopenxr.dll, wineopenxr.so), from Valve's Proton at commit
+  164e0ccd2ea2b1ec2e5d08dc97f65b184c2539ca, built for CrossOver with
+  wineopenxr-crossover.patch, from https://github.com/fayep/NotProton/tree/wineopenxr
+  BSD-3-Clause (Proton's LICENSE.proton); its generated thunk files are Apache-2.0 OR MIT.
+
+OpenComposite is not included. MacVapoR downloads it on request from its official builds,
+https://gitlab.com/znixian/OpenOVR (GPL-3.0).
