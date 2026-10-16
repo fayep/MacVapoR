@@ -1,5 +1,7 @@
 # MacVapoR
 
+<img src="macvapor/icon-256.png" width="128" alt="MacVapoR icon" align="right">
+
 Play Windows PC VR games from Steam on a Mac, shown on an Apple Vision Pro. The games run
 under [NotProton](https://github.com/NotProtonNot/NotProton)'s CrossOver runner; MacVapoR
 gives them an OpenXR runtime, alvrxr, that streams each frame to the

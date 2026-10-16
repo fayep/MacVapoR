@@ -40,7 +40,7 @@ cp "$repo/out/libalvrxr.dylib" "$repo/out/libalvr_server_core.dylib" "$code/runt
 cp "$wox/aarch64-unix/wineopenxr.so" "$wox/aarch64-unix/libopenxr_loader.dylib" "$code/wineopenxr/aarch64-unix/"
 cp "$wox/x86_64-windows/wineopenxr.dll" "$data/wineopenxr/x86_64-windows/"
 cp "$wox/wineopenxr64.json" "$data/wineopenxr/"
-cp "$repo/tools/notproton-vr-setup.sh" "$here/session-template.json" "$data/"
+cp "$repo/tools/notproton-vr-setup.sh" "$here/session-template.json" "$here/MacVapoR.icns" "$data/"
 cp "$here/LICENSES/"* "$data/LICENSES/"
 cp "$repo/LICENSE" "$data/LICENSES/MacVapoR-MIT.txt"
 cp "$ALVR/LICENSE" "$data/LICENSES/ALVR-MIT.txt"

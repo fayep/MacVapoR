@@ -8,6 +8,8 @@
 	<string>MacVapoR</string>
 	<key>CFBundleDisplayName</key>
 	<string>MacVapoR</string>
+	<key>CFBundleIconFile</key>
+	<string>MacVapoR</string>
 	<key>CFBundleExecutable</key>
 	<string>MacVapoR</string>
 	<key>CFBundlePackageType</key>
