@@ -56,6 +56,8 @@ at that height instead of your real one.
 - The Lab's Secret Shop runs at about 1 fps: its game code is slow under the x86 emulation of
   NotProton's runner. The VR pipeline is not the cause; the hub and Beat Saber run at full rate.
 - ALVR's "Stream refresh rate" setting limits the frame rate; set it to 120 Hz.
+- Westworld Awakening (Unreal Engine 4, OpenVR 1.0.10) quits about a second after the headset
+  connects; under investigation.
 
 # alvrxr, the runtime
 
