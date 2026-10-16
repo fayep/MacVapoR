@@ -1,14 +1,50 @@
-# alvrxr
+# MacVapoR
 
-An OpenXR runtime for macOS that displays through ALVR: frames go to the ALVR visionOS client
-on an Apple Vision Pro, and head, PS VR2 Sense controller and button input comes back. No
-SteamVR and no PC. The streaming side is the one proven in ../alvr-mac-spike.
+Play Windows PC VR games from Steam on a Mac, shown on an Apple Vision Pro. The games run
+under [NotProton](https://github.com/NotProtonNot/NotProton)'s CrossOver runner; MacVapoR
+gives them an OpenXR runtime, alvrxr, that streams each frame to the
+[ALVR](https://apps.apple.com/app/alvr/id6479728026) app on the Vision Pro and brings head,
+PS VR2 Sense controller and button input back. No PC and no SteamVR.
 
-Status (2026-10-15): Khronos `hello_xr` runs on it and shows correctly on the headset with
-Metal and with Vulkan (both `XR_KHR_vulkan_enable` and `enable2`, through MoltenVK), with
-controller input and haptics. The Windows build of hello_xr (D3D11) also runs on it under
-NotProton's CrossOver runner, through Proton's wineopenxr (patched for CrossOver) and DXVK;
-`tools/wine-hello.sh` sets that up in a test prefix of its own.
+OpenXR games (Beat Saber) run directly; OpenVR (SteamVR) games such as The Lab run through
+[OpenComposite](https://gitlab.com/znixian/OpenOVR), which MacVapoR downloads for you.
+
+## What you need
+
+- An Apple silicon Mac with macOS 15 or later. Tested so far on macOS 27, M4 Max.
+- NotProton with its CrossOver runner, and the games installed through Steam under it.
+- An Apple Vision Pro with ALVR from the App Store, on the same network as the Mac, and
+  PS VR2 Sense controllers paired to the Vision Pro.
+
+Tested: Beat Saber and The Lab, both with D3D11. Other D3D11 games are likely to work;
+Vulkan and D3D12 games are not supported yet.
+
+## Install
+
+1. Download the DMG from the [releases](https://github.com/fayep/MacVapoR/releases), open
+   it, and drag MacVapoR to Applications. It is signed and notarized.
+2. Open MacVapoR and click **Install**: the runtime goes into
+   `~/Library/Application Support/MacVapoR`.
+
+## Set a game up
+
+1. Launch the game once through NotProton, so it has a Wine prefix, and quit it.
+2. In NotProton, set the game's graphics to **DXMT**.
+3. In MacVapoR, find the game under **Games**, check the executable, and click **Set Up**.
+   For an OpenVR game, click **Download OpenComposite** first.
+4. Wake the controllers, open ALVR on the Vision Pro, and launch the game.
+5. The first time, the headset appears under **Headsets**: trust it, then restart the game.
+
+**Undo** puts a game back as it was. The runtime's log is at `~/Library/Logs/alvrxr.log`.
+
+## Known issues
+
+- If visionOS takes focus away (Siri, a screenshot, the Mac's screen), the controllers'
+  buttons stop working until ALVR is reopened. A fix for the ALVR app is waiting upstream.
+- The controllers must be awake when ALVR connects, or their buttons may not come through.
+- Loading screens hold the last frame; there is no compositor scene in between.
+
+# alvrxr, the runtime
 
 ## Build and use
 
@@ -48,3 +84,11 @@ file, for a look with a desktop decoder.
 - The aim pose is the grip pose; the offset is not measured yet.
 - Quad and other non-projection layers are ignored; depth is accepted and ignored.
 - Velocities are not reported.
+
+## Releases
+
+`macvapor/make-release.sh` builds the runtime, NotProton's wineopenxr and the MacVapoR app for
+macOS 15, signs them with a Developer ID, notarizes and staples the app and the DMG.
+`tools/notproton-vr-setup.sh` is the per-game setup MacVapoR runs, usable on its own.
+
+MIT licence; the bundled components keep their own, see `macvapor/LICENSES/NOTICE.txt`.

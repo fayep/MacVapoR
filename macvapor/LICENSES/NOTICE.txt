@@ -1,7 +1,7 @@
 MacVapoR bundles software from several projects, each under its own licence.
 
 alvrxr (the OpenXR runtime, libalvrxr.dylib) and the MacVapoR app
-  https://github.com/fayep/alvrxr
+  https://github.com/fayep/MacVapoR
   MIT licence, see MacVapoR-MIT.txt.
 
 ALVR server_core (libalvr_server_core.dylib), ALVR 20.14.1
