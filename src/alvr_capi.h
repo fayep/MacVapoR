@@ -78,3 +78,6 @@ void alvr_report_present(uint64_t timestamp_ns, uint64_t offset_ns);
 bool alvr_duration_until_next_vsync(uint64_t *out_ns);
 void alvr_restart(void);
 void alvr_shutdown(void);
+// From alvrxr's ALVR patch (patches/alvr-20.14.1-game-audio.patch).
+void alvr_set_external_game_audio(uint32_t sample_rate);
+void alvr_send_game_audio(const int16_t *samples, uint64_t frame_count);

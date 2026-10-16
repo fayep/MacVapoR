@@ -38,14 +38,8 @@ int64_t axr_now_ns(void);              // XrTime: CLOCK_MONOTONIC nanoseconds
 // and dropped, and poses fall back to a standing default.
 void axr_backend_start(void);
 
-// The game's own audio, tapped for ALVR to stream (audio.m).
-// Named after the game's process: ALVR picks the first device whose name contains its setting,
-// and other games' devices, or ones left behind, would otherwise match too.
-#define AXR_GAME_AUDIO_DEVICE "alvrxr game audio"
-#ifdef __OBJC__
-@class NSString;
-NSString *axr_game_audio_device_name(void);
-#endif
+// The game's audio, tapped by MacVapoR Audio and handed to ALVR (audio.m).
+bool axr_audio_available(void);
 void axr_audio_start(void);
 void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
 bool axr_backend_connected(void);

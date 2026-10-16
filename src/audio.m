@@ -1,130 +1,123 @@
-// Game audio for ALVR. macOS cannot record an output device the way ALVR's loopback capture
-// expects, so the runtime taps its own process, the game's, whose audio Wine plays from
-// in-process, and puts the tap in a private aggregate device that ALVR records as its game
-// audio device (see prepare_session). The tap is read for as long as the game runs, so the Mac's
-// own output stays muted whether or not a headset is connected to hear it.
+// Game audio for ALVR. Recording a tap from inside the game's process depends on which of the game's
+// processes macOS holds responsible for the permission, so it came and went. MacVapoR Audio, a
+// helper app with a permission of its own, taps the game instead and hands the samples over in
+// shared memory; the runtime passes them to ALVR, which streams them with the video. The helper
+// also keeps the game muted on the Mac.
 
-#import <CoreAudio/AudioHardware.h>
-#import <CoreAudio/AudioHardwareTapping.h>
-#import <CoreAudio/CATapDescription.h>
 #import <Foundation/Foundation.h>
+#include <fcntl.h>
 #include <math.h>
+#include <pthread.h>
+#include <spawn.h>
 #include <stdatomic.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
+#include "alvr_capi.h"
 #include "alvrxr.h"
+#include "../helper/audio_ring.h"
 
-static AudioObjectID g_tap = kAudioObjectUnknown;
-static AudioObjectID g_aggregate = kAudioObjectUnknown;
-static AudioDeviceIOProcID g_sink;
-// For the frame summary: what the sink has read since the last one, and how loud it was.
-static _Atomic uint64_t g_tapped_frames;
-static _Atomic uint32_t g_tapped_peak;   // x 1000
+extern char **environ;
+
+#define STREAM_RATE 48000
+
+static axr_audio_ring *g_ring;
+static _Atomic uint64_t g_stat_frames;
+static _Atomic uint32_t g_stat_peak;   // x 1000
 
 void axr_audio_stats(uint64_t *frames, float *peak) {
-    *frames = atomic_exchange(&g_tapped_frames, 0);
-    *peak = atomic_exchange(&g_tapped_peak, 0) / 1000.0f;
-}
-static dispatch_source_t g_retry;
-
-NSString *axr_game_audio_device_name(void) {
-    return [NSString stringWithFormat:@"%s %d", AXR_GAME_AUDIO_DEVICE, getpid()];
+    *frames = atomic_exchange(&g_stat_frames, 0);
+    *peak = atomic_exchange(&g_stat_peak, 0) / 1000.0f;
 }
 
-static AudioObjectID own_process_object(void) {
-    AudioObjectPropertyAddress a = {kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal,
-                                    kAudioObjectPropertyElementMain};
-    pid_t pid = getpid();
-    AudioObjectID object = kAudioObjectUnknown;
-    UInt32 size = sizeof(object);
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, sizeof(pid), &pid, &size, &object) != noErr)
-        return kAudioObjectUnknown;
-    return object;
+static NSString *helper_path(void) {
+    NSString *env = NSProcessInfo.processInfo.environment[@"ALVRXR_AUDIO_HELPER"];
+    return env ?: [NSHomeDirectory() stringByAppendingPathComponent:
+                                         @"Library/Application Support/MacVapoR/MacVapoR Audio.app"];
 }
 
-static NSString *default_output_uid(void) {
-    AudioObjectPropertyAddress a = {kAudioHardwarePropertyDefaultSystemOutputDevice, kAudioObjectPropertyScopeGlobal,
-                                    kAudioObjectPropertyElementMain};
-    AudioObjectID device = kAudioObjectUnknown;
-    UInt32 size = sizeof(device);
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &a, 0, NULL, &size, &device) != noErr) return nil;
-    a.mSelector = kAudioDevicePropertyDeviceUID;
-    CFStringRef uid = NULL;
-    size = sizeof(uid);
-    if (AudioObjectGetPropertyData(device, &a, 0, NULL, &size, &uid) != noErr) return nil;
-    return (__bridge_transfer NSString *)uid;
+bool axr_audio_available(void) {
+    return [NSFileManager.defaultManager fileExistsAtPath:helper_path()];
 }
 
-// The game's process only exists for Core Audio once it has opened audio, which may be after
-// the runtime starts.
-static bool try_tap(void) {
-    AudioObjectID process = own_process_object();
-    if (process == kAudioObjectUnknown) return false;
+static int16_t to_i16(float x) {
+    x = fmaxf(-1.0f, fminf(1.0f, x));
+    return (int16_t)lrintf(x * 32767.0f);
+}
 
-    CATapDescription *tap = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[ @(process) ]];
-    tap.name = axr_game_audio_device_name();
-    // Its own UUID, which is how the aggregate device below names it; taps outlive their process,
-    // and one left with the same UUID would be the one used.
-    tap.UUID = [NSUUID UUID];
-    tap.privateTap = YES;
-    tap.muteBehavior = CATapMutedWhenTapped;
-    OSStatus st = AudioHardwareCreateProcessTap(tap, &g_tap);
-    if (st != noErr) {
-        axr_log("audio: could not tap the game's audio (%d)", (int)st);
-        return true;
-    }
-
-    NSString *output = default_output_uid();
-    NSMutableDictionary *agg = [@{
-        @kAudioAggregateDeviceNameKey : axr_game_audio_device_name(),
-        @kAudioAggregateDeviceUIDKey : [NSUUID UUID].UUIDString,
-        @kAudioAggregateDeviceIsPrivateKey : @YES,
-        @kAudioAggregateDeviceTapAutoStartKey : @YES,
-        @kAudioAggregateDeviceTapListKey : @[ @{
-            @kAudioSubTapUIDKey : tap.UUID.UUIDString,
-            @kAudioSubTapDriftCompensationKey : @YES,
-        } ],
-    } mutableCopy];
-    // ALVR looks its device up among output devices, so the aggregate carries the Mac's output.
-    if (output) {
-        agg[@kAudioAggregateDeviceMainSubDeviceKey] = output;
-        agg[@kAudioAggregateDeviceSubDeviceListKey] = @[ @{@kAudioSubDeviceUIDKey : output} ];
-    }
-    st = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)agg, &g_aggregate);
-    if (st != noErr) {
-        axr_log("audio: could not make the game audio device (%d)", (int)st);
-        AudioHardwareDestroyProcessTap(g_tap);
-        g_tap = kAudioObjectUnknown;
-        return true;
-    }
-    // A reader that drops the audio, so the tap is read, and the Mac muted, without ALVR too.
-    st = AudioDeviceCreateIOProcIDWithBlock(&g_sink, g_aggregate, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
-                                            ^(const AudioTimeStamp *now, const AudioBufferList *in,
-                                              const AudioTimeStamp *in_time, AudioBufferList *out,
-                                              const AudioTimeStamp *out_time) {
-        for (UInt32 b = 0; in && b < in->mNumberBuffers; b++) {
-            const float *x = in->mBuffers[b].mData;
-            UInt32 n = in->mBuffers[b].mDataByteSize / sizeof(float);
-            float peak = 0;
-            for (UInt32 i = 0; x && i < n; i++) peak = fmaxf(peak, fabsf(x[i]));
-            uint32_t p = (uint32_t)(peak * 1000), old = atomic_load(&g_tapped_peak);
-            while (p > old && !atomic_compare_exchange_weak(&g_tapped_peak, &old, p)) {}
-            if (b == 0) atomic_fetch_add(&g_tapped_frames, n / (in->mBuffers[b].mNumberChannels ?: 1));
+// Reads the ring into ALVR in 10 ms pieces, at the stream's rate.
+static void *reader(void *arg) {
+    int16_t out[STREAM_RATE / 100 * 2];
+    double position = 0;   // in source frames, for resampling
+    for (;;) {
+        usleep(5000);
+        uint32_t rate = atomic_load(&g_ring->sample_rate);
+        if (!rate) continue;
+        uint64_t written = atomic_load_explicit(&g_ring->written, memory_order_acquire);
+        uint64_t read = atomic_load(&g_ring->read);
+        if (written - read > AXR_AUDIO_RING_FRAMES / 2) read = written - AXR_AUDIO_RING_FRAMES / 4;   // fell behind
+        if (position < read) position = read;
+        double step = (double)rate / STREAM_RATE;
+        float peak = 0;
+        while (position + step + 1 < written) {
+            uint32_t n = 0;
+            while (n < STREAM_RATE / 100 && position + 1 < written) {
+                uint64_t i = (uint64_t)position;
+                float t = (float)(position - i);
+                const float *a = g_ring->frames[i % AXR_AUDIO_RING_FRAMES];
+                const float *b = g_ring->frames[(i + 1) % AXR_AUDIO_RING_FRAMES];
+                for (int c = 0; c < 2; c++) {
+                    float x = a[c] + (b[c] - a[c]) * t;
+                    peak = fmaxf(peak, fabsf(x));
+                    out[n * 2 + c] = to_i16(x);
+                }
+                n++;
+                position += step;
+            }
+            alvr_send_game_audio(out, n);
+            atomic_fetch_add(&g_stat_frames, n);
         }
-    });
-    if (st == noErr) st = AudioDeviceStart(g_aggregate, g_sink);
-    if (st != noErr) axr_log("audio: could not keep the Mac muted (%d)", (int)st);
-    axr_log("audio: game audio tapped for ALVR (process object %u)", process);
-    return true;
+        atomic_store(&g_ring->read, (uint64_t)position);
+        uint32_t p = (uint32_t)(peak * 1000), old = atomic_load(&g_stat_peak);
+        while (p > old && !atomic_compare_exchange_weak(&g_stat_peak, &old, p)) {}
+    }
+    return NULL;
 }
 
 void axr_audio_start(void) {
-    if (try_tap()) return;
-    g_retry = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
-    dispatch_source_set_timer(g_retry, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC,
-                              NSEC_PER_SEC / 2);
-    dispatch_source_set_event_handler(g_retry, ^{
-        if (try_tap()) dispatch_source_cancel(g_retry);
-    });
-    dispatch_resume(g_retry);
+    if (!axr_audio_available()) {
+        axr_log("audio: MacVapoR Audio is not installed; no game audio");
+        return;
+    }
+    char name[64];
+    snprintf(name, sizeof name, AXR_AUDIO_RING_NAME_FORMAT, getpid());
+    shm_unlink(name);
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || ftruncate(fd, sizeof *g_ring) != 0) {
+        axr_log("audio: no shared memory for the game audio");
+        if (fd >= 0) close(fd);
+        return;
+    }
+    g_ring = mmap(NULL, sizeof *g_ring, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (g_ring == MAP_FAILED) {
+        g_ring = NULL;
+        return;
+    }
+    alvr_set_external_game_audio(STREAM_RATE);
+
+    // Through Launch Services, so the helper is responsible for itself and its permission is used.
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", getpid());
+    const char *app = helper_path().fileSystemRepresentation;
+    char *args[] = {"open", "-g", "-j", "-n", "-a", (char *)app, "--args", "--pid", pid, NULL};
+    pid_t child;
+    if (posix_spawn(&child, "/usr/bin/open", NULL, NULL, args, environ) != 0) {
+        axr_log("audio: could not start MacVapoR Audio");
+        return;
+    }
+    pthread_t t;
+    pthread_create(&t, NULL, reader, NULL);
+    pthread_detach(t);
+    axr_log("audio: MacVapoR Audio taps the game");
 }

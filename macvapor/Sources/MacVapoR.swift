@@ -10,6 +10,8 @@ enum Paths {
     static let runtime = support.appending(path: "runtime")
     static let wineopenxr = support.appending(path: "wineopenxr")
     static let script = support.appending(path: "notproton-vr-setup.sh")
+    static let audioHelper = support.appending(path: "MacVapoR Audio.app")
+    static let audioPermission = support.appending(path: "audio-permission")
     static let version = support.appending(path: "version")
     static let openComposite = support.appending(path: "opencomposite/openvr_api.dll")
     static let session = home.appending(path: "Library/Application Support/alvrxr/session.json")
@@ -22,6 +24,7 @@ enum Paths {
     // Code is in Contents/Library, data in Contents/Resources.
     static let bundledCode = Bundle.main.bundleURL.appending(path: "Contents/Library/MacVapoR")
     static let bundledData = Bundle.main.resourceURL!
+    static let bundledAudioHelper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/MacVapoR Audio.app")
 }
 
 struct Headset: Identifiable {
@@ -53,12 +56,41 @@ final class Model: ObservableObject {
     @Published var games: [Game] = []
     @Published var output = ""
     @Published var busy = false
+    /// Whether MacVapoR Audio may record games' audio: nil while checking.
+    @Published var audioAllowed: Bool?
+    @Published var audioChecking = false
 
     let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     var hasRunner: Bool { FileManager.default.fileExists(atPath: Paths.runner.path) }
     var hasOpenComposite: Bool { FileManager.default.fileExists(atPath: Paths.openComposite.path) }
 
-    init() { refresh() }
+    init() {
+        refresh()
+        checkAudioPermission()
+    }
+
+    // MARK: game audio
+
+    /// MacVapoR Audio taps briefly, which makes macOS ask the first time, and reports back. It is
+    /// opened through Launch Services so that the permission is its own, as when games use it.
+    func checkAudioPermission() {
+        guard FileManager.default.fileExists(atPath: Paths.audioHelper.path) else { return }
+        audioChecking = true
+        audioAllowed = nil
+        try? FileManager.default.removeItem(at: Paths.audioPermission)
+        Task.detached {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = ["-W", "-g", "-n", "-a", Paths.audioHelper.path, "--args", "--check", Paths.audioPermission.path]
+            try? p.run()
+            p.waitUntilExit()
+            let result = try? String(contentsOf: Paths.audioPermission, encoding: .utf8)
+            await MainActor.run {
+                self.audioAllowed = result == "allowed"
+                self.audioChecking = false
+            }
+        }
+    }
 
     func refresh() {
         installedVersion = try? String(contentsOf: Paths.version, encoding: .utf8)
@@ -86,6 +118,8 @@ final class Model: ObservableObject {
                             to: Paths.wineopenxr.appending(path: "aarch64-unix"))
             try? fm.removeItem(at: Paths.script)
             try fm.copyItem(at: Paths.bundledData.appending(path: "notproton-vr-setup.sh"), to: Paths.script)
+            try? fm.removeItem(at: Paths.audioHelper)
+            try fm.copyItem(at: Paths.bundledAudioHelper, to: Paths.audioHelper)
 
             if !fm.fileExists(atPath: Paths.session.path) {
                 try fm.createDirectory(at: Paths.session.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -95,6 +129,7 @@ final class Model: ObservableObject {
             try bundleVersion.write(to: Paths.version, atomically: true, encoding: .utf8)
             Self.clearQuarantine(Paths.support)
             output = "Runtime \(bundleVersion) installed."
+            checkAudioPermission()
         } catch {
             output = "Install failed: \(error.localizedDescription)"
         }
@@ -428,6 +463,7 @@ struct ContentView: View {
                           systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
+                audioStatus
                 HStack {
                     if let v = model.installedVersion {
                         Text(v == model.bundleVersion ? "alvrxr \(v) is installed." : "alvrxr \(v) is installed; this is \(model.bundleVersion).")
@@ -440,6 +476,28 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(4)
+        }
+    }
+
+    @ViewBuilder private var audioStatus: some View {
+        if model.installedVersion == nil {
+            EmptyView()
+        } else if model.audioChecking {
+            Label("Game audio: checking. If macOS asks whether MacVapoR Audio may record audio, allow it.",
+                  systemImage: "speaker.wave.2")
+                .foregroundStyle(.secondary)
+        } else if model.audioAllowed == true {
+            Label("Game audio: allowed", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+        } else if model.audioAllowed == false {
+            HStack {
+                Label("Game audio is not allowed: turn on MacVapoR Audio under Screen & System Audio Recording.",
+                      systemImage: "speaker.slash")
+                    .foregroundStyle(.orange)
+                Button("Open Settings") {
+                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture")!)
+                }
+                Button("Check Again") { model.checkAudioPermission() }
+            }
         }
     }
 

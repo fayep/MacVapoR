@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.zippysoft.macvapor.audio</string>
+	<key>CFBundleName</key>
+	<string>MacVapoR Audio</string>
+	<key>CFBundleDisplayName</key>
+	<string>MacVapoR Audio</string>
+	<key>CFBundleExecutable</key>
+	<string>MacVapoR Audio</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleIconFile</key>
+	<string>MacVapoR</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>MacVapoR sends the sound of the game you are playing to your Vision Pro with the picture.</string>
+</dict>
+</plist>

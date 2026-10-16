@@ -78,13 +78,11 @@ static void prepare_session(void) {
     NSMutableDictionary *video = s[@"session_settings"][@"video"];
     video[@"preferred_codec"][@"variant"] = @"Hevc";
     video[@"foveated_encoding"][@"enabled"] = @YES;
-    // ALVR streams the game's audio from the device audio.m makes; macOS has no loopback for it.
+    // Game audio comes from MacVapoR Audio through audio.m, not a device ALVR records; without the
+    // helper it is off, as ALVR would otherwise fail every handshake looking for a device.
     NSMutableDictionary *game_audio = s[@"session_settings"][@"audio"][@"game_audio"];
-    game_audio[@"enabled"] = @YES;
-    game_audio[@"content"][@"device"] = [@{
-        @"set" : @YES,
-        @"content" : [@{@"variant" : @"NameSubstring", @"NameSubstring" : axr_game_audio_device_name(), @"Index" : @0} mutableCopy],
-    } mutableCopy];
+    game_audio[@"enabled"] = @(axr_audio_available());
+    game_audio[@"content"][@"device"][@"set"] = @NO;
     NSMutableDictionary *conn = s[@"session_settings"][@"connection"];
     for (NSString *k in @[ @"server_send_buffer_bytes", @"server_recv_buffer_bytes", @"client_send_buffer_bytes",
                            @"client_recv_buffer_bytes" ]) {

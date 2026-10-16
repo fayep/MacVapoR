@@ -35,6 +35,13 @@ mkdir -p "$app/Contents/MacOS" "$code/runtime" "$code/wineopenxr/aarch64-unix" \
     "$data/wineopenxr/x86_64-windows" "$data/LICENSES"
 swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_VER" "$here/Sources/MacVapoR.swift" \
     -o "$app/Contents/MacOS/MacVapoR"
+# MacVapoR Audio, which taps games' audio with a permission of its own.
+helper="$app/Contents/Helpers/MacVapoR Audio.app"
+mkdir -p "$helper/Contents/MacOS" "$helper/Contents/Resources"
+clang -fobjc-arc -O2 -mmacosx-version-min="$MIN_VER" "$repo/helper/main.m" -framework CoreAudio -framework Foundation \
+    -o "$helper/Contents/MacOS/MacVapoR Audio"
+sed "s/@VERSION@/$VERSION/g" "$repo/helper/Info.plist" > "$helper/Contents/Info.plist"
+cp "$here/MacVapoR.icns" "$helper/Contents/Resources/"
 sed "s/@VERSION@/$VERSION/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 cp "$repo/out/libalvrxr.dylib" "$repo/out/libalvr_server_core.dylib" "$code/runtime/"
 cp "$wox/aarch64-unix/wineopenxr.so" "$wox/aarch64-unix/libopenxr_loader.dylib" "$code/wineopenxr/aarch64-unix/"
@@ -47,7 +54,7 @@ cp "$ALVR/LICENSE" "$data/LICENSES/ALVR-MIT.txt"
 cp "$OPENXR/LICENSES/Apache-2.0.txt" "$data/LICENSES/OpenXR-loader-Apache-2.0.txt"
 cp "$NOTPROTON/wineopenxr/crossover.patch" "$data/LICENSES/wineopenxr-crossover.patch"
 
-for f in "$code"/runtime/* "$code"/wineopenxr/aarch64-unix/* "$app/Contents/MacOS/MacVapoR"; do
+for f in "$code"/runtime/* "$code"/wineopenxr/aarch64-unix/* "$app/Contents/MacOS/MacVapoR" "$helper/Contents/MacOS/MacVapoR Audio"; do
     case "$(vtool -show-build "$f" 2>/dev/null | sed -n 's/.*minos //p' | head -1)" in
         "$MIN_VER") ;;
         *) echo "==> $f does not target macOS $MIN_VER" >&2; exit 1 ;;
@@ -58,6 +65,7 @@ echo "==> signing as $IDENTITY"
 sign() { codesign --force --timestamp --options runtime --sign "$IDENTITY" "$@"; }
 [ "$IDENTITY" = "-" ] && sign() { codesign --force --sign - "$@"; }
 for f in "$code"/runtime/* "$code"/wineopenxr/aarch64-unix/*; do sign "$f"; done
+sign "$helper"
 sign "$app"
 codesign --verify --deep --strict "$app"
 
