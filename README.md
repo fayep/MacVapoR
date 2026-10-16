@@ -104,6 +104,9 @@ file, for a look with a desktop decoder.
 
 `macvapor/make-release.sh` builds the runtime, NotProton's wineopenxr and the MacVapoR app for
 macOS 15, signs them with a Developer ID, notarizes and staples the app and the DMG.
+To sign with your own Developer ID, copy `macvapor/release.env.example` to
+`macvapor/release.env` (ignored by git) and fill it in, or set `IDENTITY` and `NOTARY_PROFILE`
+in the environment. Without them the build is signed ad hoc and not notarized.
 `tools/notproton-vr-setup.sh` is the per-game setup MacVapoR runs, usable on its own.
 
 MIT licence; the bundled components keep their own, see `macvapor/LICENSES/NOTICE.txt`.

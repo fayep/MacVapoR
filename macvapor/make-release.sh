@@ -4,16 +4,25 @@
 #
 #   macvapor/make-release.sh                 everything, into macvapor/dist/
 #   SKIP_BUILD=1 macvapor/make-release.sh    reuse alvrxr's out/ and wineopenxr's build output
-#   NOTARY_PROFILE= macvapor/make-release.sh sign only, no notarization (a local test build)
 #
-# Overridable: IDENTITY (codesign identity, "-" for ad hoc), NOTARY_PROFILE (a notarytool
-# keychain profile, from `xcrun notarytool store-credentials`), NOTPROTON, OPENXR, ALVR
+# Signing is your own: set IDENTITY (a codesign identity, e.g. "Developer ID Application: Name
+# (TEAMID)") and NOTARY_PROFILE (a notarytool keychain profile, from `xcrun notarytool
+# store-credentials`) in the environment or in macvapor/release.env, which git ignores; see
+# release.env.example. Without them the build is signed ad hoc and not notarized, which is
+# fine on the Mac that built it.
+#
+# Also overridable: NOTPROTON, OPENXR, ALVR (source trees)
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/.." && pwd)
 VERSION=$(cat "$here/VERSION")
-IDENTITY=${IDENTITY:-Developer ID Application: Faye Salwin (63JE575Q9W)}
-NOTARY_PROFILE=${NOTARY_PROFILE-m4xstudio-notary}
+# The environment wins over release.env, so NOTARY_PROFILE= still skips notarization.
+env_id=${IDENTITY+set}:${IDENTITY-} env_np=${NOTARY_PROFILE+set}:${NOTARY_PROFILE-}
+[ -f "$here/release.env" ] && . "$here/release.env"
+case $env_id in set:*) IDENTITY=${env_id#set:} ;; esac
+case $env_np in set:*) NOTARY_PROFILE=${env_np#set:} ;; esac
+IDENTITY=${IDENTITY:--}
+NOTARY_PROFILE=${NOTARY_PROFILE:-}
 NOTPROTON=${NOTPROTON:-$HOME/Source/NotProton}
 OPENXR=${OPENXR:-$HOME/Source/OpenXR-SDK-Source}
 ALVR=${ALVR:-$HOME/Source/ALVR-20.14.1}
