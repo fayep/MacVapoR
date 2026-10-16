@@ -98,5 +98,5 @@ if [ -n "$NOTARY_PROFILE" ] && [ "$IDENTITY" != "-" ]; then
     xcrun stapler staple "$dmg"
     spctl --assess --type open --context context:primary-signature -v "$dmg"
 fi
-shasum -a 256 "$dmg" | tee "$dmg.sha256"
+(cd "$(dirname "$dmg")" && shasum -a 256 "$(basename "$dmg")") | tee "$dmg.sha256"
 echo "==> $dmg"
