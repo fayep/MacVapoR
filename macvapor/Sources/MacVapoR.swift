@@ -235,8 +235,11 @@ enum GameScanner {
             for line in text.split(separator: "\n") where line.contains("\"path\"") {
                 let parts = line.split(separator: "\"")
                 if parts.count >= 4 {
+                    // Steam lists its own library here too; compare paths, as URLs differ by a trailing slash.
                     let url = URL(fileURLWithPath: String(parts[3]).replacingOccurrences(of: "\\\\", with: "\\"))
-                    if !libs.contains(url) { libs.append(url) }
+                    if !libs.contains(where: { $0.standardizedFileURL.path == url.standardizedFileURL.path }) {
+                        libs.append(url)
+                    }
                 }
             }
         }
@@ -262,6 +265,7 @@ enum GameScanner {
                       let id = value("appid", in: acf), let name = value("name", in: acf),
                       let installdir = value("installdir", in: acf) else { continue }
                 if id == "228980" || id == "250820" { continue }   // Steamworks redistributables, SteamVR
+                if games.contains(where: { $0.id == id }) { continue }
                 let dir = apps.appending(path: "common/\(installdir)")
                 var exes: [String] = []
                 var kind = Game.Kind.other
