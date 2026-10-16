@@ -36,6 +36,8 @@ Vulkan and D3D12 games are not supported yet.
    For an OpenVR game, click **Download OpenComposite** first.
 4. Wake the controllers, open ALVR on the Vision Pro, and launch the game.
 5. The first time, the headset appears under **Headsets**: trust it, then restart the game.
+6. The first time each game runs, macOS asks to let it (e.g. "Beat Saber.exe") record audio:
+   allow it, so the game's sound reaches the headset.
 
 **Undo** puts a game back as it was. The runtime's log is at `~/Library/Logs/alvrxr.log`.
 
