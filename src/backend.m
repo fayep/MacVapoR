@@ -382,7 +382,8 @@ static void snapshot_eyes(const axr_eye_image eyes[2], id<MTLCommandQueue> queue
         MTLPixelFormat fmt = src.pixelFormat;
         bool bgra = fmt == MTLPixelFormatBGRA8Unorm || fmt == MTLPixelFormatBGRA8Unorm_sRGB;
         bool rgba = fmt == MTLPixelFormatRGBA8Unorm || fmt == MTLPixelFormatRGBA8Unorm_sRGB;
-        if (!bgra && !rgba) { axr_log("snapshot: format %lu not handled", (unsigned long)fmt); continue; }
+        bool half = fmt == MTLPixelFormatRGBA16Float;   // linear, as Ready At Dawn's games submit
+        if (!bgra && !rgba && !half) { axr_log("snapshot: format %lu not handled", (unsigned long)fmt); continue; }
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:eyes[e].width
                                                                                     height:eyes[e].height mipmapped:NO];
         d.storageMode = MTLStorageModeShared;
@@ -395,12 +396,21 @@ static void snapshot_eyes(const axr_eye_image eyes[2], id<MTLCommandQueue> queue
         [blit endEncoding];
         NSString *path = [g_config_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"snapshot-%d-eye%d.png", n, e]];
         [cmd addCompletedHandler:^(id<MTLCommandBuffer> _) {
-            size_t w = dst.width, h = dst.height, row = w * 4;
+            size_t w = dst.width, h = dst.height, row = w * (half ? 8 : 4);
             NSMutableData *px = [NSMutableData dataWithLength:row * h];
             [dst getBytes:px.mutableBytes bytesPerRow:row fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
-            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(half ? kCGColorSpaceExtendedLinearSRGB : kCGColorSpaceSRGB);
             CGBitmapInfo info = bgra ? (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst) : (CGBitmapInfo)kCGImageAlphaNoneSkipLast;
-            CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, w, h, 8, row, cs, info);
+            if (half) {
+                info = kCGImageAlphaNoneSkipLast | kCGBitmapFloatComponents | kCGBitmapByteOrder16Little;
+                // The brightest colour value, so an all-black image shows in the log.
+                const __fp16 *v = px.bytes;
+                float hi = 0;
+                for (size_t i = 0; i < w * h * 4; i += 4)
+                    for (int c = 0; c < 3; c++) if ((float)v[i + c] > hi) hi = (float)v[i + c];
+                axr_log("snapshot %d eye %d: brightest colour value %.4f", n, e, hi);
+            }
+            CGContextRef ctx = CGBitmapContextCreate(px.mutableBytes, w, h, half ? 16 : 8, row, cs, info);
             CGImageRef img = CGBitmapContextCreateImage(ctx);
             CGImageDestinationRef out = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path],
                                                                         CFSTR("public.png"), 1, NULL);
