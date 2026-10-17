@@ -8,6 +8,8 @@
 #   tools/notproton-vr-setup.sh --undo APPID 'Game.exe'
 #   GFX=dxmt tools/notproton-vr-setup.sh APPID 'Game.exe'   D3D11 games on CrossOver's DXMT,
 #       chosen with the game's graphics option in NotProton; no DXVK is put in place
+#   GAME_DIR=/path/to/game tools/notproton-vr-setup.sh SHORTCUT_ID 'bin/Game.exe'
+#       a non-Steam game added as a shortcut: its folder is given, as it has no app manifest
 #   OC=/path/to/openvr_api.dll tools/notproton-vr-setup.sh APPID 'Game.exe'
 #       an OpenVR game: OpenComposite's 64-bit openvr_api.dll replaces the game's own, which is
 #       kept as openvr_api.dll.orig and put back by --undo
@@ -27,7 +29,7 @@
 #   - The native OpenXR loader inside wineopenxr finds alvrxr through the per-user
 #     ~/.config/openxr/1/active_runtime.json, since the run script passes no XR_* variables.
 #
-# Overridable: RUNNER, WOX (wineopenxr build output), ALVRXR_LIB (the runtime), STEAM
+# Overridable: RUNNER, WOX (wineopenxr build output), ALVRXR_LIB (the runtime), STEAM, GAME_DIR
 #
 # Only tools a Mac has without the Command Line Tools, except python3 for DXVK mode.
 set -eu
@@ -45,6 +47,12 @@ ALVRXR_LIB=${ALVRXR_LIB:-$here/out/libalvrxr.dylib}
 STEAM=${STEAM:-$HOME/Library/Application Support/Steam}
 
 # The game may be in any Steam library; its prefix is in that library's compatdata or the main one's.
+# A shortcut's prefix is always in the main one's.
+if [ -n "${GAME_DIR:-}" ]; then
+    game=$GAME_DIR
+    prefix="$STEAM/steamapps/compatdata/$appid/pfx"
+    [ -f "$prefix/system.reg" ] || { echo "no prefix for $appid; launch the game once first" >&2; exit 1; }
+else
 library=
 for lib in "$STEAM" $(sed -n 's/.*"path"[[:space:]]*"\(.*\)".*/\1/p' "$STEAM/steamapps/libraryfolders.vdf" | tr ' ' '\001'); do
     lib=$(printf '%s' "$lib" | tr '\001' ' ')
@@ -56,6 +64,7 @@ prefix="$library/steamapps/compatdata/$appid/pfx"
 [ -f "$prefix/system.reg" ] || { echo "no prefix for $appid; launch the game once first" >&2; exit 1; }
 game_dir=$(sed -n 's/.*"installdir"[[:space:]]*"\(.*\)".*/\1/p' "$library/steamapps/appmanifest_$appid.acf")
 game="$library/steamapps/common/$game_dir"
+fi
 [ -f "$game/$exe" ] || { echo "no $exe in $game" >&2; exit 1; }
 # The executable may be in a subfolder, as The Lab's TheLab/win64/TheLab.exe; Wine's per-app
 # settings go by its name, and DXVK's d3d11 goes beside it.
