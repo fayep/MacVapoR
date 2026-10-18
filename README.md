@@ -63,8 +63,10 @@ see [home/SCENES.md](home/SCENES.md).
   buttons stop working until ALVR is reopened. A fix for the ALVR app is waiting upstream.
 - The controllers must be awake when ALVR connects, or their buttons may not come through.
 - Loading screens hold the last frame; there is no compositor scene in between.
-- The Lab's Secret Shop runs at about 1 fps: its game code is slow under the x86 emulation of
-  NotProton's runner. The VR pipeline is not the cause; the hub and Beat Saber run at full rate.
+- The Lab's Secret Shop runs at about 1 fps, because of a bug in CrossOver's MSync that NotProton's
+  runner still has: some waits leave entries behind in the wineserver until its pool runs out, and
+  from then on it stalls the game. Highball has a fix (its patch 0014); until the runner has it,
+  `WINEMSYNC=0` in the game's launch options makes it about three times faster, which is still slow.
 - ALVR's "Stream refresh rate" setting limits the frame rate; set it to 120 Hz.
 - Westworld Awakening (Unreal Engine 4, OpenVR 1.0.10) quits about a second after the headset
   connects; under investigation.
