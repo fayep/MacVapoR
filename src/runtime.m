@@ -24,7 +24,7 @@ extern unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
 
 // ------------------------------------------------------------------------------------ handles
 
-enum { MAGIC_INSTANCE = 0x41585249, MAGIC_SESSION, MAGIC_SPACE, MAGIC_SWAPCHAIN, MAGIC_ACTIONSET, MAGIC_ACTION };
+enum { MAGIC_INSTANCE = 0x41585249, MAGIC_SESSION, MAGIC_SPACE, MAGIC_SWAPCHAIN, MAGIC_ACTIONSET, MAGIC_ACTION, MAGIC_HAND };
 
 typedef struct instance {
     uint32_t magic;
@@ -78,7 +78,6 @@ typedef struct space {
     XrReferenceSpaceType ref;
     action *act;
     int hand;                               // AXR_LEFT/RIGHT for action spaces
-    bool aim;
     XrPosef offset;
 } space;
 
@@ -95,6 +94,17 @@ struct session {
     XrPosef local;                           // LOCAL's origin in STAGE
     bool local_from_headset;
     uint32_t recenter_seen;                  // axr_recenter_generation() when LOCAL was last taken
+    // Images a D3D11 bridge shares rather than copies (wineopenxr on DXMT; see
+    // xrSetSwapchainImagesALVRXR): the GPU waits for each one's fence before the next frame reads
+    // it, and signals it once that frame is done with it.
+    struct {
+        swapchain *sc;
+        uint32_t index;
+        id<MTLSharedEvent> __strong event;
+        uint64_t wait, signal;
+        bool waited;
+    } fences[16];
+    uint32_t fence_count;
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -191,6 +201,7 @@ static const XrExtensionProperties g_extensions[] = {
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME, XR_KHR_convert_timespec_time_SPEC_VERSION},
     {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME, XR_KHR_composition_layer_depth_SPEC_VERSION},
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_hand_tracking_SPEC_VERSION},
 };
 #define EXTENSION_COUNT (sizeof g_extensions / sizeof g_extensions[0])
 
@@ -299,6 +310,9 @@ static XrResult xrGetSystemProperties_(XrInstance h, XrSystemId sys, XrSystemPro
     p->graphicsProperties.maxLayerCount = XR_MIN_COMPOSITION_LAYERS_SUPPORTED;
     p->trackingProperties.orientationTracking = XR_TRUE;
     p->trackingProperties.positionTracking = XR_TRUE;
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)p->next; n; n = n->next)
+        if (n->type == XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT)
+            ((XrSystemHandTrackingPropertiesEXT *)n)->supportsHandTracking = XR_TRUE;
     return XR_SUCCESS;
 }
 
@@ -441,9 +455,12 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     return XR_SUCCESS;
 }
 
+static void signal_fences(session *s, swapchain *sc, int32_t index);
+
 static XrResult xrDestroySession_(XrSession h) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     session *s = (session *)h;
+    signal_fences(s, NULL, -1);
     pthread_mutex_lock(&g_lock);
     s->magic = 0;
     s->queue = nil;
@@ -619,6 +636,19 @@ typedef struct {
     XrVector3f linear, angular;
 } space_motion;
 
+static int sub_of(NSString *binding);
+
+// Whether an action space follows the aim pose: what its action is bound to now, since apps may
+// make their spaces before attaching the bindings (RiftLift does).
+static bool space_is_aim(const space *sp) {
+    for (NSString *b in sp->act->bindings) {
+        int bu = sub_of(b);
+        if ((bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT) != sp->hand) continue;
+        return [b hasSuffix:@"/aim/pose"];
+    }
+    return false;
+}
+
 // A space's pose in STAGE, and whether it is tracked right now.
 static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, space_motion *motion) {
     *tracked = true;
@@ -646,6 +676,7 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, spa
     axr_motion m = axr_device_motion(sp->hand, t);
     if (!m.valid) return false;
     XrPosef device = from_axr(m.pose);
+    if (space_is_aim(sp)) device = pmul(device, from_axr(axr_aim_offset(sp->hand)));
     *out = pmul(device, sp->offset);
     if (motion) {
         motion->angular = (XrVector3f){m.angular_velocity[0], m.angular_velocity[1], m.angular_velocity[2]};
@@ -828,6 +859,7 @@ static XrResult xrCreateSwapchain_(XrSession h, const XrSwapchainCreateInfo *inf
 static XrResult xrDestroySwapchain_(XrSwapchain h) {
     CHECK_HANDLE(h, swapchain, MAGIC_SWAPCHAIN);
     swapchain *sc = (swapchain *)h;
+    signal_fences(sc->sess, sc, -1);
     sc->magic = 0;
     for (uint32_t i = 0; i < sc->count; i++) {
         sc->images[i] = nil;
@@ -883,6 +915,93 @@ static XrResult xrReleaseSwapchainImage_(XrSwapchain h, const XrSwapchainImageRe
     return XR_SUCCESS;
 }
 
+// ----------------------------------------------------------------------------- shared images
+//
+// Two functions of alvrxr's own, for a bridge that has its app render straight into Metal
+// textures of its own (wineopenxr, whose D3D11 games render on DXMT): the swapchain then shows
+// those instead of its images, with no copy.
+//
+//   XrResult xrSetSwapchainImagesALVRXR(XrSwapchain, uint32_t count, void *const *mtl_textures)
+//     replaces the swapchain's images, one for one; before the first acquire.
+//   XrResult xrSetSwapchainImageFenceALVRXR(XrSwapchain, uint32_t index, void *mtl_shared_event,
+//                                           uint64_t wait_value, uint64_t signal_value)
+//     says, before image index is released, that the app's GPU work on it is done when the
+//     event reaches wait_value; the event is set to signal_value once alvrxr is done with it.
+
+static pthread_mutex_t g_fence_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// Commits a command buffer that signals the given fences, waiting first for those not yet
+// waited for, and drops them: every fence of sc's (all of them, if NULL), or only index's.
+static void signal_fences(session *s, swapchain *sc, int32_t index) {
+    pthread_mutex_lock(&g_fence_lock);
+    id<MTLCommandBuffer> cmd = nil;
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < s->fence_count; i++) {
+        if ((sc && s->fences[i].sc != sc) || (index >= 0 && s->fences[i].index != (uint32_t)index)) {
+            s->fences[kept++] = s->fences[i];
+            continue;
+        }
+        if (!cmd) cmd = [s->queue commandBuffer];
+        if (!s->fences[i].waited) [cmd encodeWaitForEvent:s->fences[i].event value:s->fences[i].wait];
+        [cmd encodeSignalEvent:s->fences[i].event value:s->fences[i].signal];
+    }
+    for (uint32_t i = kept; i < s->fence_count; i++) s->fences[i].event = nil;
+    s->fence_count = kept;
+    pthread_mutex_unlock(&g_fence_lock);
+    [cmd commit];
+}
+
+// Has the queue wait for the app's work on every image it has released since.
+static void wait_fences(session *s) {
+    pthread_mutex_lock(&g_fence_lock);
+    id<MTLCommandBuffer> cmd = nil;
+    for (uint32_t i = 0; i < s->fence_count; i++) {
+        if (s->fences[i].waited) continue;
+        if (!cmd) cmd = [s->queue commandBuffer];
+        [cmd encodeWaitForEvent:s->fences[i].event value:s->fences[i].wait];
+        s->fences[i].waited = true;
+    }
+    pthread_mutex_unlock(&g_fence_lock);
+    [cmd commit];
+}
+
+static XrResult xrSetSwapchainImagesALVRXR_(XrSwapchain h, uint32_t count, void *const *textures) {
+    CHECK_HANDLE(h, swapchain, MAGIC_SWAPCHAIN);
+    swapchain *sc = (swapchain *)h;
+    if (sc->sess->vulkan || count != sc->count || !textures) return XR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t i = 0; i < count; i++) {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)textures[i];
+        if (!t || t.width < sc->info.width || t.height < sc->info.height) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < count; i++) sc->images[i] = (__bridge id<MTLTexture>)textures[i];
+    axr_log("swapchain %p: shown from the app's own %lux%lu textures, format %lu", (void *)sc,
+            (unsigned long)sc->images[0].width, (unsigned long)sc->images[0].height,
+            (unsigned long)sc->images[0].pixelFormat);
+    return XR_SUCCESS;
+}
+
+static XrResult xrSetSwapchainImageFenceALVRXR_(XrSwapchain h, uint32_t index, void *event, uint64_t wait,
+                                                uint64_t signal) {
+    CHECK_HANDLE(h, swapchain, MAGIC_SWAPCHAIN);
+    swapchain *sc = (swapchain *)h;
+    session *s = sc->sess;
+    if (index >= sc->count || !event) return XR_ERROR_VALIDATION_FAILURE;
+    // An image released again before a frame took it, or more pending than there's room for:
+    // the older fence is passed on now.
+    signal_fences(s, sc, (int32_t)index);
+    if (s->fence_count == sizeof s->fences / sizeof s->fences[0]) signal_fences(s, NULL, -1);
+    pthread_mutex_lock(&g_fence_lock);
+    s->fences[s->fence_count].sc = sc;
+    s->fences[s->fence_count].index = index;
+    s->fences[s->fence_count].event = (__bridge id<MTLSharedEvent>)event;
+    s->fences[s->fence_count].wait = wait;
+    s->fences[s->fence_count].signal = signal;
+    s->fences[s->fence_count].waited = false;
+    s->fence_count++;
+    pthread_mutex_unlock(&g_fence_lock);
+    return XR_SUCCESS;
+}
+
 // ----------------------------------------------------------------------------------- frames
 
 static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameState *st) {
@@ -894,6 +1013,10 @@ static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameSt
     st->predictedDisplayTime = axr_wait_frame();
     st->predictedDisplayPeriod = (XrDuration)(1e9 / axr_refresh_hz());
     st->shouldRender = s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED;
+    // The home scene draws only for a headset; games always do, for their window on the Mac.
+    static int home = -1;
+    if (home < 0) home = getenv("ALVRXR_HOME") != NULL;
+    if (home && !axr_backend_connected()) st->shouldRender = XR_FALSE;
     return XR_SUCCESS;
 }
 
@@ -1122,10 +1245,21 @@ static bool compose_layers(session *s, const XrFrameEndInfo *info, const XrCompo
     return true;
 }
 
+static XrResult end_frame(session *s, const XrFrameEndInfo *info);
+
+// The frame reads shared images only once the app's GPU is done with them, and hands them back
+// once it has, whether it showed them or not.
 static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
-    axr_stat_end++;
     session *s = (session *)h;
+    wait_fences(s);
+    XrResult r = end_frame(s, info);
+    signal_fences(s, NULL, -1);
+    return r;
+}
+
+static XrResult end_frame(session *s, const XrFrameEndInfo *info) {
+    axr_stat_end++;
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
     if (info->environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
@@ -1454,16 +1588,14 @@ static XrResult xrCreateActionSpace_(XrSession h, const XrActionSpaceCreateInfo 
     if (!ok) return XR_ERROR_PATH_UNSUPPORTED;
     // The hand comes from the subaction path, or else from where the action is bound.
     int hand = u == SUB_LEFT ? AXR_LEFT : u == SUB_RIGHT ? AXR_RIGHT : AXR_RIGHT;
-    bool aim = false;
     for (NSString *b in a->bindings) {
         int bu = sub_of(b);
         if (u != SUB_NONE && bu != u) continue;
         hand = bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT;
-        aim = [b hasSuffix:@"/aim/pose"];
         break;
     }
-    // TODO: ALVR reports the controller's grip; aim is the same pose until its offset is measured.
-    return new_space((session *)h, (space){.kind = SPACE_ACTION, .act = a, .hand = hand, .aim = aim,
+    // ALVR reports the controller's grip; aim is offset from it by axr_aim_offset (space_is_aim).
+    return new_space((session *)h, (space){.kind = SPACE_ACTION, .act = a, .hand = hand,
                                            .offset = info->poseInActionSpace}, out);
 }
 
@@ -1520,6 +1652,79 @@ static XrResult xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceL
     return copy_string([parts componentsJoinedByString:@" "].UTF8String, cap, n, buf);
 }
 
+// ------------------------------------------------------------------------------- hand tracking
+//
+// XR_EXT_hand_tracking from the hand skeletons the client sends: its 26 joints in SteamVR's bone
+// order match OpenXR's joints one for one, but for the palm, which SteamVR roots at the wrist; it
+// is put between the middle finger's metacarpal and knuckle instead.
+
+typedef struct {
+    uint32_t magic;
+    session *sess;
+    int hand;
+} hand_tracker;
+
+static XrResult xrCreateHandTrackerEXT_(XrSession h, const XrHandTrackerCreateInfoEXT *info, XrHandTrackerEXT *out) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (info->handJointSet != XR_HAND_JOINT_SET_DEFAULT_EXT) return XR_ERROR_VALIDATION_FAILURE;
+    if (info->hand != XR_HAND_LEFT_EXT && info->hand != XR_HAND_RIGHT_EXT) return XR_ERROR_VALIDATION_FAILURE;
+    hand_tracker *t = calloc(1, sizeof *t);
+    t->magic = MAGIC_HAND;
+    t->sess = (session *)h;
+    t->hand = info->hand == XR_HAND_LEFT_EXT ? AXR_LEFT : AXR_RIGHT;
+    *out = (XrHandTrackerEXT)t;
+    return XR_SUCCESS;
+}
+
+static XrResult xrDestroyHandTrackerEXT_(XrHandTrackerEXT h) {
+    CHECK_HANDLE(h, hand_tracker, MAGIC_HAND);
+    ((hand_tracker *)h)->magic = 0;
+    free((void *)h);
+    return XR_SUCCESS;
+}
+
+static XrResult xrLocateHandJointsEXT_(XrHandTrackerEXT h, const XrHandJointsLocateInfoEXT *info,
+                                       XrHandJointLocationsEXT *locs) {
+    CHECK_HANDLE(h, hand_tracker, MAGIC_HAND);
+    CHECK_HANDLE(info->baseSpace, space, MAGIC_SPACE);
+    if (locs->jointCount != XR_HAND_JOINT_COUNT_EXT) return XR_ERROR_VALIDATION_FAILURE;
+    hand_tracker *t = (hand_tracker *)h;
+    XrHandJointVelocitiesEXT *vel = NULL;
+    for (XrBaseOutStructure *n = (XrBaseOutStructure *)locs->next; n; n = n->next)
+        if (n->type == XR_TYPE_HAND_JOINT_VELOCITIES_EXT) vel = (XrHandJointVelocitiesEXT *)n;
+    if (vel) for (uint32_t i = 0; i < vel->jointCount; i++) vel->jointVelocities[i].velocityFlags = 0;
+    for (uint32_t i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) locs->jointLocations[i].locationFlags = 0;
+    locs->isActive = XR_FALSE;
+
+    XrTime when = info->time ? info->time : axr_now_ns();
+    axr_pose joints[26];
+    XrPosef base;
+    bool base_tracked;
+    if (!axr_hand_joints(t->hand, when, joints) || !space_in_stage((space *)info->baseSpace, when, &base, &base_tracked, NULL))
+        return XR_SUCCESS;
+    // Radii, metres: wrist, palm, thumb, then each finger from metacarpal to tip.
+    static const float thumb[4] = {0.019f, 0.015f, 0.013f, 0.011f}, finger[5] = {0.020f, 0.011f, 0.009f, 0.008f, 0.007f};
+    XrPosef inv_base = pinv(base);
+    for (int i = 0; i < 26; i++) {
+        XrPosef p = from_axr(joints[i]);
+        if (i == XR_HAND_JOINT_PALM_EXT) {
+            XrPosef a = from_axr(joints[XR_HAND_JOINT_MIDDLE_METACARPAL_EXT]), b = from_axr(joints[XR_HAND_JOINT_MIDDLE_PROXIMAL_EXT]);
+            p = a;
+            p.position = (XrVector3f){(a.position.x + b.position.x) / 2, (a.position.y + b.position.y) / 2,
+                                      (a.position.z + b.position.z) / 2};
+        }
+        XrHandJointLocationEXT *l = &locs->jointLocations[i];
+        l->pose = pmul(inv_base, p);
+        l->radius = i == XR_HAND_JOINT_PALM_EXT ? 0.032f : i == XR_HAND_JOINT_WRIST_EXT ? 0.024f
+                    : i <= XR_HAND_JOINT_THUMB_TIP_EXT ? thumb[i - XR_HAND_JOINT_THUMB_METACARPAL_EXT]
+                                                       : finger[(i - XR_HAND_JOINT_INDEX_METACARPAL_EXT) % 5];
+        l->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                           (base_tracked ? XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT : 0);
+    }
+    locs->isActive = XR_TRUE;
+    return XR_SUCCESS;
+}
+
 // ------------------------------------------------------------------------------------ dispatch
 
 #define FUNCTIONS(X)                                                                                      \
@@ -1541,7 +1746,9 @@ static XrResult xrGetInputSourceLocalizedName_(XrSession h, const XrInputSourceL
     X(xrStopHapticFeedback) X(xrGetMetalGraphicsRequirementsKHR) X(xrConvertTimespecTimeToTimeKHR)        \
     X(xrConvertTimeToTimespecTimeKHR) X(xrGetVulkanGraphicsRequirementsKHR) X(xrGetVulkanGraphicsRequirements2KHR)   \
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR)  \
-    X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR) X(xrLocateSpaces)
+    X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR) X(xrLocateSpaces) \
+    X(xrSetSwapchainImagesALVRXR) X(xrSetSwapchainImageFenceALVRXR)                                      \
+    X(xrCreateHandTrackerEXT) X(xrDestroyHandTrackerEXT) X(xrLocateHandJointsEXT)
 
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
 

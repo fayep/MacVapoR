@@ -1,6 +1,8 @@
 // ALVR, frame timing, the compositor and the encoder. Ported from alvr-mac-spike, which has the
 // background for most of what is here (README "Things that were not obvious").
 
+#include <notify.h>
+#include <signal.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -99,11 +101,25 @@ typedef struct {
     bool foveated;
     float center_size[2], center_shift[2], edge_ratio[2];
     uint32_t target_w, target_h;
+    // ALVR's controller offsets (its headset.controllers settings), for its SteamVR driver.
+    bool controller_offsets;
+    float controller_position_offset[3], controller_rotation_offset[3];   // left hand; metres, degrees
 } stream_setup;
 
 static stream_setup read_stream_setup(void) {
     stream_setup s = {.codec = ALVR_CODEC_HEVC, .refresh = 90, .edge_ratio = {1, 1}};
-    NSDictionary *cfg = read_session()[@"openvr_config"];
+    NSDictionary *session = read_session();
+    NSDictionary *controllers = session[@"session_settings"][@"headset"][@"controllers"];
+    if ([controllers[@"enabled"] boolValue]) {
+        NSArray *pos = controllers[@"content"][@"left_controller_position_offset"][@"content"];
+        NSArray *rot = controllers[@"content"][@"left_controller_rotation_offset"][@"content"];
+        s.controller_offsets = true;
+        for (NSUInteger i = 0; i < 3; i++) {
+            s.controller_position_offset[i] = i < pos.count ? [pos[i] floatValue] : 0;
+            s.controller_rotation_offset[i] = i < rot.count ? [rot[i] floatValue] : 0;
+        }
+    }
+    NSDictionary *cfg = session[@"openvr_config"];
     if (!cfg) return s;
     s.codec = [cfg[@"codec"] intValue];
     s.refresh = [cfg[@"refresh_rate"] doubleValue] ?: 90;
@@ -162,6 +178,60 @@ static struct { int64_t xr_time; uint64_t client_ts; } g_frames[FRAME_RING];
 static unsigned g_frame_next;
 static int64_t g_last_wait, g_last_display, g_last_sample_ns;
 static uint64_t g_last_frame_ts;
+// How the headset's tracking samples arrive, for the stats line: how many, the mean interval
+// between their timestamps, and how many came on the heels of the one before (under a third of
+// a frame) or late (over one and a half frames).
+static unsigned g_stat_samples, g_stat_bunched, g_stat_late;
+static bool g_velocity_check;   // see check_velocity
+static void undo_alvr_shaping(int device, AlvrDeviceMotion *am, const stream_setup *setup);
+static void record_hand_samples(uint64_t ts);
+static const char *input_name(uint64_t id);
+static bool pose_velocity(int device, uint64_t ts, float linear[3], float angular[3]);
+
+// tune.json "velocity_check": true compares the right controller's reported velocities with the
+// ones its poses imply, sample to sample, while it moves fast (a throw): the direction each way,
+// its elevation, and the angle between them.
+static void check_velocity(uint64_t ts) {
+    static AlvrDeviceMotion prev;
+    static uint64_t prev_ts;
+    AlvrDeviceMotion m;
+    if (!alvr_get_device_motion(g_device_id[AXR_RIGHT], ts, &m)) return;
+    pthread_mutex_lock(&g_lock);
+    stream_setup setup = g_setup;
+    pthread_mutex_unlock(&g_lock);
+    undo_alvr_shaping(AXR_RIGHT, &m, &setup);
+    pose_velocity(AXR_RIGHT, ts, m.linear_velocity, m.angular_velocity);
+    double dt = prev_ts ? (ts - prev_ts) / 1e9 : 0;
+    if (dt > 0.004 && dt < 0.05) {
+        float d[3], r[3];
+        for (int i = 0; i < 3; i++) { d[i] = (m.pose.position[i] - prev.pose.position[i]) / dt; r[i] = m.linear_velocity[i]; }
+        float dn = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), rn = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        if (dn > 1.5f && rn > 0.01f) {
+            float cosang = (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]) / (dn * rn);
+            // The rotation from the last pose to this one, as an angular velocity in the world frame.
+            AlvrQuat a = prev.pose.orientation, b = m.pose.orientation;
+            float qx = b.w * -a.x + b.x * a.w + b.y * -a.z - b.z * -a.y;
+            float qy = b.w * -a.y - b.x * -a.z + b.y * a.w + b.z * -a.x;
+            float qz = b.w * -a.z + b.x * -a.y - b.y * -a.x + b.z * a.w;
+            float qw = b.w * a.w - b.x * -a.x - b.y * -a.y - b.z * -a.z;
+            if (qw < 0) { qx = -qx; qy = -qy; qz = -qz; qw = -qw; }
+            float s = sqrtf(qx * qx + qy * qy + qz * qz), angle = 2 * atan2f(s, qw);
+            float w[3] = {0, 0, 0};
+            if (s > 1e-6f) { w[0] = qx / s * angle / dt; w[1] = qy / s * angle / dt; w[2] = qz / s * angle / dt; }
+            const float *rw = m.angular_velocity;
+            float wn = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]), rwn = sqrtf(rw[0] * rw[0] + rw[1] * rw[1] + rw[2] * rw[2]);
+            float wcos = wn > 0.5f && rwn > 0.01f ? (w[0] * rw[0] + w[1] * rw[1] + w[2] * rw[2]) / (wn * rwn) : 2;
+            axr_log("velocity: poses %.2f m/s at %+.0f deg up, reported %.2f m/s at %+.0f deg up, %.0f deg apart"
+                    " | spin: poses %.1f rad/s, reported %.1f rad/s, %s%.0f deg apart",
+                    dn, asinf(d[1] / dn) * 180 / M_PI, rn, asinf(r[1] / rn) * 180 / M_PI,
+                    acosf(fmaxf(-1, fminf(1, cosang))) * 180 / M_PI, wn, rwn, wcos > 1.5f ? "(slow) " : "",
+                    wcos > 1.5f ? 0 : acosf(fmaxf(-1, fminf(1, wcos))) * 180 / M_PI);
+        }
+    }
+    prev = m;
+    prev_ts = ts;
+}
+static uint64_t g_stat_prev_ts, g_stat_ts_span;
 static pthread_cond_t g_sample_cond = PTHREAD_COND_INITIALIZER;
 unsigned axr_stat_reused;
 
@@ -595,13 +665,24 @@ static void *event_thread(void *arg) {
                 double offset = (double)axr_now_ns() - (double)ts;
                 pthread_mutex_lock(&g_lock);
                 if (ts > g_newest_ts) g_newest_ts = ts;
-                g_last_sample_ns = axr_now_ns();
+                int64_t arrived = axr_now_ns(), frame = (int64_t)(1e9 / (g_setup.refresh > 0 ? g_setup.refresh : 90));
+                if (g_last_sample_ns && arrived - g_last_sample_ns < frame / 3) g_stat_bunched++;
+                if (g_last_sample_ns && arrived - g_last_sample_ns > frame * 3 / 2) g_stat_late++;
+                if (g_stat_prev_ts && ts > g_stat_prev_ts && ts - g_stat_prev_ts < 100000000) {
+                    g_stat_samples++;
+                    g_stat_ts_span += ts - g_stat_prev_ts;
+                }
+                g_stat_prev_ts = ts;
+                g_last_sample_ns = arrived;
+                bool check = g_velocity_check;
                 pthread_cond_broadcast(&g_sample_cond);
                 if (g_tracking_real) g_samples_since_real++;
                 // Smoothed, since each sample's arrival carries network jitter.
                 g_clock_offset = g_have_offset ? g_clock_offset + (offset - g_clock_offset) * 0.05 : offset;
                 g_have_offset = true;
                 pthread_mutex_unlock(&g_lock);
+                record_hand_samples(ts);
+                if (check) check_velocity(ts);
                 break;
             }
             case ALVR_EVENT_BUTTONS_UPDATED: {
@@ -621,8 +702,26 @@ static void *event_thread(void *arg) {
                     if (bits <= 1) v = bits ? 1.0f : 0.0f;
                     g_inputs[@(entries[i].id)] = @(v);
                     if (!old || old.floatValue != v) g_input_generation++;
+                    if (!old) axr_log("input: first %s", input_name(entries[i].id));
                 }
                 pthread_mutex_unlock(&g_lock);
+                break;
+            }
+            case ALVR_EVENT_BATTERY: {
+                // Every few seconds the client sends each device's charge, 0 to 1; its controllers
+                // read more than 1 until visionOS has told it theirs. Logged when it changes.
+                static int last_percent[AXR_DEVICE_COUNT] = {-1, -1, -1};
+                static bool last_plugged[AXR_DEVICE_COUNT];
+                static const char *names[AXR_DEVICE_COUNT] = {"headset", "left controller", "right controller"};
+                AlvrBatteryInfo b = ev.battery.info;
+                for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
+                    if (b.device_id != g_device_id[d] || b.gauge_value > 1.0f) continue;
+                    int percent = (int)lroundf(b.gauge_value * 100);
+                    if (percent == last_percent[d] && b.is_plugged == last_plugged[d]) break;
+                    last_percent[d] = percent;
+                    last_plugged[d] = b.is_plugged;
+                    axr_log("battery: %s %d%%%s", names[d], percent, b.is_plugged ? ", charging" : "");
+                }
                 break;
             }
             case ALVR_EVENT_REQUEST_IDR:
@@ -664,21 +763,60 @@ static void *event_thread(void *arg) {
                 axr_audio_stats(&audio_frames, &audio_peak);
                 if (g_stat_frames || axr_stat_wait)
                     axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
+                            " | headset: %.0f samples/s, every %.1f ms, %u bunched, %u late"
                             " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads"
                             " | audio: %llu frames tapped, peak %.3f",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
                             axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
-                            g_stat_button_events, (unsigned long)g_inputs.count, axr_stat_syncs,
+                            g_stat_samples / dt, g_stat_samples ? g_stat_ts_span / 1e6 / g_stat_samples : 0.0,
+                            g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_inputs.count, axr_stat_syncs,
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
                             audio_peak);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
                 axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
+                pthread_mutex_lock(&g_lock);
+                g_stat_samples = g_stat_bunched = g_stat_late = 0;
+                g_stat_ts_span = 0;
+                pthread_mutex_unlock(&g_lock);
                 g_stat_since = now;
             }
         }
     }
     return NULL;
+}
+
+// MacVapoR's home scene (vapord) holds the headset between games, and a game takes it over: its
+// runtime records its pid as the claim, tells vapord, and waits for vapord, and the ALVR server
+// it runs, to be gone. vapord starts again, and waits out the claim, once the game has ended.
+static void claim_headset(void) {
+    if (getenv("ALVRXR_HOME")) return;   // vapord itself
+    NSString *claim = [g_config_dir stringByAppendingPathComponent:@"claim.pid"];
+    [[NSString stringWithFormat:@"%d\n", getpid()] writeToFile:claim atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSString *home = [NSString stringWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"home.pid"]
+                                               encoding:NSUTF8StringEncoding error:nil];
+    pid_t pid = home.intValue;
+    if (pid <= 0 || kill(pid, 0) != 0) return;
+    notify_post("com.zippysoft.macvapor.claim");
+    for (int i = 0; i < 60 && kill(pid, 0) == 0; i++) usleep(50000);
+    axr_log("headset claimed from the home scene (pid %d)%s", pid, kill(pid, 0) == 0 ? ", which hasn't gone" : "");
+}
+
+// An input's path, for the log, from the ones a Touch controller has.
+static const char *input_name(uint64_t id) {
+    static const char *hands[] = {"left", "right"};
+    static const char *inputs[] = {"a/click", "a/touch", "b/click", "b/touch", "x/click", "x/touch", "y/click", "y/touch",
+                                   "menu/click", "system/click", "system/touch", "trigger/value", "trigger/click", "trigger/touch",
+                                   "squeeze/value", "squeeze/click", "squeeze/force", "thumbstick/x", "thumbstick/y",
+                                   "thumbstick/click", "thumbstick/touch", "thumbrest/touch"};
+    static char name[96];
+    for (int h = 0; h < 2; h++)
+        for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+            snprintf(name, sizeof name, "/user/hand/%s/input/%s", hands[h], inputs[i]);
+            if (alvr_path_to_id(name) == id) return name;
+        }
+    snprintf(name, sizeof name, "id %#llx", (unsigned long long)id);
+    return name;
 }
 
 void axr_backend_start(void) {
@@ -689,6 +827,7 @@ void axr_backend_start(void) {
 
     NSString *env = NSProcessInfo.processInfo.environment[@"ALVRXR_CONFIG_DIR"];
     g_config_dir = env ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
+    claim_headset();
     prepare_session();
     read_eye_height();
     NSString *dump = NSProcessInfo.processInfo.environment[@"ALVRXR_DUMP"];
@@ -776,16 +915,24 @@ void axr_recommended_eye_size(uint32_t *w, uint32_t *h) {
 
 // ------------------------------------------------------------------------------ frame timing
 
-// Paced by the headset: the client sends one tracking sample per frame it displays, so a frame
-// starts when a sample newer than the last frame's arrives, and every frame gets its own
-// sample. Without samples (no headset, or the client not tracking yet) a plain timer paces.
+// Paced by a steady clock at the headset's refresh rate. Each frame takes the newest tracking
+// sample, waiting a little for one if none has come since the last frame's. Starting frames as
+// samples arrived instead let Wi-Fi's bunching and gaps set the frame times, which stuttered.
 int64_t axr_wait_frame(void) {
     int64_t period = (int64_t)(1e9 / axr_refresh_hz());
+    int64_t now = axr_now_ns();
+    int64_t next = g_last_wait + period;
+    if (next < now - period) next = now;   // fell behind: start again from now
+    if (next > now) {
+        struct timespec d = {(next - now) / 1000000000, (next - now) % 1000000000};
+        nanosleep(&d, NULL);
+    }
+    g_last_wait = next;
+
     pthread_mutex_lock(&g_lock);
     bool tracking = g_connected && g_have_offset && axr_now_ns() - g_last_sample_ns < 100000000;
     if (tracking) {
-        // Up to a frame and a half; a late sample is better met with the newest we have.
-        int64_t deadline = axr_now_ns() + period * 3 / 2;
+        int64_t deadline = axr_now_ns() + period / 4;
         while (g_newest_ts <= g_last_frame_ts) {
             int64_t left = deadline - axr_now_ns();
             if (left <= 0) break;
@@ -795,20 +942,8 @@ int64_t axr_wait_frame(void) {
             struct timespec until = {abs_ns / 1000000000, abs_ns % 1000000000};
             pthread_cond_timedwait(&g_sample_cond, &g_lock, &until);
         }
-        g_last_wait = axr_now_ns();
     }
     pthread_mutex_unlock(&g_lock);
-
-    if (!tracking) {
-        int64_t now = axr_now_ns();
-        int64_t next = g_last_wait + period;
-        if (next < now - period) next = now;   // fell behind: start again from now
-        if (next > now) {
-            struct timespec d = {(next - now) / 1000000000, (next - now) % 1000000000};
-            nanosleep(&d, NULL);
-        }
-        g_last_wait = next;
-    }
 
     pthread_mutex_lock(&g_lock);
     int64_t display;
@@ -840,6 +975,156 @@ static axr_pose from_alvr(AlvrPose p) {
 static bool g_fake_tpose;
 static NSSet<NSString *> *g_fake_press;
 
+typedef struct { float x, y, z, w; } quat;
+static quat qmul(quat a, quat b) {
+    return (quat){a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                  a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+static void qrot3(quat q, const float v[3], float out[3]) {
+    quat r = qmul(qmul(q, (quat){v[0], v[1], v[2], 0}), (quat){-q.x, -q.y, -q.z, q.w});
+    out[0] = r.x; out[1] = r.y; out[2] = r.z;
+}
+
+// ALVR shapes each motion for SteamVR before handing it over: a controller is moved and turned by
+// its offset settings, and every angular velocity is turned into the device's own frame. This
+// takes that back off, leaving the motion the headset sent: poses as tracked, velocities in the
+// tracking frame.
+static void undo_alvr_shaping(int device, AlvrDeviceMotion *am, const stream_setup *setup) {
+    quat q = {am->pose.orientation.x, am->pose.orientation.y, am->pose.orientation.z, am->pose.orientation.w};
+    float w[3];
+    qrot3(q, am->angular_velocity, w);
+    memcpy(am->angular_velocity, w, sizeof w);
+    if (device == AXR_HEAD || !setup->controller_offsets) return;
+    float sign = device == AXR_RIGHT ? -1 : 1;
+    const float *r = setup->controller_rotation_offset;
+    float t[3] = {sign * setup->controller_position_offset[0], setup->controller_position_offset[1],
+                  setup->controller_position_offset[2]};
+    float d = (float)M_PI / 360;   // half a degree in radians: half-angles
+    quat rx = {sinf(r[0] * d), 0, 0, cosf(r[0] * d)}, ry = {0, sinf(sign * r[1] * d), 0, cosf(sign * r[1] * d)},
+         rz = {0, 0, sinf(sign * r[2] * d), cosf(sign * r[2] * d)};
+    quat rot = qmul(qmul(rx, ry), rz);
+    float arm[3];
+    qrot3(q, t, arm);
+    for (int i = 0; i < 3; i++) am->pose.position[i] -= arm[i];
+    am->linear_velocity[0] -= w[1] * arm[2] - w[2] * arm[1];
+    am->linear_velocity[1] -= w[2] * arm[0] - w[0] * arm[2];
+    am->linear_velocity[2] -= w[0] * arm[1] - w[1] * arm[0];
+    quat orig = qmul(q, (quat){-rot.x, -rot.y, -rot.z, rot.w});
+    am->pose.orientation = (AlvrQuat){orig.x, orig.y, orig.z, orig.w};
+}
+
+// Controller velocities from the tracked poses. The headset's own are damped to a third or less
+// of the real speed (visionOS's, for PS VR2 Sense), which threw everything short, so each hand
+// keeps its last poses and its velocities are fitted over the newest VELOCITY_WINDOW: linear by
+// least squares through the positions, angular from the turn between the first and last.
+// tune.json "pose_velocity": false hands on the headset's instead.
+#define VELOCITY_RING 16
+#define VELOCITY_WINDOW 40000000   // ns
+typedef struct {
+    uint64_t ts;
+    float p[3];
+    quat q;
+    float v[3], w[3];
+} hand_sample;
+static hand_sample g_hand_samples[2][VELOCITY_RING];
+static unsigned g_hand_next[2];
+static bool g_pose_velocity = true;
+
+static void record_hand_samples(uint64_t ts) {
+    pthread_mutex_lock(&g_lock);
+    stream_setup setup = g_setup;
+    pthread_mutex_unlock(&g_lock);
+    for (int h = 0; h < 2; h++) {
+        int device = h ? AXR_RIGHT : AXR_LEFT;
+        AlvrDeviceMotion am;
+        if (!alvr_get_device_motion(g_device_id[device], ts, &am)) continue;
+        undo_alvr_shaping(device, &am, &setup);
+        hand_sample s = {.ts = ts, .q = {am.pose.orientation.x, am.pose.orientation.y, am.pose.orientation.z,
+                                         am.pose.orientation.w}};
+        memcpy(s.p, am.pose.position, sizeof s.p);
+
+        pthread_mutex_lock(&g_lock);
+        hand_sample *ring = g_hand_samples[h];
+        const hand_sample *prev = &ring[(g_hand_next[h] + VELOCITY_RING - 1) % VELOCITY_RING];
+        if (prev->ts >= ts) { pthread_mutex_unlock(&g_lock); continue; }
+        // The window: this sample and those before it within VELOCITY_WINDOW.
+        const hand_sample *win[VELOCITY_RING];
+        int n = 0;
+        win[n++] = &s;
+        for (unsigned k = 1; k < VELOCITY_RING; k++) {
+            const hand_sample *o = &ring[(g_hand_next[h] + VELOCITY_RING - k) % VELOCITY_RING];
+            if (!o->ts || ts - o->ts > VELOCITY_WINDOW) break;
+            win[n++] = o;
+        }
+        if (n >= 2) {
+            double tm = 0;
+            for (int i = 0; i < n; i++) tm += (double)(int64_t)(win[i]->ts - ts) / 1e9;
+            tm /= n;
+            for (int a = 0; a < 3; a++) {
+                double pm = 0, num = 0, den = 0;
+                for (int i = 0; i < n; i++) pm += win[i]->p[a];
+                pm /= n;
+                for (int i = 0; i < n; i++) {
+                    double dt = (double)(int64_t)(win[i]->ts - ts) / 1e9 - tm;
+                    num += dt * (win[i]->p[a] - pm);
+                    den += dt * dt;
+                }
+                s.v[a] = den > 0 ? (float)(num / den) : 0;
+            }
+            const hand_sample *first = win[n - 1];
+            quat a = first->q, d = qmul(s.q, (quat){-a.x, -a.y, -a.z, a.w});
+            if (d.w < 0) d = (quat){-d.x, -d.y, -d.z, -d.w};
+            float sn = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z), span = (float)((ts - first->ts) / 1e9);
+            float rate = sn > 1e-6f && span > 0 ? 2 * atan2f(sn, d.w) / span / sn : 0;
+            s.w[0] = d.x * rate; s.w[1] = d.y * rate; s.w[2] = d.z * rate;
+        }
+        ring[g_hand_next[h] % VELOCITY_RING] = s;
+        g_hand_next[h] = (g_hand_next[h] + 1) % VELOCITY_RING;
+        pthread_mutex_unlock(&g_lock);
+    }
+}
+
+// The fitted velocities for a hand's sample at ts; false (leaving them) for the head, when turned
+// off, or for a sample not recorded.
+static bool pose_velocity(int device, uint64_t ts, float linear[3], float angular[3]) {
+    if (device == AXR_HEAD) return false;
+    int h = device == AXR_RIGHT;
+    bool found = false;
+    pthread_mutex_lock(&g_lock);
+    if (g_pose_velocity) {
+        for (unsigned k = 0; k < VELOCITY_RING && !found; k++) {
+            const hand_sample *s = &g_hand_samples[h][k];
+            if (s->ts != ts) continue;
+            memcpy(linear, s->v, sizeof s->v);
+            memcpy(angular, s->w, sizeof s->w);
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return found;
+}
+
+// A hand's 26 joints at time, in the tracking frame as device poses are, in the client's order:
+// SteamVR's bones, which line up with OpenXR's hand joints one for one. False while the hand
+// isn't seen, or is holding a controller and the client sends that instead.
+bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]) {
+    pthread_mutex_lock(&g_lock);
+    bool connected = g_connected;
+    uint64_t ts = client_ts_for(time), newest = g_newest_ts;
+    float raise = g_eye_height > 0 && g_height_offset_set ? g_height_offset : 0;
+    pthread_mutex_unlock(&g_lock);
+    AlvrPose sk[26];
+    uint8_t which = hand == AXR_LEFT ? 0 : 1;
+    // Skeletons are kept by their exact sample time: the frame's, or else the newest.
+    if (!connected || !((ts && alvr_get_hand_skeleton(which, ts, sk)) || (newest && alvr_get_hand_skeleton(which, newest, sk))))
+        return false;
+    for (int i = 0; i < 26; i++) {
+        out[i] = from_alvr(sk[i]);
+        out[i].position[1] += raise;
+    }
+    return true;
+}
+
 axr_motion axr_device_motion(int device, int64_t time) {
     axr_motion m = {0};
     pthread_mutex_lock(&g_lock);
@@ -847,8 +1132,13 @@ axr_motion axr_device_motion(int device, int64_t time) {
     uint64_t ts = client_ts_for(time);
     if (!ts && g_have_offset) ts = (uint64_t)((double)time - g_clock_offset);
     pthread_mutex_unlock(&g_lock);
+    pthread_mutex_lock(&g_lock);
+    stream_setup setup = g_setup;
+    pthread_mutex_unlock(&g_lock);
     AlvrDeviceMotion am;
     if (connected && ts && alvr_get_device_motion(g_device_id[device], ts, &am)) {
+        undo_alvr_shaping(device, &am, &setup);
+        pose_velocity(device, ts, am.linear_velocity, am.angular_velocity);
         m.pose = from_alvr(am.pose);
         if (g_eye_height > 0) {
             if (!g_height_offset_set && device == AXR_HEAD && m.pose.position[1] > 0.3f) {
@@ -877,6 +1167,19 @@ axr_motion axr_device_motion(int device, int64_t time) {
 // Stereo tuning, read from <config>/tune.json while running: {"ipd_scale":1, "fov_scale":1,
 // "swap_eyes":false}. For finding which of the client's view numbers the picture disagrees with.
 static float g_ipd_scale = 1, g_fov_scale = 1;
+static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
+
+axr_pose axr_aim_offset(int hand) {
+    pthread_mutex_lock(&g_lock);
+    float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw, roll and x
+    quat rx = {sinf(g_aim_rotation[0] * d), 0, 0, cosf(g_aim_rotation[0] * d)};
+    quat ry = {0, sinf(m * g_aim_rotation[1] * d), 0, cosf(m * g_aim_rotation[1] * d)};
+    quat rz = {0, 0, sinf(m * g_aim_rotation[2] * d), cosf(m * g_aim_rotation[2] * d)};
+    quat q = qmul(qmul(ry, rx), rz);
+    axr_pose p = {{q.x, q.y, q.z, q.w}, {m * g_aim_offset[0], g_aim_offset[1], g_aim_offset[2]}};
+    pthread_mutex_unlock(&g_lock);
+    return p;
+}
 static bool g_swap_eyes;
 
 static void read_tune(void) {
@@ -886,6 +1189,29 @@ static void read_tune(void) {
     bool swap = [t[@"swap_eyes"] boolValue];
     int snap = [t[@"snapshot"] intValue];
     bool tpose = [t[@"fake_tpose"] boolValue];
+    // Touch's aim points 45 degrees below the PS VR2 Sense grip ALVR reports: measured by hand, in
+    // Asgard's Wrath.
+    float aim_rotation[3] = {t[@"aim_pitch"] ? [t[@"aim_pitch"] floatValue] : -45, [t[@"aim_yaw"] floatValue],
+                             [t[@"aim_roll"] floatValue]};
+    float aim_offset[3] = {0, 0, 0};
+    NSArray *ao = [t[@"aim_offset"] isKindOfClass:NSArray.class] ? t[@"aim_offset"] : nil;
+    for (NSUInteger i = 0; i < 3 && i < ao.count; i++) aim_offset[i] = [ao[i] floatValue];
+    pthread_mutex_lock(&g_lock);
+    if (memcmp(aim_rotation, g_aim_rotation, sizeof aim_rotation) || memcmp(aim_offset, g_aim_offset, sizeof aim_offset)) {
+        memcpy(g_aim_rotation, aim_rotation, sizeof aim_rotation);
+        memcpy(g_aim_offset, aim_offset, sizeof aim_offset);
+        axr_log("aim: pitch %.1f, yaw %.1f, roll %.1f deg, offset (%.3f, %.3f, %.3f) m from the grip (right hand)",
+                aim_rotation[0], aim_rotation[1], aim_rotation[2], aim_offset[0], aim_offset[1], aim_offset[2]);
+    }
+    pthread_mutex_unlock(&g_lock);
+    bool velocity_check = [t[@"velocity_check"] boolValue];
+    bool pose_vel = t[@"pose_velocity"] ? [t[@"pose_velocity"] boolValue] : true;
+    pthread_mutex_lock(&g_lock);
+    if (pose_vel != g_pose_velocity) axr_log("controller velocities from %s", pose_vel ? "the poses" : "the headset");
+    g_pose_velocity = pose_vel;
+    pthread_mutex_unlock(&g_lock);
+    if (velocity_check != g_velocity_check) axr_log("velocity check %s", velocity_check ? "on" : "off");
+    g_velocity_check = velocity_check;
     NSArray *press = [t[@"fake_press"] isKindOfClass:NSArray.class] ? t[@"fake_press"] : @[];
     pthread_mutex_lock(&g_lock);
     NSSet *pressed = [NSSet setWithArray:press];

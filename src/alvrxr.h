@@ -44,6 +44,11 @@ void axr_audio_start(void);
 void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
 bool axr_backend_connected(void);
 bool axr_fake_tracking(void);       // tune.json fake_tpose, with no client: report the head as tracked
+// The aim pose in the controller's (grip) frame: tune.json "aim_yaw", "aim_pitch" and "aim_roll"
+// degrees about its Y, X and Z axes (pitch -45 unless set), and "aim_offset" [x, y, z] metres; the
+// left hand mirrors yaw, roll and x.
+axr_pose axr_aim_offset(int hand);
+bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]);   // see backend.m
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
 uint32_t axr_recenter_generation(void);   // changes when the user asks to recenter (Digital Crown)
 double axr_refresh_hz(void);
