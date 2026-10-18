@@ -1,0 +1,16 @@
+diff --git a/alvr/server_core/src/input_mapping.rs b/alvr/server_core/src/input_mapping.rs
+index 694be0e..dd409c8 100644
+--- a/alvr/server_core/src/input_mapping.rs
++++ b/alvr/server_core/src/input_mapping.rs
+@@ -656,7 +656,10 @@ impl ButtonMappingManager {
+             let button_name = BUTTON_INFO
+                 .get(&source_button.path_id)
+                 .map_or("Unknown", |info| info.path);
+-            info!("Received button not mapped: {button_name}");
++            debug!("Received button not mapped: {button_name}");
++            // Passed on as it came: the emulated profile lacks it (the Sense controllers' grip
++            // touch, the right Options button), but a runtime may still want it.
++            destination_buttons.push(ButtonEntry { path_id: source_button.path_id, value: source_button.value });
+         }
+ 
+         destination_buttons
