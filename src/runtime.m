@@ -628,7 +628,7 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, spa
         if (sp->ref == XR_REFERENCE_SPACE_TYPE_VIEW) {
             axr_motion head = axr_device_motion(AXR_HEAD, t);
             base = from_axr(head.pose);
-            *tracked = axr_backend_connected();
+            *tracked = (axr_backend_connected() || axr_fake_tracking());
             if (motion) {
                 motion->angular = (XrVector3f){head.angular_velocity[0], head.angular_velocity[1], head.angular_velocity[2]};
                 motion->linear = vadd((XrVector3f){head.linear_velocity[0], head.linear_velocity[1], head.linear_velocity[2]},
@@ -734,7 +734,7 @@ static XrResult xrLocateViews_(XrSession h, const XrViewLocateInfo *info, XrView
         views[e].fov = (XrFovf){v.fov[e][0], v.fov[e][1], v.fov[e][2], v.fov[e][3]};
     }
     state->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
-    if (axr_backend_connected())
+    if ((axr_backend_connected() || axr_fake_tracking()))
         state->viewStateFlags |= XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
     return XR_SUCCESS;
 }
@@ -788,6 +788,9 @@ static XrResult xrCreateSwapchain_(XrSession h, const XrSwapchainCreateInfo *inf
             }
         }
         *out = (XrSwapchain)sc;
+        axr_log("swapchain %p: %ux%u x%u, %u mips, %u samples, format %lld, create flags %#llx, usage %#llx", (void *)sc, info->width,
+                info->height, info->arraySize, info->mipCount, info->sampleCount, (long long)info->format, (unsigned long long)info->createFlags,
+                (unsigned long long)info->usageFlags);
         return XR_SUCCESS;
     }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
@@ -816,6 +819,9 @@ static XrResult xrCreateSwapchain_(XrSession h, const XrSwapchainCreateInfo *inf
         }
     }
     *out = (XrSwapchain)sc;
+    axr_log("swapchain %p: %ux%u x%u, %u mips, %u samples, format %lld, create flags %#llx, usage %#llx", (void *)sc, info->width,
+            info->height, info->arraySize, info->mipCount, info->sampleCount, (long long)info->format, (unsigned long long)info->createFlags,
+            (unsigned long long)info->usageFlags);
     return XR_SUCCESS;
 }
 
@@ -897,6 +903,225 @@ static XrResult xrBeginFrame_(XrSession h, const XrFrameBeginInfo *info) {
     return ((session *)h)->running ? XR_SUCCESS : XR_ERROR_SESSION_NOT_RUNNING;
 }
 
+// ------------------------------------------------------------------------------- quad layers
+//
+// Games put title, splash and loading screens on quad layers: a flat image at a pose in a space,
+// often with no projection layer at all. The stream carries one picture per eye, so a frame with
+// quads is drawn into two eye images of alvrxr's own: the projection layer, if any, then each
+// quad as that eye sees it at the frame's display time.
+
+static NSString *const kLayerShaders =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct Quad { float4 pos[4]; float4 uv[4]; uint slice; };\n"
+     "struct V { float4 pos [[position]]; float2 uv; };\n"
+     "vertex V lvs(uint vid [[vertex_id]], constant Quad &q [[buffer(0)]]) {\n"
+     "    V o; o.pos = q.pos[vid]; o.uv = q.uv[vid].xy; return o;\n"
+     "}\n"
+     "fragment float4 lfs(V in [[stage_in]], texture2d_array<float> t [[texture(0)]],\n"
+     "                    constant Quad &q [[buffer(0)]]) {\n"
+     "    constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+     "    return t.sample(s, in.uv, q.slice);\n"
+     "}\n";
+
+typedef struct {
+    float pos[4][4];   // clip space, corners in triangle-strip order
+    float uv[4][4];    // .xy used
+    uint32_t slice;
+} layer_quad;
+
+enum { BLEND_NONE, BLEND_PREMULTIPLIED, BLEND_STRAIGHT, BLEND_COUNT };
+// sRGB like the games' own swapchains; Metal blends sRGB targets in linear space.
+static const MTLPixelFormat kLayerFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+static id<MTLRenderPipelineState> g_layer_pso[BLEND_COUNT];
+static id<MTLTexture> g_layer_eye[2];
+
+static bool layer_pipelines(id<MTLDevice> dev) {
+    if (g_layer_pso[0]) return true;
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:kLayerShaders options:nil error:&err];
+    if (!lib) {
+        axr_log("quad layers: shaders didn't compile: %s", err.localizedDescription.UTF8String);
+        return false;
+    }
+    for (int b = 0; b < BLEND_COUNT; b++) {
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"lvs"];
+        d.fragmentFunction = [lib newFunctionWithName:@"lfs"];
+        MTLRenderPipelineColorAttachmentDescriptor *c = d.colorAttachments[0];
+        c.pixelFormat = kLayerFormat;
+        if (b != BLEND_NONE) {
+            c.blendingEnabled = YES;
+            c.sourceRGBBlendFactor = b == BLEND_STRAIGHT ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
+            c.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            c.sourceAlphaBlendFactor = MTLBlendFactorOne;
+            c.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        }
+        g_layer_pso[b] = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+        if (!g_layer_pso[b]) {
+            axr_log("quad layers: no pipeline: %s", err.localizedDescription.UTF8String);
+            return false;
+        }
+    }
+    return true;
+}
+
+static int layer_blend(XrCompositionLayerFlags flags) {
+    if (!(flags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT)) return BLEND_NONE;
+    return (flags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ? BLEND_STRAIGHT : BLEND_PREMULTIPLIED;
+}
+
+// The released image of a sub-image's swapchain, with its rect as texture coordinates.
+static id<MTLTexture> sub_image(const XrSwapchainSubImage *sub, float uv[4]) {
+    swapchain *sc = (swapchain *)sub->swapchain;
+    if (!sc || sc->magic != MAGIC_SWAPCHAIN || sc->released < 0) return nil;
+    id<MTLTexture> t = sc->images[sc->released];
+    uv[0] = (float)sub->imageRect.offset.x / t.width;
+    uv[1] = (float)sub->imageRect.offset.y / t.height;
+    uv[2] = (float)(sub->imageRect.offset.x + sub->imageRect.extent.width) / t.width;
+    uv[3] = (float)(sub->imageRect.offset.y + sub->imageRect.extent.height) / t.height;
+    return axr_array_view(t);
+}
+
+// A quad's corners as the eye sees them, in clip space; false if any is behind the eye.
+static bool quad_corners(const XrCompositionLayerQuad *q, XrPosef eye, XrFovf fov, XrTime t, float out[4][4]) {
+    XrPosef in_stage;
+    bool tracked;
+    if (!space_in_stage((space *)q->space, t, &in_stage, &tracked, NULL)) return false;
+    XrPosef quad = pmul(in_stage, q->pose), to_eye = pinv(eye);
+    float hw = q->size.width / 2, hh = q->size.height / 2;
+    const float local[4][2] = {{-hw, hh}, {hw, hh}, {-hw, -hh}, {hw, -hh}};   // TL, TR, BL, BR
+    float l = tanf(fov.angleLeft), r = tanf(fov.angleRight), u = tanf(fov.angleUp), d = tanf(fov.angleDown);
+    for (int i = 0; i < 4; i++) {
+        XrVector3f world = vadd(quad.position, qrot(quad.orientation, (XrVector3f){local[i][0], local[i][1], 0}));
+        XrVector3f p = vadd(to_eye.position, qrot(to_eye.orientation, world));
+        float w = -p.z;   // the eye looks down -Z
+        if (w < 0.01f) return false;
+        out[i][0] = (2 * p.x / w - (r + l)) / (r - l) * w;
+        out[i][1] = (2 * p.y / w - (u + d)) / (u - d) * w;
+        out[i][2] = 0.5f * w;
+        out[i][3] = w;
+    }
+    return true;
+}
+
+static void draw_layer(id<MTLRenderCommandEncoder> enc, int blend, id<MTLTexture> tex, const layer_quad *q) {
+    [enc setRenderPipelineState:g_layer_pso[blend]];
+    [enc setVertexBytes:q length:sizeof *q atIndex:0];
+    [enc setFragmentBytes:q length:sizeof *q atIndex:0];
+    [enc setFragmentTexture:tex atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
+// Logs the frame's layer stack when it differs from the last one logged; true when it did.
+static bool log_layers(const XrFrameEndInfo *info) {
+    static char last[1024];
+    char now[1024] = "";
+    size_t n = 0;
+    for (uint32_t i = 0; i < info->layerCount && n < sizeof now - 80; i++) {
+        const XrCompositionLayerBaseHeader *l = info->layers[i];
+        if (!l) continue;
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) {
+            const XrCompositionLayerQuad *q = (const XrCompositionLayerQuad *)l;
+            swapchain *sc = (swapchain *)q->subImage.swapchain;
+            n += snprintf(now + n, sizeof now - n, " [quad %p flags %#llx %.2fx%.2fm]", (void *)sc,
+                          (unsigned long long)l->layerFlags, q->size.width, q->size.height);
+        } else if (l->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+            n += snprintf(now + n, sizeof now - n, " [projection flags %#llx]", (unsigned long long)l->layerFlags);
+        } else {
+            n += snprintf(now + n, sizeof now - n, " [type %d]", (int)l->type);
+        }
+    }
+    if (strcmp(now, last)) {
+        strcpy(last, now);
+        axr_log("layers:%s", now);
+        return true;
+    }
+    return false;
+}
+
+// Draws the frame's projection layer (if any) and its quads into g_layer_eye; false if it can't.
+static bool compose_layers(session *s, const XrFrameEndInfo *info, const XrCompositionLayerProjection *proj,
+                           bool explain) {
+    id<MTLDevice> dev = s->queue.device;
+    if (!layer_pipelines(dev)) return false;
+    uint32_t w, h;
+    axr_recommended_eye_size(&w, &h);
+    if (proj) {
+        w = proj->views[0].subImage.imageRect.extent.width;
+        h = proj->views[0].subImage.imageRect.extent.height;
+    }
+    for (int e = 0; e < 2; e++) {
+        if (g_layer_eye[e] && g_layer_eye[e].width == w && g_layer_eye[e].height == h) continue;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kLayerFormat width:w height:h
+                                                                                 mipmapped:NO];
+        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        d.storageMode = MTLStorageModePrivate;
+        g_layer_eye[e] = [dev newTextureWithDescriptor:d];
+    }
+    XrPosef head = from_axr(axr_device_motion(AXR_HEAD, info->displayTime).pose);
+    axr_views v = axr_current_views();
+    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    for (int e = 0; e < 2; e++) {
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = g_layer_eye[e];
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        XrPosef eye = pmul(head, from_axr(v.eye_in_head[e]));
+        XrFovf fov = {v.fov[e][0], v.fov[e][1], v.fov[e][2], v.fov[e][3]};
+        for (uint32_t i = 0; i < info->layerCount; i++) {
+            const XrCompositionLayerBaseHeader *l = info->layers[i];
+            layer_quad q = {0};
+            float uv[4];
+            id<MTLTexture> tex;
+            if (l && (const void *)l == (const void *)proj) {
+                if (!(tex = sub_image(&proj->views[e].subImage, uv))) continue;
+                q.slice = proj->views[e].subImage.imageArrayIndex;
+                const float ndc[4][2] = {{-1, 1}, {1, 1}, {-1, -1}, {1, -1}};
+                const float corner_uv[4][2] = {{uv[0], uv[1]}, {uv[2], uv[1]}, {uv[0], uv[3]}, {uv[2], uv[3]}};
+                for (int c = 0; c < 4; c++) {
+                    q.pos[c][0] = ndc[c][0], q.pos[c][1] = ndc[c][1], q.pos[c][2] = 0.5f, q.pos[c][3] = 1;
+                    q.uv[c][0] = corner_uv[c][0], q.uv[c][1] = corner_uv[c][1];
+                }
+                draw_layer(enc, i == 0 ? BLEND_NONE : layer_blend(l->layerFlags), tex, &q);
+                continue;
+            }
+            if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_QUAD) continue;
+            const XrCompositionLayerQuad *ql = (const XrCompositionLayerQuad *)l;
+            if ((ql->eyeVisibility == XR_EYE_VISIBILITY_LEFT && e != 0) ||
+                (ql->eyeVisibility == XR_EYE_VISIBILITY_RIGHT && e != 1))
+                continue;
+            if (!(tex = sub_image(&ql->subImage, uv))) {
+                if (explain && e == 0) axr_log("  layer %u: no released image", i);
+                continue;
+            }
+            if (!quad_corners(ql, eye, fov, info->displayTime, q.pos)) {
+                if (explain && e == 0) {
+                    XrPosef sp;
+                    bool tr;
+                    space_in_stage((space *)ql->space, info->displayTime, &sp, &tr, NULL);
+                    XrPosef in_eye = pmul(pinv(eye), pmul(sp, ql->pose));
+                    axr_log("  layer %u: behind the eye, at (%.2f, %.2f, %.2f) from it; space ref %d",
+                            i, in_eye.position.x, in_eye.position.y, in_eye.position.z, ((space *)ql->space)->ref);
+                }
+                continue;
+            }
+            if (explain && e == 0)
+                axr_log("  layer %u: drawn, %ux%u image, corner w %.2f", i, (unsigned)tex.width, (unsigned)tex.height,
+                        q.pos[0][3]);
+            q.slice = ql->subImage.imageArrayIndex;
+            const float corner_uv[4][2] = {{uv[0], uv[1]}, {uv[2], uv[1]}, {uv[0], uv[3]}, {uv[2], uv[3]}};
+            for (int c = 0; c < 4; c++) q.uv[c][0] = corner_uv[c][0], q.uv[c][1] = corner_uv[c][1];
+            draw_layer(enc, layer_blend(ql->layerFlags), tex, &q);
+        }
+        [enc endEncoding];
+    }
+    [cmd commit];
+    return true;
+}
+
 static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     axr_stat_end++;
@@ -904,25 +1129,40 @@ static XrResult xrEndFrame_(XrSession h, const XrFrameEndInfo *info) {
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
     if (info->environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
-    // The stream carries one picture per eye, so the first stereo projection layer is it.
+    // The stream carries one picture per eye: the first stereo projection layer, unless there are
+    // quad layers to draw over it (or instead of it).
+    const XrCompositionLayerProjection *proj = NULL;
+    bool quads = false;
     for (uint32_t i = 0; i < info->layerCount; i++) {
         const XrCompositionLayerBaseHeader *l = info->layers[i];
-        if (!l || l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
-        const XrCompositionLayerProjection *p = (const XrCompositionLayerProjection *)l;
+        if (!l) continue;
+        if (l->type == XR_TYPE_COMPOSITION_LAYER_QUAD) quads = true;
+        if (l->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION || proj) continue;
+        proj = (const XrCompositionLayerProjection *)l;
         axr_stat_projection++;
-        if (p->viewCount != 2) return XR_ERROR_VALIDATION_FAILURE;
-        axr_eye_image eyes[2];
+        if (proj->viewCount != 2) return XR_ERROR_VALIDATION_FAILURE;
         for (int e = 0; e < 2; e++) {
-            const XrSwapchainSubImage *sub = &p->views[e].subImage;
-            CHECK_HANDLE(sub->swapchain, swapchain, MAGIC_SWAPCHAIN);
+            CHECK_HANDLE(proj->views[e].subImage.swapchain, swapchain, MAGIC_SWAPCHAIN);
+            if (((swapchain *)proj->views[e].subImage.swapchain)->released < 0) return XR_ERROR_LAYER_INVALID;
+        }
+    }
+    // Each new layer stack is logged, and explained once.
+    bool changed = log_layers(info);
+    axr_eye_image eyes[2];
+    if (quads && compose_layers(s, info, proj, changed)) {
+        for (int e = 0; e < 2; e++)
+            eyes[e] = (axr_eye_image){g_layer_eye[e], 0, 0, 0, (int32_t)g_layer_eye[e].width, (int32_t)g_layer_eye[e].height};
+    } else if (proj) {
+        for (int e = 0; e < 2; e++) {
+            const XrSwapchainSubImage *sub = &proj->views[e].subImage;
             swapchain *sc = (swapchain *)sub->swapchain;
-            if (sc->released < 0) return XR_ERROR_LAYER_INVALID;
             eyes[e] = (axr_eye_image){sc->images[sc->released], sub->imageArrayIndex, sub->imageRect.offset.x,
                                       sub->imageRect.offset.y, sub->imageRect.extent.width, sub->imageRect.extent.height};
         }
-        axr_submit(info->displayTime, eyes, s->queue);
-        break;
+    } else {
+        return XR_SUCCESS;
     }
+    axr_submit(info->displayTime, eyes, s->queue);
     return XR_SUCCESS;
 }
 
@@ -1089,7 +1329,7 @@ static XrResult xrSyncActions_(XrSession h, const XrActionsSyncInfo *info) {
         return XR_SESSION_NOT_FOCUSED;
     }
     XrTime now = axr_now_ns();
-    bool connected = axr_backend_connected();
+    bool connected = (axr_backend_connected() || axr_fake_tracking());
     for (uint32_t i = 0; i < info->countActiveActionSets; i++) {
         action_set *as = (action_set *)info->activeActionSets[i].actionSet;
         if (!as || as->magic != MAGIC_ACTIONSET) return XR_ERROR_HANDLE_INVALID;

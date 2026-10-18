@@ -2,3 +2,4 @@ build/
 out/
 macvapor/dist/
 macvapor/release.env
+__pycache__/

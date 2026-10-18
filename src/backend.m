@@ -345,6 +345,9 @@ static void make_encoder(void) {
             g_ffr.enabled ? " (foveated)" : "", hevc ? "HEVC" : "H264", g_setup.refresh);
 }
 
+static id<MTLTexture> array_view(id<MTLTexture> t);
+id<MTLTexture> axr_array_view(id<MTLTexture> t) { return array_view(t); }
+
 static id<MTLTexture> array_view(id<MTLTexture> t) {
     if (t.textureType == MTLTextureType2DArray) return t;
     id<MTLTexture> v;
@@ -741,6 +744,15 @@ bool axr_backend_tracking(void) {
     return t;
 }
 
+static bool g_fake_tpose;   // see axr_device_motion
+
+bool axr_fake_tracking(void) {
+    pthread_mutex_lock(&g_lock);
+    bool f = !g_connected && g_fake_tpose;
+    pthread_mutex_unlock(&g_lock);
+    return f;
+}
+
 bool axr_backend_connected(void) {
     pthread_mutex_lock(&g_lock);
     bool c = g_connected;
@@ -823,6 +835,11 @@ static axr_pose from_alvr(AlvrPose p) {
                       {p.position[0], p.position[1], p.position[2]}};
 }
 
+// Testing without a headset: tune.json "fake_tpose": true holds both controllers out at shoulder
+// height, and "fake_press": [paths] reads those inputs as pressed. Only while no client is connected.
+static bool g_fake_tpose;
+static NSSet<NSString *> *g_fake_press;
+
 axr_motion axr_device_motion(int device, int64_t time) {
     axr_motion m = {0};
     pthread_mutex_lock(&g_lock);
@@ -847,6 +864,12 @@ axr_motion axr_device_motion(int device, int64_t time) {
     } else if (device == AXR_HEAD) {
         m.pose = (axr_pose){{0, 0, 0, 1}, {0, 1.6f, 0}};
         m.valid = true;
+    } else if (!connected && g_fake_tpose) {
+        // Pointing out along the arms: the left controller yawed 90 degrees left, the right one right.
+        float s = 0.70710678f;
+        m.pose = device == AXR_LEFT ? (axr_pose){{0, s, 0, s}, {-0.75f, 1.45f, -0.1f}}
+                                    : (axr_pose){{0, -s, 0, s}, {0.75f, 1.45f, -0.1f}};
+        m.valid = true;
     }
     return m;
 }
@@ -862,7 +885,16 @@ static void read_tune(void) {
     float ipd = t[@"ipd_scale"] ? [t[@"ipd_scale"] floatValue] : 1, fov = t[@"fov_scale"] ? [t[@"fov_scale"] floatValue] : 1;
     bool swap = [t[@"swap_eyes"] boolValue];
     int snap = [t[@"snapshot"] intValue];
+    bool tpose = [t[@"fake_tpose"] boolValue];
+    NSArray *press = [t[@"fake_press"] isKindOfClass:NSArray.class] ? t[@"fake_press"] : @[];
     pthread_mutex_lock(&g_lock);
+    NSSet *pressed = [NSSet setWithArray:press];
+    if (tpose != g_fake_tpose || ![pressed isEqualToSet:g_fake_press ?: [NSSet set]]) {
+        g_fake_tpose = tpose;
+        g_fake_press = pressed;
+        g_input_generation++;
+        axr_log("fake input: tpose %d, pressed %s", tpose, [[press componentsJoinedByString:@" "] UTF8String]);
+    }
     g_snapshot_request = snap;
     bool changed = ipd != g_ipd_scale || fov != g_fov_scale || swap != g_swap_eyes;
     g_ipd_scale = ipd; g_fov_scale = fov; g_swap_eyes = swap;
@@ -892,6 +924,11 @@ axr_views axr_current_views(void) {
 bool axr_input(const char *path, float *value) {
     uint64_t id = alvr_path_to_id(path);
     pthread_mutex_lock(&g_lock);
+    if (!g_connected && [g_fake_press containsObject:@(path)]) {
+        pthread_mutex_unlock(&g_lock);
+        *value = 1;
+        return true;
+    }
     NSNumber *v = g_inputs[@(id)];
     pthread_mutex_unlock(&g_lock);
     if (!v) return false;

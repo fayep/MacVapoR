@@ -43,6 +43,7 @@ bool axr_audio_available(void);
 void axr_audio_start(void);
 void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
 bool axr_backend_connected(void);
+bool axr_fake_tracking(void);       // tune.json fake_tpose, with no client: report the head as tracked
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
 uint32_t axr_recenter_generation(void);   // changes when the user asks to recenter (Digital Crown)
 double axr_refresh_hz(void);
@@ -73,4 +74,7 @@ typedef struct {
 // Composes the two eye images into ALVR's (foveated) stream layout on the app's queue, after
 // the app's own rendering, and encodes and sends the result for that frame's display time.
 void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommandQueue> queue);
+
+// A 2D texture as a one-slice 2D array view (cached), so shaders can take either.
+id<MTLTexture> axr_array_view(id<MTLTexture> t);
 #endif
