@@ -18,7 +18,7 @@
 #     else to Meta's. It is installed only after Meta has confirmed, with the documented
 #     verify_entitlement call and AVP-Play's stored token, that the account owns the game.
 #
-# Overridable: RUNNER, STEAM, RIFTLIFT_ZIP (riftlift-compat.zip from RiftLift's release),
+# Overridable: RUNNER, STEAM, RIFTLIFT_ZIP (RiftLift's riftlift-compat.zip; fetched from its release when missing),
 # PLATFORM_DIR, ACCOUNT (AVP-Play's keychain account, default "default")
 set -eu
 [ $# -eq 2 ] || { sed -n 2,6p "$0" >&2; exit 2; }
@@ -27,13 +27,23 @@ case "$id$app" in ''|*[!0-9]*) echo "IDs must be numeric" >&2; exit 2 ;; esac
 
 RUNNER=${RUNNER:-$HOME/Library/Application Support/notproton/runners/current}
 STEAM=${STEAM:-$HOME/Library/Application Support/Steam}
-RIFTLIFT_ZIP=${RIFTLIFT_ZIP:-$HOME/Source/riftlift-dl/riftlift-compat.zip}
+RIFTLIFT_ZIP=${RIFTLIFT_ZIP:-$HOME/Library/Application Support/MacVapoR/rift/riftlift-compat-0.11.1.2.zip}
 PLATFORM_DIR=${PLATFORM_DIR:-/Volumes/Ext/AVPPlay/rift/oculus-platform}
 ACCOUNT=${ACCOUNT:-default}
 
 prefix="$STEAM/steamapps/compatdata/$id/pfx"
 [ -f "$prefix/system.reg" ] || { echo "no prefix for $id; launch the game once first" >&2; exit 1; }
-for f in "$RIFTLIFT_ZIP" "$PLATFORM_DIR/LibOVRPlatform64_1.dll" "$PLATFORM_DIR/LibOVRPlatformImpl64_1.dll" \
+# RiftLift's release, fetched once and checked against the checksum its release publishes.
+riftlift_sha=9abc7f42a78eb2cf03d122b35871c47cd19132e7b4a20fccb55650abb8c2a9f5
+if [ ! -f "$RIFTLIFT_ZIP" ]; then
+    mkdir -p "$(dirname "$RIFTLIFT_ZIP")"
+    echo "fetching RiftLift 0.11.1.2"
+    curl -fsSL -o "$RIFTLIFT_ZIP.part" https://github.com/Villagers654/RiftLift/releases/download/v0.11.1.2/riftlift-compat.zip
+    mv "$RIFTLIFT_ZIP.part" "$RIFTLIFT_ZIP"
+fi
+[ "$(shasum -a 256 "$RIFTLIFT_ZIP" | cut -d' ' -f1)" = "$riftlift_sha" ] ||
+    { echo "$RIFTLIFT_ZIP isn't RiftLift 0.11.1.2's riftlift-compat.zip (checksum differs)" >&2; exit 1; }
+for f in "$PLATFORM_DIR/LibOVRPlatform64_1.dll" "$PLATFORM_DIR/LibOVRPlatformImpl64_1.dll" \
          "$PLATFORM_DIR/LibOVRP2P64_1.dll"; do
     [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
 done

@@ -10,14 +10,7 @@ Under the hood, the game talks to the Rift's runtime (LibOVR) as it would on a P
 Revive, turns that into OpenXR, and alvrxr takes it from there, as for any other game. Each game
 is added to Steam as a non-Steam game and runs through NotProton like the rest.
 
-> **Not ready for everyone yet.** Two things the games need are built on the developer's Mac and
-> not yet published:
->
-> - RiftLift's bridge with vtable hooks: the released bridge's code patches break DXMT on Apple silicon.
-> - A DXMT with `SwapDeviceContextState`, which Lone Echo needs.
->
-> Until they ship with MacVapoR or upstream, the steps below work only on that Mac. The rest
-> of this guide is how it will go.
+Some of this only works on the developer's Mac so far: see [What's left](#whats-left) at the end.
 
 ## Tested games
 
@@ -162,3 +155,28 @@ The game's own saves are in its prefix, as on a PC.
 Remove the shortcut in Steam, then delete its prefix
 (`~/Library/Application Support/Steam/steamapps/compatdata/<shortcut ID>`) and, if you like, its
 folder in the Rift folder. The game's saves are in the prefix, so they go with it.
+
+## What's left
+
+What stands between this guide and someone else following it on their own Mac:
+
+1. **RiftLift's bridge with vtable hooks.** RiftLift's released bridge patches D3D11's code with
+   Detours, which corrupts DXMT's ARM64EC code; ours hooks the vtables instead. It's on a local
+   branch only. To do: ship the built bridge with MacVapoR (RiftLift is MIT), and offer the
+   change to RiftLift.
+2. **DXMT with `SwapDeviceContextState`.** Lone Echo needs it, and CrossOver's DXMT lacks it. It's
+   a local ARM64EC build. To do: find which games need it, ship it with MacVapoR for those (DXMT
+   is zlib licensed), and offer the change to DXMT.
+3. **The tools are in a source checkout, with this Mac's folders as their defaults.** To do: MacVapoR
+   installs `rift-add.sh`, `rift-setup.sh`, their helpers and the builds above beside the
+   runtime, and they default to those; the Rift folder has no default.
+4. ~~**RiftLift's release is downloaded by hand.**~~ Done: the setup fetches RiftLift 0.11.1.2's
+   `riftlift-compat.zip` itself and checks its SHA-256.
+5. **The artwork tool is compiled on first use** with `swiftc`, which needs Xcode's command line
+   tools. To do: ship it built.
+6. **AVP-Play for the sign-in.** It has releases; check that `avpplay login` works from the
+   released app, and say how to get it.
+7. **Tested on one Mac and one CrossOver runner.** The DXMT build has to match the runner's
+   `winemetal`. To do: try a clean prefix on NotProton's current runner, and a second Mac.
+8. **Terminal only.** To do, once the rest is done: a Rift Games section in MacVapoR that does
+   steps 2 and 3 for a folder you choose.
