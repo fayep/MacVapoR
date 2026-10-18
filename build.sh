@@ -25,6 +25,13 @@ clang -dynamiclib -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall -Wno-u
     -framework Foundation -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework ImageIO -framework CoreGraphics -framework CoreAudio \
     -L "$out" -lalvr_server_core -Wl,-rpath,@loader_path \
     -install_name @rpath/libalvrxr.dylib -o "$out/libalvrxr.dylib"
+# The home scene (home/vapord.m), which MacVapoR keeps running while no game holds the headset.
+{ printf 'static const char scene_metal[] =\n'; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/\\n"/' "$here/home/scene.metal"; printf ';\n'; } \
+    > "$here/build/scene_metal.h"
+clang -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall \
+    -I "$here/build" -I "$OPENXR/build/include" -I "$OPENXR/include" \
+    "$here/home/vapord.m" -framework Foundation -framework Metal -framework CoreText -framework CoreGraphics \
+    -o "$out/vapord"
 cat > "$out/alvrxr.json" <<JSON
 {
     "file_format_version": "1.0.0",
