@@ -44,6 +44,7 @@ void axr_audio_start(void);
 void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
 bool axr_backend_connected(void);
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
+uint32_t axr_recenter_generation(void);   // changes when the user asks to recenter (Digital Crown)
 double axr_refresh_hz(void);
 void axr_recommended_eye_size(uint32_t *w, uint32_t *h);
 

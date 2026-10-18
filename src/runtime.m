@@ -94,6 +94,7 @@ struct session {
     XrPath profile;                          // active interaction profile
     XrPosef local;                           // LOCAL's origin in STAGE
     bool local_from_headset;
+    uint32_t recenter_seen;                  // axr_recenter_generation() when LOCAL was last taken
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -574,9 +575,14 @@ static XrResult xrDestroySpace_(XrSpace h) {
 }
 
 // LOCAL is where the user's head was, facing where it faced but level. Until the headset reports
-// a real pose that is a guess, so it is taken once from the first real head pose, and the app is
-// told the space moved.
+// a real pose that is a guess, so it is taken from the first real head pose, and again whenever the
+// user recenters (holding the Digital Crown); each time the app is told the space moved.
 static XrPosef local_origin(session *s, XrTime t) {
+    uint32_t recenter = axr_recenter_generation();
+    if (recenter != s->recenter_seen) {
+        s->recenter_seen = recenter;
+        s->local_from_headset = false;
+    }
     if (!s->local_from_headset && axr_backend_tracking()) {
         axr_motion head = axr_device_motion(AXR_HEAD, t);
         bool placeholder = head.pose.position[0] == 0 && head.pose.position[1] == 1.2f && head.pose.position[2] == 0;

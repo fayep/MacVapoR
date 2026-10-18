@@ -537,6 +537,11 @@ static bool finite_fov(const AlvrFov *f) {
 
 static void read_tune(void);
 
+// Bumped when the user asks to recenter: the visionOS client syncs its playspace when the Digital
+// Crown is held (with "keep SteamVR center" off, its default) and expects the server to recenter.
+static _Atomic uint32_t g_recenter_generation;
+uint32_t axr_recenter_generation(void) { return g_recenter_generation; }
+
 static void *event_thread(void *arg) {
     (void)arg;
     AlvrEvent ev;
@@ -555,6 +560,10 @@ static void *event_thread(void *arg) {
                 g_samples_since_real = 0;
                 pthread_mutex_unlock(&g_lock);
                 axr_log("headset connected");
+                break;
+            case ALVR_EVENT_PLAYSPACE_SYNC:
+                g_recenter_generation++;
+                axr_log("recenter requested");
                 break;
             case ALVR_EVENT_CLIENT_DISCONNECTED:
                 pthread_mutex_lock(&g_lock);
