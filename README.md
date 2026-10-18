@@ -47,6 +47,16 @@ at that height instead of your real one.
 
 **Undo** puts a game back as it was. The runtime's log is at `~/Library/Logs/alvrxr.log`.
 
+Games from Meta's PC store for the Rift can be played too, brought over from the PC they're
+installed on: see [Meta Rift games](docs/rift-games.md). That isn't ready for everyone yet.
+
+## Home scene
+
+While no game is running, the headset shows a home scene: somewhere to stand, with your hands or
+controllers, and a ball on a table to throw. Choose it, or turn it off, under **Home Scene** in
+MacVapoR. Two come with it, Vaporwave and Studio. A scene is a folder, so you can make your own:
+see [home/SCENES.md](home/SCENES.md).
+
 ## Known issues
 
 - If visionOS takes focus away (Siri, a screenshot, the Mac's screen), the controllers'
