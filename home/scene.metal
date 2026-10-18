@@ -11,6 +11,7 @@ struct Eye {
     float4 pos;                // the eye's position, metres, floor at y = 0
     float4 tan;                // tangents of the left, right, up and down field of view angles
     float4 time;               // seconds
+    float4 ball;               // the ball's centre and radius, for its shadow
 };
 
 struct Board {                 // an upright picture facing +z: centre and half size, metres
@@ -84,7 +85,7 @@ static float3 sky(float3 d, float t) {
 // Where the ray meets the ground: the neon grid near, the beach, then the sea out to the horizon.
 constant float kBeachNear = -12.0, kBeachFar = -16.5;
 
-static float3 ground(float3 o, float3 d, float t, thread float &dist) {
+static float3 ground(float3 o, float3 d, float t, float4 ball, thread float &dist) {
     dist = -o.y / d.y;
     float3 p = o + d * dist;
     float3 horizon = sky(float3(d.x, 0.0, d.z), t);
@@ -108,6 +109,10 @@ static float3 ground(float3 o, float3 d, float t, thread float &dist) {
         c = mix(lin(kDeep) * 1.2, lin(kPurple) * 0.6, 0.3);
         c += mix(lin(kCyan), lin(kSilver), smoothstep(0.15, 0.0, col)) * path * 0.9;
     }
+    // The ball's shadow: softer and fainter the higher it is.
+    float h = max(ball.y - ball.w, 0.0), spread = ball.w * (1.0 + h * 1.5);
+    float2 off = p.xz - ball.xz;
+    c *= 1.0 - 0.65 * exp(-dot(off, off) / (spread * spread)) / (1.0 + h * 2.0);
     return mix(horizon, c, exp(-dist * 0.018));   // haze to the horizon
 }
 
@@ -122,7 +127,7 @@ fragment float4 fs(VOut in [[stage_in]], constant Eye &eye [[buffer(0)]], consta
 
     float depth = INFINITY;
     float3 c;
-    if (d.y < -1e-4) c = ground(o, d, t, depth);
+    if (d.y < -1e-4) c = ground(o, d, t, eye.ball, depth);
     else c = sky(d, t);
 
     // The pictures, furthest first, each over what's behind it.

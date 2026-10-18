@@ -487,6 +487,155 @@ static void hand_lines(const XrHandJointLocationEXT *j, segment *out, int *n) {
     }
 }
 
+// ---------------------------------------------------------------------------- the ball and table
+//
+// A beach ball on a pedestal beside you. Grab it by reaching in with a controller and squeezing the
+// trigger or grip, or bare-handed by pinching it; let go and it flies with your hand's velocity
+// and spin, bounces on the grid and the table, and rolls to a stop. Out of reach, it comes back.
+
+static const float kBallRadius = 0.11f;
+static const simd_float3 kTableCentre = {0.5f, 0.0f, -0.42f};   // on the floor, ahead and to the right
+static const float kTableTop = 0.76f, kTableHalf = 0.22f, kTableThick = 0.035f, kColumnHalf = 0.045f;
+
+static mesh mesh_from(NSData *verts, NSData *idx, id<MTLDevice> dev) {
+    mesh m;
+    m.vertices = [dev newBufferWithBytes:verts.bytes length:verts.length options:MTLResourceStorageModeShared];
+    m.indices = [dev newBufferWithBytes:idx.bytes length:idx.length options:MTLResourceStorageModeShared];
+    m.index_count = (uint32_t)(idx.length / sizeof(uint32_t));
+    return m;
+}
+
+// A unit sphere, its texture wrapped round once: u around, v from the top.
+static mesh sphere_mesh(id<MTLDevice> dev) {
+    NSMutableData *verts = [NSMutableData data], *idx = [NSMutableData data];
+    const int rings = 24, segs = 48;
+    for (int r = 0; r <= rings; r++)
+        for (int s = 0; s <= segs; s++) {
+            float th = (float)M_PI * r / rings, ph = 2 * (float)M_PI * s / segs;
+            float x = sinf(th) * cosf(ph), y = cosf(th), z = sinf(th) * sinf(ph);
+            mesh_vertex m = {{x, y, z}, {x, y, z}, {(float)s / segs, (float)r / rings}};
+            [verts appendBytes:&m length:sizeof m];
+        }
+    for (int r = 0; r < rings; r++)
+        for (int s = 0; s < segs; s++) {
+            uint32_t a = r * (segs + 1) + s, b = a + segs + 1;
+            uint32_t tri[6] = {a, b, a + 1, a + 1, b, b + 1};
+            [idx appendBytes:tri length:sizeof tri];
+        }
+    return mesh_from(verts, idx, dev);
+}
+
+// A box of the given half sizes, centred; each face shows the whole texture.
+static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) {
+    NSMutableData *verts = [NSMutableData data], *idx = [NSMutableData data];
+    for (int axis = 0; axis < 3; axis++)
+        for (int sign = -1; sign <= 1; sign += 2) {
+            simd_float3 n = 0, u = 0, w = 0;
+            n[axis] = sign;
+            u[(axis + 1) % 3] = 1;
+            w[(axis + 2) % 3] = 1;
+            uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
+            for (int k = 0; k < 4; k++) {
+                float a = (k & 1) ? 1 : -1, b = (k & 2) ? 1 : -1;
+                simd_float3 p = (n + u * a + w * b) * half;
+                mesh_vertex m = {{p.x, p.y, p.z}, {n.x, n.y, n.z}, {(a + 1) / 2, (b + 1) / 2}};
+                [verts appendBytes:&m length:sizeof m];
+            }
+            uint32_t tri[6] = {base, base + 1, base + 2, base + 1, base + 3, base + 2};
+            [idx appendBytes:tri length:sizeof tri];
+        }
+    return mesh_from(verts, idx, dev);
+}
+
+// The beach ball: six panels, purple, cyan and silver, with white caps.
+static CGContextRef draw_ball(void) {
+    CGContextRef c = canvas(512, 256);
+    CGColorRef panels[3] = {rgb(0.55, 0.22, 0.90, 1), rgb(0.0, 0.85, 0.95, 1), rgb(0.88, 0.90, 0.96, 1)};
+    for (int i = 0; i < 6; i++) {
+        CGContextSetFillColorWithColor(c, panels[i % 3]);
+        CGContextFillRect(c, CGRectMake(i * 512.0 / 6, 0, 512.0 / 6 + 1, 256));
+    }
+    CGContextSetFillColorWithColor(c, rgb(0.97, 0.97, 1.0, 1));
+    CGContextFillRect(c, CGRectMake(0, 0, 512, 22));
+    CGContextFillRect(c, CGRectMake(0, 234, 512, 22));
+    return c;
+}
+
+// The table: dark purple, edged in neon.
+static CGContextRef draw_table(void) {
+    CGContextRef c = canvas(256, 256);
+    CGContextSetFillColorWithColor(c, rgb(0.10, 0.03, 0.20, 1));
+    CGContextFillRect(c, CGRectMake(0, 0, 256, 256));
+    CGContextSetStrokeColorWithColor(c, rgb(0.0, 0.92, 1.0, 1));
+    CGContextSetLineWidth(c, 14);
+    CGContextStrokeRect(c, CGRectMake(7, 7, 242, 242));
+    CGContextSetStrokeColorWithColor(c, rgb(0.62, 0.30, 0.95, 1));
+    CGContextSetLineWidth(c, 4);
+    CGContextStrokeRect(c, CGRectMake(24, 24, 208, 208));
+    return c;
+}
+
+typedef struct {
+    simd_float3 p, v, w;    // centre, velocity, angular velocity
+    simd_quatf q;           // its turn
+    int held;               // the hand holding it, or -1
+    simd_float4x4 in_hand;  // held: its pose in the hand's
+    double still;           // seconds at rest out of reach
+} ball_state;
+
+static void ball_reset(ball_state *b) {
+    *b = (ball_state){.p = kTableCentre + simd_make_float3(0, kTableTop + kBallRadius, 0), .q = simd_quaternion(0.0f, 0.0f, 0.0f, 1.0f),
+                      .held = -1};
+}
+
+// One step of the ball's flight, bounces and rolling.
+static void ball_step(ball_state *b, float dt) {
+    if (b->held >= 0) return;
+    b->v.y -= 9.81f * dt;
+    b->p += b->v * dt;
+    float spin = simd_length(b->w);
+    if (spin > 1e-4f) b->q = simd_normalize(simd_mul(simd_quaternion(spin * dt, b->w / spin), b->q));
+
+    // The surface under it: the table top over the table, else the floor.
+    simd_float3 rel = b->p - kTableCentre;
+    bool over_table = fabsf(rel.x) < kTableHalf && fabsf(rel.z) < kTableHalf;
+    float floor_y = over_table && b->p.y > kTableTop - kTableThick ? kTableTop : 0;
+    if (b->p.y < floor_y + kBallRadius) {
+        b->p.y = floor_y + kBallRadius;
+        if (b->v.y < 0) b->v.y = -b->v.y * 0.6f;   // a beach ball's bounce
+        if (b->v.y < 0.35f) b->v.y = 0;
+        b->v.x *= 1 - fminf(2.0f * dt, 1);         // rolling friction
+        b->v.z *= 1 - fminf(2.0f * dt, 1);
+        // Rolling: it turns as it goes.
+        b->w = simd_cross(simd_make_float3(0, 1, 0), b->v) / kBallRadius;
+    }
+    // The column and the table's edges push it out sideways.
+    if (b->p.y < kTableTop + kBallRadius && b->p.y > 0) {
+        float half = b->p.y < kTableTop - kTableThick ? kColumnHalf : kTableHalf;
+        simd_float2 d = simd_make_float2(rel.x, rel.z);
+        simd_float2 nearest = simd_clamp(d, -half, half);
+        simd_float2 out = d - nearest;
+        float len = simd_length(out);
+        if (len < kBallRadius && !(over_table && b->p.y >= kTableTop)) {
+            simd_float2 n = len > 1e-5f ? out / len : simd_make_float2(1, 0);
+            simd_float2 pos = nearest + n * kBallRadius;
+            b->p.x = kTableCentre.x + pos.x;
+            b->p.z = kTableCentre.z + pos.y;
+            simd_float2 vv = simd_make_float2(b->v.x, b->v.z);
+            float into = simd_dot(vv, n);
+            if (into < 0) vv -= n * into * 1.6f;
+            b->v.x = vv.x;
+            b->v.z = vv.y;
+        }
+    }
+    // Back to the table once it's been at rest on the floor a few seconds (seated, the floor at
+    // your feet is out of reach), or soon after it flies off over the sea.
+    bool on_floor = b->p.y < kBallRadius + 0.01f && simd_length(b->v) < 0.08f;
+    bool gone = b->p.z < -40 || fabsf(b->p.x) > 40 || b->p.z > 40;
+    b->still = on_floor || gone ? b->still + dt : 0;
+    if (b->still > 3.0) ball_reset(b);
+}
+
 // ------------------------------------------------------------------------------------- the app
 
 typedef struct {
@@ -494,6 +643,7 @@ typedef struct {
     float pos[4];
     float tan[4];
     float time[4];
+    float ball[4];
 } eye_uniform;
 
 static void rotation_columns(XrQuaternionf q, eye_uniform *u) {
@@ -579,6 +729,7 @@ int main(int argc, char **argv) {
         FN(xrGetActionStateBoolean);
         FN(xrGetActionStateFloat);
         FN(xrGetActionStateVector2f);
+        FN(xrApplyHapticFeedback);
 
         XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO, NULL, XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
         XrSystemId system;
@@ -658,10 +809,22 @@ int main(int argc, char **argv) {
             {"stick_touch", XR_ACTION_TYPE_BOOLEAN_INPUT, "thumbstick/touch", "thumbstick/touch"},
         };
         XrAction control[A_COUNT];
-        XrActionSuggestedBinding sb[2 + 2 * A_COUNT] = {{grip}, {grip}};
+        XrAction haptic;
+        {
+            XrActionCreateInfo ci = {XR_TYPE_ACTION_CREATE_INFO};
+            strcpy(ci.actionName, "haptic");
+            strcpy(ci.localizedActionName, "Haptic");
+            ci.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+            ci.countSubactionPaths = 2;
+            ci.subactionPaths = hands;
+            XR(xrCreateAction(set, &ci, &haptic));
+        }
+        XrActionSuggestedBinding sb[4 + 2 * A_COUNT] = {{grip}, {grip}, {haptic}, {haptic}};
         XR(xrStringToPath(instance, "/user/hand/left/input/grip/pose", &sb[0].binding));
         XR(xrStringToPath(instance, "/user/hand/right/input/grip/pose", &sb[1].binding));
-        uint32_t nsb = 2;
+        XR(xrStringToPath(instance, "/user/hand/left/output/haptic", &sb[2].binding));
+        XR(xrStringToPath(instance, "/user/hand/right/output/haptic", &sb[3].binding));
+        uint32_t nsb = 4;
         for (int i = 0; i < A_COUNT; i++) {
             XrActionCreateInfo ci = {XR_TYPE_ACTION_CREATE_INFO};
             strcpy(ci.actionName, controls[i].name);
@@ -696,6 +859,20 @@ int main(int argc, char **argv) {
         controller controllers[2];
         bool have_model[2];
         for (int h = 0; h < 2; h++) have_model[h] = load_controller(models_dir, h == 0, dev, queue, &controllers[h]);
+        mesh ball_mesh = sphere_mesh(dev);
+        mesh table_top = box_mesh(simd_make_float3(kTableHalf, kTableThick / 2, kTableHalf), dev);
+        mesh table_column = box_mesh(simd_make_float3(kColumnHalf, (kTableTop - kTableThick) / 2, kColumnHalf), dev);
+        id<MTLTexture> tex_ball = texture_from(draw_ball(), dev, queue);
+        id<MTLTexture> tex_table = texture_from(draw_table(), dev, queue);
+        ball_state ball;
+        ball_reset(&ball);
+        XrTime last_time = 0;
+        // Bare hands: where each pinch is, and was, for a throw's speed.
+        bool pinching[2] = {false, false};
+        simd_float3 pinch_at[2][4];
+        XrTime pinch_time[2][4];
+        int pinch_n[2] = {0, 0};
+        bool was_gripping[2] = {false, false};
 
         NSError *err = nil;
         id<MTLLibrary> mlib = [dev newLibraryWithSource:@(scene_metal) options:nil error:&err];
@@ -838,19 +1015,97 @@ int main(int argc, char **argv) {
                 segment lines[2 * 29];
                 int nlines = 0;
                 for (int h = 0; h < 2; h++) {
-                    XrSpaceLocation sl = {XR_TYPE_SPACE_LOCATION};
+                    XrSpaceVelocity svel = {XR_TYPE_SPACE_VELOCITY};
+                    XrSpaceLocation sl = {XR_TYPE_SPACE_LOCATION, &svel};
                     XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+                    // A pinch the client sends as a controller sits on the gaze ray, at the eyes: not a
+                    // controller in the hand, which can't be there.
+                    simd_float3 head = simd_make_float3((views[0].pose.position.x + views[1].pose.position.x) / 2,
+                                                        (views[0].pose.position.y + views[1].pose.position.y) / 2,
+                                                        (views[0].pose.position.z + views[1].pose.position.z) / 2);
                     if (have_model[h] && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
-                        (sl.locationFlags & want) == want) {
+                        (sl.locationFlags & want) == want &&
+                        simd_distance(simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z), head) > 0.25f) {
                         show_controller[h] = true;
                         controller_model[h] = simd_mul(pose_matrix(sl.pose), grip_to_model(h == 0));
+                        // The ball: squeeze the trigger or grip with the controller in it, taking it from the other
+                        // hand if that has it.
+                        simd_float4x4 hand = pose_matrix(sl.pose);
+                        simd_float3 at = simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z);
+                        bool gripping = input[h].trigger > 0.6f || input[h].squeeze > 0.6f;
+                        bool letting_go = input[h].trigger < 0.35f && input[h].squeeze < 0.35f;
+                        if (gripping && !was_gripping[h] && ball.held != h && simd_distance(at, ball.p) < kBallRadius + 0.07f) {
+                            ball.held = h;
+                            simd_float4x4 bm = simd_matrix4x4(ball.q);
+                            bm.columns[3] = simd_make_float4(ball.p, 1);
+                            ball.in_hand = simd_mul(simd_inverse(hand), bm);
+                            XrHapticVibration buzz = {XR_TYPE_HAPTIC_VIBRATION, NULL, 40000000, XR_FREQUENCY_UNSPECIFIED, 0.6f};
+                            XrHapticActionInfo hai = {XR_TYPE_HAPTIC_ACTION_INFO, NULL, haptic, hands[h]};
+                            xrApplyHapticFeedback(session, &hai, (const XrHapticBaseHeader *)&buzz);
+                        }
+                        if (ball.held == h) {
+                            simd_float4x4 bm = simd_mul(hand, ball.in_hand);
+                            ball.p = simd_make_float3(bm.columns[3]);
+                            ball.q = simd_quaternion(simd_matrix(simd_make_float3(bm.columns[0]), simd_make_float3(bm.columns[1]),
+                                                                    simd_make_float3(bm.columns[2])));
+                            if (letting_go) {
+                                // It leaves with the hand's motion at the ball: its velocity, and its spin.
+                                simd_float3 lin = simd_make_float3(svel.linearVelocity.x, svel.linearVelocity.y, svel.linearVelocity.z);
+                                simd_float3 ang = simd_make_float3(svel.angularVelocity.x, svel.angularVelocity.y, svel.angularVelocity.z);
+                                if (!(svel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT)) lin = 0;
+                                if (!(svel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT)) ang = 0;
+                                ball.v = lin + simd_cross(ang, ball.p - at);
+                                ball.w = ang;
+                                ball.held = -1;
+                            }
+                        }
+                        was_gripping[h] = gripping;
                         continue;
                     }
+                    was_gripping[h] = false;
                     XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
                     XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT, NULL, XR_FALSE, XR_HAND_JOINT_COUNT_EXT, joints};
                     XrHandJointsLocateInfoEXT hli = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, NULL, stage, fs.predictedDisplayTime};
-                    if (XR_SUCCEEDED(xrLocateHandJointsEXT(trackers[h], &hli, &jl)) && jl.isActive) hand_lines(joints, lines, &nlines);
+                    if (XR_SUCCEEDED(xrLocateHandJointsEXT(trackers[h], &hli, &jl)) && jl.isActive) {
+                        hand_lines(joints, lines, &nlines);
+                        // The ball, bare-handed: pinch it.
+                        XrVector3f th = joints[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position, ix = joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+                        simd_float3 t3 = simd_make_float3(th.x, th.y, th.z), i3 = simd_make_float3(ix.x, ix.y, ix.z);
+                        simd_float3 at = (t3 + i3) * 0.5f;
+                        float gap = simd_distance(t3, i3);
+                        bool now = pinching[h] ? gap < 0.045f : gap < 0.022f;
+                        // The last few pinch points, for the throw.
+                        int k = pinch_n[h] % 4;
+                        pinch_at[h][k] = at;
+                        pinch_time[h][k] = fs.predictedDisplayTime;
+                        pinch_n[h]++;
+                        if (now && !pinching[h] && ball.held != h && simd_distance(at, ball.p) < kBallRadius + 0.05f) {
+                            ball.held = h;
+                            simd_float4x4 bm = simd_matrix4x4(ball.q);
+                            bm.columns[3] = simd_make_float4(ball.p, 1);
+                            ball.in_hand = simd_mul(simd_inverse(translation(at)), bm);
+                        }
+                        if (ball.held == h) {
+                            simd_float4x4 bm = simd_mul(translation(at), ball.in_hand);
+                            ball.p = simd_make_float3(bm.columns[3]);
+                            if (!now) {
+                                int oldest = pinch_n[h] >= 4 ? pinch_n[h] % 4 : 0, newest = (pinch_n[h] - 1) % 4;
+                                double span = (pinch_time[h][newest] - pinch_time[h][oldest]) / 1e9;
+                                ball.v = span > 0.005 ? (pinch_at[h][newest] - pinch_at[h][oldest]) / (float)span : 0;
+                                ball.w = 0;
+                                ball.held = -1;
+                            }
+                        }
+                        pinching[h] = now;
+                    } else {
+                        pinching[h] = false;
+                        if (ball.held == h) ball.held = -1;   // the hand's gone: drop it
+                    }
                 }
+                // The ball's flight, in small steps.
+                float dt = last_time ? fminf((float)((fs.predictedDisplayTime - last_time) / 1e9), 0.05f) : 0;
+                last_time = fs.predictedDisplayTime;
+                for (int s = 0; s < 4; s++) ball_step(&ball, dt / 4);
 
                 XrCompositionLayerProjectionView pv[2];
                 id<MTLCommandBuffer> cmd = [queue commandBuffer];
@@ -870,6 +1125,10 @@ int main(int argc, char **argv) {
                     u.tan[2] = tanf(views[e].fov.angleUp);
                     u.tan[3] = tanf(views[e].fov.angleDown);
                     u.time[0] = (float)(CFAbsoluteTimeGetCurrent() - start);
+                    u.ball[0] = ball.p.x;
+                    u.ball[1] = ball.p.y;
+                    u.ball[2] = ball.p.z;
+                    u.ball[3] = kBallRadius;
 
                     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
                     rp.colorAttachments[0].texture = images[e][idx];
@@ -891,6 +1150,27 @@ int main(int argc, char **argv) {
 
                     struct { simd_float4x4 view, proj; } camera = {simd_inverse(pose_matrix(views[e].pose)),
                                                                    projection(views[e].fov, 0.05f, 200)};
+                    // The table and the ball.
+                    {
+                        simd_float4 no_glow = 0;
+                        struct { mesh *m; simd_float4x4 model; id<MTLTexture> tex; } things[3];
+                        things[0] = (typeof(things[0])){&table_top, translation(kTableCentre + simd_make_float3(0, kTableTop - kTableThick / 2, 0)), tex_table};
+                        things[1] = (typeof(things[0])){&table_column, translation(kTableCentre + simd_make_float3(0, (kTableTop - kTableThick) / 2, 0)), tex_table};
+                        simd_float4x4 bm = simd_mul(translation(ball.p), simd_mul(simd_matrix4x4(ball.q),
+                                                                                  simd_diagonal_matrix(simd_make_float4(kBallRadius, kBallRadius, kBallRadius, 1))));
+                        things[2] = (typeof(things[0])){&ball_mesh, bm, tex_ball};
+                        [enc setRenderPipelineState:mesh_pso];
+                        [enc setDepthStencilState:depth_write];
+                        [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
+                        [enc setFragmentBytes:&no_glow length:sizeof no_glow atIndex:0];
+                        for (int i = 0; i < 3; i++) {
+                            [enc setVertexBuffer:things[i].m->vertices offset:0 atIndex:0];
+                            [enc setVertexBytes:&things[i].model length:sizeof things[i].model atIndex:2];
+                            [enc setFragmentTexture:things[i].tex atIndex:0];
+                            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:things[i].m->index_count
+                                             indexType:MTLIndexTypeUInt32 indexBuffer:things[i].m->indices indexBufferOffset:0];
+                        }
+                    }
                     for (int h = 0; h < 2; h++) {
                         if (!show_controller[h]) continue;
                         [enc setRenderPipelineState:mesh_pso];
