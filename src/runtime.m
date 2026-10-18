@@ -1752,6 +1752,22 @@ static XrResult xrLocateHandJointsEXT_(XrHandTrackerEXT h, const XrHandJointsLoc
 
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
 
+// Shared images are offered only when asked for, with ALVRXR_SHARE_IMAGES=1 or tune.json
+// "share_images": true, until a game's loading screens no longer stall on them (the game's render
+// thread can wait on a fence alvrxr hasn't signalled yet). Without them wineopenxr copies.
+static bool share_images_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("ALVRXR_SHARE_IMAGES");
+        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr/tune.json"];
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        id t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        wanted = env ? atoi(env) != 0 : [t isKindOfClass:NSDictionary.class] && [t[@"share_images"] boolValue];
+        if (wanted) axr_log("shared images offered");
+    }
+    return wanted;
+}
+
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn) {
     if (!name || !fn) return XR_ERROR_VALIDATION_FAILURE;
     *fn = NULL;
@@ -1760,6 +1776,7 @@ static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xr
         strcmp(name, "xrEnumerateApiLayerProperties"))
         return XR_ERROR_HANDLE_INVALID;
     if (!strcmp(name, "xrGetInstanceProcAddr")) { *fn = (PFN_xrVoidFunction)xrGetInstanceProcAddr_; return XR_SUCCESS; }
+    if (!strncmp(name, "xrSetSwapchainImage", 19) && !share_images_wanted()) return XR_ERROR_FUNCTION_UNSUPPORTED;
 #define LOOKUP(f) if (!strcmp(name, #f)) { *fn = (PFN_xrVoidFunction)f##_; return XR_SUCCESS; }
     FUNCTIONS(LOOKUP)
     return XR_ERROR_FUNCTION_UNSUPPORTED;
