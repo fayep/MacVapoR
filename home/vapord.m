@@ -1,12 +1,14 @@
-// vapord: MacVapoR's home scene. It holds the headset while no game does, drawing scene.metal
-// through the alvrxr runtime like any OpenXR app. When a game starts, its runtime posts a claim
+// vapord: MacVapoR's home scene. It holds the headset while no game does, drawing a scene (a
+// folder: see SCENES.md) through the alvrxr runtime like any OpenXR app. When a game starts, its runtime posts a claim
 // (see claim_headset in backend.m) and vapord exits at once, which frees the ALVR server it ran;
 // launchd starts it again, and it waits for the claiming game to end before taking the headset back.
 //
 // Usage: vapord [RUNTIME]   (default ~/Library/Application Support/MacVapoR/runtime/libalvrxr.dylib)
+//        vapord --preview SCENE_DIR OUT.png [YAW [PITCH]]   a scene as seen standing, turned YAW degrees
+//                                                             left and PITCH up (default 0, -8)
 
-#import <CoreText/CoreText.h>
 #import <Foundation/Foundation.h>
+#import <ImageIO/ImageIO.h>
 #import <Metal/Metal.h>
 #include <dlfcn.h>
 #include <simd/simd.h>
@@ -21,7 +23,8 @@
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
 
-#include "scene_metal.h"
+#include "objects_metal.h"
+#include "prelude_metal.h"
 
 static PFN_xrGetInstanceProcAddr gipa;
 static NSString *g_config_dir, *g_pid_path;
@@ -49,13 +52,13 @@ static pid_t pid_in(NSString *file) {
 
 // ------------------------------------------------------------------------------------- pictures
 
-// As scene.metal's Board: its float3 takes 16 bytes, and its bool the first byte of flip.
+// As prelude.metal's Picture: its float3 takes 16 bytes, and its bool the first byte of flip.
 typedef struct {
     float centre[3], pad0;
     float half_size[2];
     int texture;
     int flip;
-} board_gpu;
+} picture_gpu;
 
 static CGContextRef canvas(size_t w, size_t h) {
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -82,131 +85,209 @@ static id<MTLTexture> texture_from(CGContextRef c, id<MTLDevice> dev, id<MTLComm
     return t;
 }
 
-static CGColorRef rgb(double r, double g, double b, double a) {
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGFloat comps[4] = {r, g, b, a};
-    CGColorRef c = CGColorCreate(cs, comps);
-    CGColorSpaceRelease(cs);
-    return c;   // leaked: a handful, made once
+// A picture file, as a texture: premultiplied, as the scene's pictures are drawn over it.
+static id<MTLTexture> load_image(NSString *path, id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+    CGImageRef img = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
+    if (src) CFRelease(src);
+    if (!img) return nil;
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    if (w > 8192 || h > 8192) { CGImageRelease(img); return nil; }
+    CGContextRef c = canvas(w, h);
+    CGContextDrawImage(c, CGRectMake(0, 0, w, h), img);
+    CGImageRelease(img);
+    return texture_from(c, dev, q);
 }
 
-static CGGradientRef gradient(int n, const CGFloat *colors, const CGFloat *stops) {
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGGradientRef g = CGGradientCreateWithColorComponents(cs, colors, stops, n);
-    CGColorSpaceRelease(cs);
-    return g;
+static id<MTLTexture> colour_texture(simd_float3 srgb, id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    CGContextRef c = canvas(1, 1);
+    uint8_t *px = CGBitmapContextGetData(c);
+    for (int i = 0; i < 3; i++) px[i] = (uint8_t)lroundf(fminf(fmaxf(srgb[i], 0), 1) * 255);
+    px[3] = 255;
+    return texture_from(c, dev, q);
 }
 
-// A line of text, sheared into an 80s italic, centred on (x, y).
-static CTLineRef text_line(NSString *s, NSString *font_name, CGFloat size, CGFloat kern) {
-    CGAffineTransform shear = CGAffineTransformMake(1, 0, 0.22, 1, 0, 0);
-    CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)font_name, size, &shear);
-    NSAttributedString *a = [[NSAttributedString alloc]
-        initWithString:s attributes:@{(id)kCTFontAttributeName : (__bridge id)font, (id)kCTKernAttributeName : @(kern)}];
-    CFRelease(font);
-    return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)a);
+// ---------------------------------------------------------------------------------------- scenes
+//
+// A scene is a folder: scene.json, backdrop.metal and the pictures it names (see SCENES.md). The
+// one shown is named in MacVapoR's home.json, looked for among the user's scenes and then those
+// installed with the runtime, and is reloaded whenever any of them changes.
+
+// As objects.metal's Look.
+typedef struct {
+    simd_float4 light, tint, rim, ambient;
+} look_gpu;
+
+typedef struct {
+    NSString *dir, *name;
+    id<MTLRenderPipelineState> backdrop;
+    picture_gpu pictures[16];
+    int picture_count;
+    id<MTLTexture> images[8];
+    id<MTLTexture> ball, table;
+    look_gpu look;
+    simd_float4 bones, palm, tips;   // a bare hand's lines, linear
+    simd_float3 touched, pressed;    // a control's glow, linear
+} scene;
+
+static NSString *support_dir(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/MacVapoR"];
 }
 
-static CGPoint centred(CGContextRef c, CTLineRef line, CGFloat x, CGFloat y) {
-    CGRect b = CTLineGetImageBounds(line, c);
-    return CGPointMake(x - b.size.width / 2 - b.origin.x, y - b.size.height / 2 - b.origin.y);
+static float lin(float c) { return powf(c, 2.2f); }
+
+static simd_float3 lin3(simd_float3 c) { return simd_make_float3(lin(c.x), lin(c.y), lin(c.z)); }
+
+// A JSON array of three numbers, else the default.
+static simd_float3 vec3_or(id a, simd_float3 dflt) {
+    if (![a isKindOfClass:NSArray.class] || [a count] < 3) return dflt;
+    for (int i = 0; i < 3; i++)
+        if (![a[i] isKindOfClass:NSNumber.class]) return dflt;
+    return simd_make_float3([a[0] floatValue], [a[1] floatValue], [a[2] floatValue]);
 }
 
-// "MACVAPOR" in chrome, with a neon glow, and a smaller line under it.
-static CGContextRef draw_name(void) {
-    CGContextRef c = canvas(2048, 768);
-    CTLineRef title = text_line(@"MACVAPOR", @"Futura-CondensedExtraBold", 330, 10);
-    CGPoint at = centred(c, title, 1024, 470);
-    CGRect b = CTLineGetImageBounds(title, c);
-    b.origin.x += at.x;
-    b.origin.y += at.y;
+static float number_or(id n, float dflt) { return [n isKindOfClass:NSNumber.class] ? [n floatValue] : dflt; }
 
-    // Glow, then the chrome inside the letters, then a bright rim.
-    CGContextSetLineJoin(c, kCGLineJoinRound);
-    CGContextSetTextDrawingMode(c, kCGTextStroke);
-    CGContextSetShadowWithColor(c, CGSizeZero, 40, rgb(0.0, 0.9, 1.0, 1.0));
-    CGContextSetStrokeColorWithColor(c, rgb(0.0, 0.85, 1.0, 0.9));
-    CGContextSetLineWidth(c, 14);
-    CGContextSetTextPosition(c, at.x, at.y);
-    CTLineDraw(title, c);
-    CGContextSetShadowWithColor(c, CGSizeZero, 0, NULL);
+static NSDictionary *dict_or_empty(id d) { return [d isKindOfClass:NSDictionary.class] ? d : @{}; }
 
-    CGContextSaveGState(c);
-    CGContextSetTextDrawingMode(c, kCGTextClip);
-    CGContextSetTextPosition(c, at.x, at.y);
-    CTLineDraw(title, c);
-    // Chrome: a cyan floor, a sharp purple horizon, silver sky darkening to violet at the top.
-    const CGFloat colors[] = {
-        0.10, 0.75, 0.95, 1,   0.45, 0.95, 1.00, 1,   0.22, 0.05, 0.42, 1,   0.95, 0.96, 1.00, 1,
-        0.80, 0.84, 0.95, 1,   0.42, 0.28, 0.80, 1,
-    };
-    const CGFloat stops[] = {0.0, 0.30, 0.47, 0.50, 0.70, 1.0};
-    CGGradientRef g = gradient(6, colors, stops);
-    CGContextDrawLinearGradient(c, g, CGPointMake(0, b.origin.y), CGPointMake(0, b.origin.y + b.size.height), 0);
-    CGGradientRelease(g);
-    CGContextRestoreGState(c);
-
-    CGContextSetTextDrawingMode(c, kCGTextStroke);
-    CGContextSetStrokeColorWithColor(c, rgb(0.92, 0.95, 1.0, 1.0));
-    CGContextSetLineWidth(c, 3);
-    CGContextSetTextPosition(c, at.x, at.y);
-    CTLineDraw(title, c);
-    CFRelease(title);
-
-    CTLineRef sub = text_line(@"VISION PRO  ·  PC VR", @"AvenirNext-DemiBold", 92, 26);
-    CGPoint sat = centred(c, sub, 1024, 150);
-    CGContextSetTextDrawingMode(c, kCGTextFill);
-    CGContextSetShadowWithColor(c, CGSizeZero, 24, rgb(0.62, 0.30, 0.95, 1.0));
-    CGContextSetFillColorWithColor(c, rgb(0.0, 0.92, 1.0, 1.0));
-    CGContextSetTextPosition(c, sat.x, sat.y);
-    CTLineDraw(sub, c);
-    CFRelease(sub);
-    return c;
-}
-
-// A palm in silhouette against the sunset, edged in cyan.
-static CGContextRef draw_palm(void) {
-    CGContextRef c = canvas(512, 1024);
-    CGColorRef dark = rgb(0.06, 0.01, 0.12, 1.0), rim = rgb(0.0, 0.9, 1.0, 0.55);
-    CGPoint crown = CGPointMake(300, 800);
-
-    CGMutablePathRef trunk = CGPathCreateMutable();
-    CGPathMoveToPoint(trunk, NULL, 226, 0);
-    CGPathAddQuadCurveToPoint(trunk, NULL, 200, 470, crown.x - 10, crown.y);
-    CGPathAddLineToPoint(trunk, NULL, crown.x + 10, crown.y);
-    CGPathAddQuadCurveToPoint(trunk, NULL, 236, 470, 282, 0);
-    CGPathCloseSubpath(trunk);
-
-    CGMutablePathRef fronds = CGPathCreateMutable();
-    const CGFloat tips[][2] = {{40, 640}, {80, 820}, {190, 960}, {330, 990}, {470, 880}, {500, 700}, {420, 560},
-                               {150, 560}};
-    for (size_t i = 0; i < sizeof tips / sizeof tips[0]; i++) {
-        CGPoint tip = CGPointMake(tips[i][0], tips[i][1]);
-        // The leaf arches up out of the crown and droops to its tip.
-        CGPoint ctrl = CGPointMake((crown.x + tip.x) / 2, MAX(crown.y, tip.y) + 70);
-        CGFloat dx = tip.y - crown.y, dy = crown.x - tip.x, n = hypot(dx, dy);
-        dx = dx / n * 26;
-        dy = dy / n * 26;
-        CGPathMoveToPoint(fronds, NULL, crown.x, crown.y);
-        CGPathAddQuadCurveToPoint(fronds, NULL, ctrl.x + dx, ctrl.y + dy, tip.x, tip.y);
-        CGPathAddQuadCurveToPoint(fronds, NULL, ctrl.x - dx, ctrl.y - dy, crown.x, crown.y);
-        CGPathCloseSubpath(fronds);
+// When the scene was last changed: its folder's files, and the choice of it.
+static NSDate *scene_stamp(NSString *dir) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSDate *newest = [fm attributesOfItemAtPath:[support_dir() stringByAppendingPathComponent:@"home.json"] error:nil].fileModificationDate
+                         ?: NSDate.distantPast;
+    for (NSString *f in dir ? [fm contentsOfDirectoryAtPath:dir error:nil] : @[]) {
+        NSDate *d = [fm attributesOfItemAtPath:[dir stringByAppendingPathComponent:f] error:nil].fileModificationDate;
+        if (d && [d compare:newest] == NSOrderedDescending) newest = d;
     }
-    for (int pass = 0; pass < 2; pass++) {
-        CGContextAddPath(c, trunk);
-        CGContextAddPath(c, fronds);
-        if (pass == 0) {
-            CGContextSetStrokeColorWithColor(c, rim);
-            CGContextSetLineWidth(c, 6);
-            CGContextStrokePath(c);
-        } else {
-            CGContextSetFillColorWithColor(c, dark);
-            CGContextFillPath(c);
+    return newest;
+}
+
+// The chosen scene's folder: by name, the user's own before those installed, else Vaporwave.
+static NSString *chosen_scene_dir(void) {
+    NSData *json = [NSData dataWithContentsOfFile:[support_dir() stringByAppendingPathComponent:@"home.json"]];
+    NSDictionary *home = json ? dict_or_empty([NSJSONSerialization JSONObjectWithData:json options:0 error:nil]) : @{};
+    NSString *chosen = [home[@"scene"] isKindOfClass:NSString.class] ? home[@"scene"] : @"vaporwave";
+    NSArray *roots = @[[support_dir() stringByAppendingPathComponent:@"scenes"],
+                       [support_dir() stringByAppendingPathComponent:@"runtime/scenes"]];
+    for (NSString *name in @[chosen, @"vaporwave"]) {
+        if ([name containsString:@"/"] || [name hasPrefix:@"."]) continue;
+        for (NSString *root in roots) {
+            NSString *dir = [root stringByAppendingPathComponent:name];
+            if ([NSFileManager.defaultManager fileExistsAtPath:[dir stringByAppendingPathComponent:@"scene.json"]]) return dir;
         }
     }
-    CGPathRelease(trunk);
-    CGPathRelease(fronds);
-    return c;
+    return nil;
+}
+
+// What's left when no scene loads: a dark grey floor under a dark sky.
+static const char fallback_backdrop[] =
+    "float3 backdrop(float3 o, float3 d, constant Eye &eye, thread float &depth) {\n"
+    "    if (d.y >= -1e-4) return float3(0.02, 0.02, 0.03);\n"
+    "    depth = -o.y / d.y;\n"
+    "    float2 g = abs(fract((o + d * depth).xz + 0.5) - 0.5);\n"
+    "    return float3(0.04) + float3(0.10) * step(min(g.x, g.y), 0.01) * exp(-depth * 0.2);\n"
+    "}\n";
+
+// The scene in dir (nil: the fallback), into out; on failure out is left as it was and why says
+// what went wrong.
+static bool load_scene(NSString *dir, id<MTLDevice> dev, id<MTLCommandQueue> q, scene *out, NSString **why) {
+    scene sc = {.dir = dir, .name = @"(none)"};
+    NSDictionary *j = @{};
+    NSString *source = @(fallback_backdrop);
+    if (dir) {
+        NSError *err = nil;
+        NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"scene.json"]];
+        id parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&err] : nil;
+        if (![parsed isKindOfClass:NSDictionary.class]) {
+            *why = [NSString stringWithFormat:@"scene.json: %@", err.localizedDescription ?: @"not a JSON object"];
+            return false;
+        }
+        j = parsed;
+        NSString *file = [j[@"shader"] isKindOfClass:NSString.class] ? j[@"shader"] : @"backdrop.metal";
+        source = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:file.lastPathComponent]
+                                           encoding:NSUTF8StringEncoding error:&err];
+        if (!source) {
+            *why = [NSString stringWithFormat:@"%@: %@", file, err.localizedDescription];
+            return false;
+        }
+        sc.name = [j[@"name"] isKindOfClass:NSString.class] ? j[@"name"] : dir.lastPathComponent;
+    }
+
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[@(prelude_metal) stringByAppendingString:source] options:nil error:&err];
+    if (!lib) {
+        *why = [NSString stringWithFormat:@"backdrop shader: %@", err.localizedDescription];
+        return false;
+    }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    sc.backdrop = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!sc.backdrop) {
+        *why = [NSString stringWithFormat:@"backdrop pipeline: %@", err.localizedDescription];
+        return false;
+    }
+
+    // The pictures, each image loaded once.
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (id p in [j[@"pictures"] isKindOfClass:NSArray.class] ? j[@"pictures"] : @[]) {
+        NSDictionary *pic = dict_or_empty(p);
+        NSString *image = [pic[@"image"] isKindOfClass:NSString.class] ? [pic[@"image"] lastPathComponent] : nil;
+        if (!image || sc.picture_count == 16) continue;
+        NSUInteger k = [names indexOfObject:image];
+        if (k == NSNotFound) {
+            if (names.count == 8) { say(@"%@: only 8 images; %@ left out", sc.name, image); continue; }
+            id<MTLTexture> t = load_image([dir stringByAppendingPathComponent:image], dev, q);
+            if (!t) { say(@"%@: can't load %@", sc.name, image); continue; }
+            k = names.count;
+            [names addObject:image];
+            sc.images[k] = t;
+        }
+        simd_float3 c = vec3_or(pic[@"centre"], 0);
+        simd_float3 size = vec3_or([pic[@"size"] isKindOfClass:NSArray.class] && [pic[@"size"] count] == 2
+                                       ? [pic[@"size"] arrayByAddingObject:@0] : nil, simd_make_float3(1, 1, 0));
+        sc.pictures[sc.picture_count++] = (picture_gpu){{c.x, c.y, c.z}, 0, {size.x / 2, size.y / 2}, (int)k,
+                                                        [pic[@"flip"] boolValue]};
+    }
+    id<MTLTexture> blank = colour_texture(0, dev, q);
+    for (int i = (int)names.count; i < 8; i++) sc.images[i] = blank;
+
+    // The ball and table: a picture each, or a colour.
+    id<MTLTexture> (^surface)(id, simd_float3) = ^id<MTLTexture>(id v, simd_float3 dflt) {
+        id<MTLTexture> t = [v isKindOfClass:NSString.class] ? load_image([dir stringByAppendingPathComponent:[v lastPathComponent]], dev, q) : nil;
+        return t ?: colour_texture(vec3_or(v, dflt), dev, q);
+    };
+    sc.ball = surface(j[@"ball"], simd_make_float3(0.9f, 0.9f, 0.92f));
+    sc.table = surface(j[@"table"], simd_make_float3(0.3f, 0.3f, 0.32f));
+
+    NSDictionary *light = dict_or_empty(j[@"light"]), *rim = dict_or_empty(j[@"rim"]), *ambient = dict_or_empty(j[@"ambient"]);
+    NSDictionary *hands = dict_or_empty(j[@"hands"]), *controls = dict_or_empty(j[@"controls"]);
+    sc.look.light = simd_make_float4(simd_normalize(vec3_or(light[@"from"], simd_make_float3(0, 0.3f, -1))),
+                                     number_or(light[@"shade"], 0.35f));
+    sc.look.tint = simd_make_float4(lin3(vec3_or(light[@"colour"], 1)), 0);
+    sc.look.rim = simd_make_float4(lin3(vec3_or(rim[@"colour"], 1)) * number_or(rim[@"strength"], 0.3f), 0);
+    sc.look.ambient = simd_make_float4(lin3(vec3_or(ambient[@"colour"], 1)) * number_or(ambient[@"strength"], 0.0f), 0);
+    sc.bones = simd_make_float4(lin3(vec3_or(hands[@"bones"], simd_make_float3(0, 0.92f, 1))), 1);
+    sc.palm = simd_make_float4(lin3(vec3_or(hands[@"palm"], simd_make_float3(0.62f, 0.30f, 0.95f))), 1);
+    sc.tips = simd_make_float4(lin3(vec3_or(hands[@"tips"], simd_make_float3(0.86f, 0.89f, 0.96f))), 1);
+    sc.touched = lin3(vec3_or(controls[@"touched"], simd_make_float3(0, 0.60f, 0.65f)));
+    sc.pressed = lin3(vec3_or(controls[@"pressed"], simd_make_float3(0.70f, 0.42f, 0.88f)));
+    *out = sc;
+    return true;
+}
+
+// The chosen scene, or failing it the fallback.
+static void load_chosen_scene(id<MTLDevice> dev, id<MTLCommandQueue> q, scene *out) {
+    NSString *dir = chosen_scene_dir(), *why = nil;
+    if (load_scene(dir, dev, q, out, &why)) {
+        say(@"scene: %@ (%@)", out->name, dir ?: @"built in");
+        return;
+    }
+    say(@"scene %@: %@", dir, why);
+    if (!out->backdrop && !load_scene(nil, dev, q, out, &why)) { say(@"fallback scene: %@", why); exit(1); }
+    out->dir = dir;   // watched still, so a fix is picked up
 }
 
 // ---------------------------------------------------------------------------- hands, controllers
@@ -394,9 +475,9 @@ static bool load_controller(NSString *dir, bool left, id<MTLDevice> dev, id<MTLC
     return true;
 }
 
-// Where a part sits for these inputs, in the model's frame, and how it glows: cyan while touched,
-// violet while pressed.
-static simd_float4x4 part_pose(const part *p, const hand_input *in, simd_float4 *glow) {
+// Where a part sits for these inputs, in the model's frame, and how it glows: in the scene's
+// colours, one while touched, the other while pressed.
+static simd_float4x4 part_pose(const part *p, const hand_input *in, const scene *sc, simd_float4 *glow) {
     float value = 0;
     bool touched = false;
     switch (p->input) {
@@ -412,9 +493,8 @@ static simd_float4x4 part_pose(const part *p, const hand_input *in, simd_float4 
         touched = in->stick_touch || fabsf(in->stick[0]) > 0.05f || fabsf(in->stick[1]) > 0.05f;
         break;
     }
-    simd_float3 cyan = {0.0f, 0.55f, 0.65f}, violet = {0.45f, 0.15f, 0.75f};
-    simd_float3 g = touched ? cyan * 0.6f : simd_make_float3(0, 0, 0);
-    g = simd_mix(g, violet, simd_make_float3(1, 1, 1) * fminf(fmaxf((value - 0.5f) * 2, 0), 1));
+    simd_float3 g = touched ? sc->touched : simd_make_float3(0, 0, 0);
+    g = simd_mix(g, sc->pressed, simd_make_float3(1, 1, 1) * fminf(fmaxf((value - 0.5f) * 2, 0), 1));
     *glow = simd_make_float4(g, 0);
 
     switch (p->move) {
@@ -463,25 +543,22 @@ typedef struct {
     float a_radius[4];
     float b[4];
     float colour[4];
-} segment;   // as scene.metal's Segment
+} segment;   // as objects.metal's Segment
 
-static float lin(float c) { return powf(c, 2.2f); }
-
-// A hand in neon: a line along each bone, cyan, violet across the back of the hand, and a silver
-// dot on each fingertip.
-static void hand_lines(const XrHandJointLocationEXT *j, segment *out, int *n) {
+// A hand: a line along each bone, a different colour across the back of the hand, and a dot on
+// each fingertip, in the scene's colours.
+static void hand_lines(const XrHandJointLocationEXT *j, const scene *sc, segment *out, int *n) {
     static const int parent[26] = {-1, -1, 1, 2, 3, 4, 1, 6, 7, 8, 9, 1, 11, 12, 13, 14, 1, 16, 17, 18, 19, 1, 21, 22, 23, 24};
-    const float cyan[4] = {lin(0.0f), lin(0.92f), lin(1.0f), 1}, silver[4] = {lin(0.86f), lin(0.89f), lin(0.96f), 1},
-                violet[4] = {lin(0.62f), lin(0.30f), lin(0.95f), 1};
     for (int i = 2; i < 26; i++) {
         XrVector3f a = j[parent[i]].pose.position, b = j[i].pose.position;
         bool metacarpal = parent[i] == XR_HAND_JOINT_WRIST_EXT;
         segment s = {{a.x, a.y, a.z, 0.0035f}, {b.x, b.y, b.z, 0}, {0}};
-        memcpy(s.colour, metacarpal ? violet : cyan, sizeof s.colour);
+        simd_float4 c = metacarpal ? sc->palm : sc->bones;
+        memcpy(s.colour, &c, sizeof s.colour);
         out[(*n)++] = s;
         if (i == 5 || i == 10 || i == 15 || i == 20 || i == 25) {
             segment tip = {{b.x, b.y, b.z, 0.0055f}, {b.x, b.y, b.z, 0}, {0}};
-            memcpy(tip.colour, silver, sizeof tip.colour);
+            memcpy(tip.colour, &sc->tips, sizeof tip.colour);
             out[(*n)++] = tip;
         }
     }
@@ -545,34 +622,6 @@ static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) {
             [idx appendBytes:tri length:sizeof tri];
         }
     return mesh_from(verts, idx, dev);
-}
-
-// The beach ball: six panels, purple, cyan and silver, with white caps.
-static CGContextRef draw_ball(void) {
-    CGContextRef c = canvas(512, 256);
-    CGColorRef panels[3] = {rgb(0.55, 0.22, 0.90, 1), rgb(0.0, 0.85, 0.95, 1), rgb(0.88, 0.90, 0.96, 1)};
-    for (int i = 0; i < 6; i++) {
-        CGContextSetFillColorWithColor(c, panels[i % 3]);
-        CGContextFillRect(c, CGRectMake(i * 512.0 / 6, 0, 512.0 / 6 + 1, 256));
-    }
-    CGContextSetFillColorWithColor(c, rgb(0.97, 0.97, 1.0, 1));
-    CGContextFillRect(c, CGRectMake(0, 0, 512, 22));
-    CGContextFillRect(c, CGRectMake(0, 234, 512, 22));
-    return c;
-}
-
-// The table: dark purple, edged in neon.
-static CGContextRef draw_table(void) {
-    CGContextRef c = canvas(256, 256);
-    CGContextSetFillColorWithColor(c, rgb(0.10, 0.03, 0.20, 1));
-    CGContextFillRect(c, CGRectMake(0, 0, 256, 256));
-    CGContextSetStrokeColorWithColor(c, rgb(0.0, 0.92, 1.0, 1));
-    CGContextSetLineWidth(c, 14);
-    CGContextStrokeRect(c, CGRectMake(7, 7, 242, 242));
-    CGContextSetStrokeColorWithColor(c, rgb(0.62, 0.30, 0.95, 1));
-    CGContextSetLineWidth(c, 4);
-    CGContextStrokeRect(c, CGRectMake(24, 24, 208, 208));
-    return c;
 }
 
 typedef struct {
@@ -656,8 +705,171 @@ static void rotation_columns(XrQuaternionf q, eye_uniform *u) {
     memcpy(u->rot2, c2, sizeof c2);
 }
 
+// What every scene has drawn in it: the pipelines for meshes and hands, and the table and ball.
+typedef struct {
+    id<MTLRenderPipelineState> mesh_pso, line_pso;
+    id<MTLDepthStencilState> no_depth, depth_write, depth_test;
+    mesh ball, table_top, table_column;
+} world;
+
+typedef struct {
+    simd_float4x4 view, proj;
+} camera_gpu;   // as objects.metal's Camera
+
+static bool make_world(id<MTLDevice> dev, world *w) {
+    NSError *err = nil;
+    id<MTLLibrary> mlib = [dev newLibraryWithSource:@(objects_metal) options:nil error:&err];
+    if (!mlib) { say(@"objects shader: %@", err); return false; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    pd.vertexFunction = [mlib newFunctionWithName:@"mesh_vs"];
+    pd.fragmentFunction = [mlib newFunctionWithName:@"mesh_fs"];
+    w->mesh_pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!w->mesh_pso) { say(@"mesh pipeline: %@", err); return false; }
+    pd.vertexFunction = [mlib newFunctionWithName:@"line_vs"];
+    pd.fragmentFunction = [mlib newFunctionWithName:@"line_fs"];
+    pd.colorAttachments[0].blendingEnabled = YES;
+    pd.colorAttachments[0].sourceRGBBlendFactor = pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    pd.colorAttachments[0].destinationRGBBlendFactor = pd.colorAttachments[0].destinationAlphaBlendFactor =
+        MTLBlendFactorOneMinusSourceAlpha;
+    w->line_pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!w->line_pso) { say(@"hand pipeline: %@", err); return false; }
+    MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+    w->no_depth = [dev newDepthStencilStateWithDescriptor:dsd];
+    dsd.depthCompareFunction = MTLCompareFunctionLess;
+    dsd.depthWriteEnabled = YES;
+    w->depth_write = [dev newDepthStencilStateWithDescriptor:dsd];
+    dsd.depthWriteEnabled = NO;
+    w->depth_test = [dev newDepthStencilStateWithDescriptor:dsd];
+    w->ball = sphere_mesh(dev);
+    w->table_top = box_mesh(simd_make_float3(kTableHalf, kTableThick / 2, kTableHalf), dev);
+    w->table_column = box_mesh(simd_make_float3(kColumnHalf, (kTableTop - kTableThick) / 2, kColumnHalf), dev);
+    return true;
+}
+
+// One eye's backdrop, then the table and the ball on it; returns the eye's camera, for what's
+// drawn after.
+static camera_gpu draw_world(id<MTLRenderCommandEncoder> enc, const world *w, const scene *sc, XrPosef pose, XrFovf fov,
+                             float time, const ball_state *ball) {
+    eye_uniform u = {0};
+    rotation_columns(pose.orientation, &u);
+    u.pos[0] = pose.position.x;
+    u.pos[1] = pose.position.y;
+    u.pos[2] = pose.position.z;
+    u.tan[0] = tanf(fov.angleLeft);
+    u.tan[1] = tanf(fov.angleRight);
+    u.tan[2] = tanf(fov.angleUp);
+    u.tan[3] = tanf(fov.angleDown);
+    u.time[0] = time;
+    u.ball[0] = ball->p.x;
+    u.ball[1] = ball->p.y;
+    u.ball[2] = ball->p.z;
+    u.ball[3] = kBallRadius;
+
+    [enc setDepthStencilState:w->no_depth];
+    [enc setRenderPipelineState:sc->backdrop];
+    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    [enc setFragmentBytes:sc->pictures length:sizeof sc->pictures atIndex:1];
+    [enc setFragmentBytes:&sc->picture_count length:sizeof sc->picture_count atIndex:2];
+    [enc setFragmentTextures:sc->images withRange:NSMakeRange(0, 8)];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+    camera_gpu camera = {simd_inverse(pose_matrix(pose)), projection(fov, 0.05f, 200)};
+    // The table and the ball.
+    {
+        simd_float4 no_glow = 0;
+        struct { const mesh *m; simd_float4x4 model; id<MTLTexture> tex; } things[3];
+        things[0] = (typeof(things[0])){&w->table_top, translation(kTableCentre + simd_make_float3(0, kTableTop - kTableThick / 2, 0)), sc->table};
+        things[1] = (typeof(things[0])){&w->table_column, translation(kTableCentre + simd_make_float3(0, (kTableTop - kTableThick) / 2, 0)), sc->table};
+        simd_float4x4 bm = simd_mul(translation(ball->p), simd_mul(simd_matrix4x4(ball->q),
+                                                                   simd_diagonal_matrix(simd_make_float4(kBallRadius, kBallRadius, kBallRadius, 1))));
+        things[2] = (typeof(things[0])){&w->ball, bm, sc->ball};
+        [enc setRenderPipelineState:w->mesh_pso];
+        [enc setDepthStencilState:w->depth_write];
+        [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
+        [enc setFragmentBytes:&no_glow length:sizeof no_glow atIndex:0];
+        [enc setFragmentBytes:&sc->look length:sizeof sc->look atIndex:1];
+        for (int i = 0; i < 3; i++) {
+            [enc setVertexBuffer:things[i].m->vertices offset:0 atIndex:0];
+            [enc setVertexBytes:&things[i].model length:sizeof things[i].model atIndex:2];
+            [enc setFragmentTexture:things[i].tex atIndex:0];
+            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:things[i].m->index_count
+                             indexType:MTLIndexTypeUInt32 indexBuffer:things[i].m->indices indexBufferOffset:0];
+        }
+    }
+    return camera;
+}
+
+// vapord --preview: the scene in a folder as you'd see it standing by the table, into a PNG,
+// without a headset; for making scenes.
+static int preview(NSString *dir, NSString *png, float yaw, float pitch) {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    world w;
+    scene sc = {0};
+    NSString *why = nil;
+    if (!make_world(dev, &w)) return 1;
+    if (!load_scene(dir, dev, q, &sc, &why)) { say(@"%@", why); return 1; }
+    const int width = 1920, height = 1080;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                  width:width height:height mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> colour = [dev newTextureWithDescriptor:td];
+    td.pixelFormat = MTLPixelFormatDepth32Float;
+    td.storageMode = MTLStorageModePrivate;
+    id<MTLTexture> depth = [dev newTextureWithDescriptor:td];
+
+    // Standing at the origin, eyes 1.6 m up; 100 degrees across.
+    simd_quatf turn = simd_mul(simd_quaternion(yaw * (float)M_PI / 180, simd_make_float3(0, 1, 0)),
+                               simd_quaternion(pitch * (float)M_PI / 180, simd_make_float3(1, 0, 0)));
+    XrPosef pose = {{turn.vector.x, turn.vector.y, turn.vector.z, turn.vector.w}, {0, 1.6f, 0}};
+    float across = 50 * (float)M_PI / 180, up = atanf(tanf(across) * height / width);
+    XrFovf fov = {-across, across, up, -up};
+    ball_state ball;
+    ball_reset(&ball);
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = colour;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.depthAttachment.texture = depth;
+    rp.depthAttachment.loadAction = MTLLoadActionClear;
+    rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rp.depthAttachment.clearDepth = 1.0;
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+    draw_world(enc, &w, &sc, pose, fov, 10, &ball);
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    NSMutableData *px = [NSMutableData dataWithLength:(NSUInteger)width * height * 4];
+    [colour getBytes:px.mutableBytes bytesPerRow:width * 4 fromRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0];
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGDataProviderRef dp = CGDataProviderCreateWithCFData((__bridge CFDataRef)px);
+    CGImageRef img = CGImageCreate(width, height, 8, 32, width * 4, cs,
+                                   (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, dp, NULL, false,
+                                   kCGRenderingIntentDefault);
+    CGImageDestinationRef d = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:png], CFSTR("public.png"), 1, NULL);
+    bool ok = d != NULL;
+    if (d) {
+        CGImageDestinationAddImage(d, img, NULL);
+        ok = CGImageDestinationFinalize(d);
+        CFRelease(d);
+    }
+    CGImageRelease(img);
+    CGDataProviderRelease(dp);
+    CGColorSpaceRelease(cs);
+    if (!ok) { say(@"can't write %@", png); return 1; }
+    say(@"%@: %d pictures, into %@", sc.name, sc.picture_count, png);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
+        if (argc >= 4 && !strcmp(argv[1], "--preview")) return preview(@(argv[2]), @(argv[3]), argc > 4 ? atof(argv[4]) : 0, argc > 5 ? atof(argv[5]) : -8);
         g_config_dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
         g_pid_path = [g_config_dir stringByAppendingPathComponent:@"home.pid"];
 
@@ -859,11 +1071,6 @@ int main(int argc, char **argv) {
         controller controllers[2];
         bool have_model[2];
         for (int h = 0; h < 2; h++) have_model[h] = load_controller(models_dir, h == 0, dev, queue, &controllers[h]);
-        mesh ball_mesh = sphere_mesh(dev);
-        mesh table_top = box_mesh(simd_make_float3(kTableHalf, kTableThick / 2, kTableHalf), dev);
-        mesh table_column = box_mesh(simd_make_float3(kColumnHalf, (kTableTop - kTableThick) / 2, kColumnHalf), dev);
-        id<MTLTexture> tex_ball = texture_from(draw_ball(), dev, queue);
-        id<MTLTexture> tex_table = texture_from(draw_table(), dev, queue);
         ball_state ball;
         ball_reset(&ball);
         XrTime last_time = 0;
@@ -874,35 +1081,8 @@ int main(int argc, char **argv) {
         int pinch_n[2] = {0, 0};
         bool was_gripping[2] = {false, false};
 
-        NSError *err = nil;
-        id<MTLLibrary> mlib = [dev newLibraryWithSource:@(scene_metal) options:nil error:&err];
-        if (!mlib) { say(@"scene shader: %@", err); return 1; }
-        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-        pd.vertexFunction = [mlib newFunctionWithName:@"vs"];
-        pd.fragmentFunction = [mlib newFunctionWithName:@"fs"];
-        pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
-        pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-        id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!pso) { say(@"scene pipeline: %@", err); return 1; }
-        pd.vertexFunction = [mlib newFunctionWithName:@"mesh_vs"];
-        pd.fragmentFunction = [mlib newFunctionWithName:@"mesh_fs"];
-        id<MTLRenderPipelineState> mesh_pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!mesh_pso) { say(@"controller pipeline: %@", err); return 1; }
-        pd.vertexFunction = [mlib newFunctionWithName:@"line_vs"];
-        pd.fragmentFunction = [mlib newFunctionWithName:@"line_fs"];
-        pd.colorAttachments[0].blendingEnabled = YES;
-        pd.colorAttachments[0].sourceRGBBlendFactor = pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-        pd.colorAttachments[0].destinationRGBBlendFactor = pd.colorAttachments[0].destinationAlphaBlendFactor =
-            MTLBlendFactorOneMinusSourceAlpha;
-        id<MTLRenderPipelineState> line_pso = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!line_pso) { say(@"hand pipeline: %@", err); return 1; }
-        MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
-        id<MTLDepthStencilState> no_depth = [dev newDepthStencilStateWithDescriptor:dsd];
-        dsd.depthCompareFunction = MTLCompareFunctionLess;
-        dsd.depthWriteEnabled = YES;
-        id<MTLDepthStencilState> depth_write = [dev newDepthStencilStateWithDescriptor:dsd];
-        dsd.depthWriteEnabled = NO;
-        id<MTLDepthStencilState> depth_test = [dev newDepthStencilStateWithDescriptor:dsd];
+        world w;
+        if (!make_world(dev, &w)) return 1;
         id<MTLTexture> depth[2];
         for (int e = 0; e < 2; e++) {
             MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
@@ -913,18 +1093,10 @@ int main(int argc, char **argv) {
             dd.storageMode = MTLStorageModeMemoryless;
             depth[e] = [dev newTextureWithDescriptor:dd];
         }
-        id<MTLTexture> tex_name = texture_from(draw_name(), dev, queue);
-        id<MTLTexture> tex_palm = texture_from(draw_palm(), dev, queue);
-
-        // Furthest first: the name over the sea, then palms along the beach.
-        const struct { float x, h; bool flip; } palms[] = {
-            {-15, 8, true}, {-10.5, 6.5, false}, {-6.8, 8.8, true}, {6.8, 7.2, false}, {10.8, 9, true}, {15.5, 6.8, false},
-        };
-        board_gpu boards[16];
-        int nb = 0;
-        boards[nb++] = (board_gpu){{0, 6.6f, -18}, 0, {9.5f, 9.5f * 768 / 2048}, 0, 0};
-        for (size_t i = 0; i < sizeof palms / sizeof palms[0]; i++)
-            boards[nb++] = (board_gpu){{palms[i].x, palms[i].h / 2, -14.2f}, 0, {palms[i].h / 4, palms[i].h / 2}, 1, palms[i].flip};
+        scene sc = {0};
+        load_chosen_scene(dev, queue, &sc);
+        NSDate *scene_changed = scene_stamp(sc.dir);
+        CFAbsoluteTime scene_checked = CFAbsoluteTimeGetCurrent();
 
         say(@"home scene up");
         bool running = false;
@@ -953,6 +1125,17 @@ int main(int argc, char **argv) {
                 if (!running) {
                     usleep(20000);
                     continue;
+                }
+
+                // A new scene chosen, or the scene's files changed: in with it.
+                if (CFAbsoluteTimeGetCurrent() - scene_checked > 1) {
+                    scene_checked = CFAbsoluteTimeGetCurrent();
+                    NSString *dir = chosen_scene_dir();
+                    NSDate *stamp = scene_stamp(dir);
+                    if (!(dir == sc.dir || [dir isEqualToString:sc.dir]) || [stamp compare:scene_changed] == NSOrderedDescending) {
+                        scene_changed = stamp;
+                        load_chosen_scene(dev, queue, &sc);
+                    }
                 }
 
                 XrFrameState fs = {XR_TYPE_FRAME_STATE};
@@ -1067,7 +1250,7 @@ int main(int argc, char **argv) {
                     XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT, NULL, XR_FALSE, XR_HAND_JOINT_COUNT_EXT, joints};
                     XrHandJointsLocateInfoEXT hli = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, NULL, stage, fs.predictedDisplayTime};
                     if (XR_SUCCEEDED(xrLocateHandJointsEXT(trackers[h], &hli, &jl)) && jl.isActive) {
-                        hand_lines(joints, lines, &nlines);
+                        hand_lines(joints, &sc, lines, &nlines);
                         // The ball, bare-handed: pinch it.
                         XrVector3f th = joints[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position, ix = joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
                         simd_float3 t3 = simd_make_float3(th.x, th.y, th.z), i3 = simd_make_float3(ix.x, ix.y, ix.z);
@@ -1115,21 +1298,6 @@ int main(int argc, char **argv) {
                     XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, NULL, XR_INFINITE_DURATION};
                     XR(xrWaitSwapchainImage(chains[e], &wi));
 
-                    eye_uniform u = {0};
-                    rotation_columns(views[e].pose.orientation, &u);
-                    u.pos[0] = views[e].pose.position.x;
-                    u.pos[1] = views[e].pose.position.y;
-                    u.pos[2] = views[e].pose.position.z;
-                    u.tan[0] = tanf(views[e].fov.angleLeft);
-                    u.tan[1] = tanf(views[e].fov.angleRight);
-                    u.tan[2] = tanf(views[e].fov.angleUp);
-                    u.tan[3] = tanf(views[e].fov.angleDown);
-                    u.time[0] = (float)(CFAbsoluteTimeGetCurrent() - start);
-                    u.ball[0] = ball.p.x;
-                    u.ball[1] = ball.p.y;
-                    u.ball[2] = ball.p.z;
-                    u.ball[3] = kBallRadius;
-
                     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
                     rp.colorAttachments[0].texture = images[e][idx];
                     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -1139,48 +1307,19 @@ int main(int argc, char **argv) {
                     rp.depthAttachment.storeAction = MTLStoreActionDontCare;
                     rp.depthAttachment.clearDepth = 1.0;
                     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
-                    [enc setDepthStencilState:no_depth];
-                    [enc setRenderPipelineState:pso];
-                    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
-                    [enc setFragmentBytes:boards length:sizeof(board_gpu) * nb atIndex:1];
-                    [enc setFragmentBytes:&nb length:sizeof nb atIndex:2];
-                    [enc setFragmentTexture:tex_name atIndex:0];
-                    [enc setFragmentTexture:tex_palm atIndex:1];
-                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-
-                    struct { simd_float4x4 view, proj; } camera = {simd_inverse(pose_matrix(views[e].pose)),
-                                                                   projection(views[e].fov, 0.05f, 200)};
-                    // The table and the ball.
-                    {
-                        simd_float4 no_glow = 0;
-                        struct { mesh *m; simd_float4x4 model; id<MTLTexture> tex; } things[3];
-                        things[0] = (typeof(things[0])){&table_top, translation(kTableCentre + simd_make_float3(0, kTableTop - kTableThick / 2, 0)), tex_table};
-                        things[1] = (typeof(things[0])){&table_column, translation(kTableCentre + simd_make_float3(0, (kTableTop - kTableThick) / 2, 0)), tex_table};
-                        simd_float4x4 bm = simd_mul(translation(ball.p), simd_mul(simd_matrix4x4(ball.q),
-                                                                                  simd_diagonal_matrix(simd_make_float4(kBallRadius, kBallRadius, kBallRadius, 1))));
-                        things[2] = (typeof(things[0])){&ball_mesh, bm, tex_ball};
-                        [enc setRenderPipelineState:mesh_pso];
-                        [enc setDepthStencilState:depth_write];
-                        [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
-                        [enc setFragmentBytes:&no_glow length:sizeof no_glow atIndex:0];
-                        for (int i = 0; i < 3; i++) {
-                            [enc setVertexBuffer:things[i].m->vertices offset:0 atIndex:0];
-                            [enc setVertexBytes:&things[i].model length:sizeof things[i].model atIndex:2];
-                            [enc setFragmentTexture:things[i].tex atIndex:0];
-                            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:things[i].m->index_count
-                                             indexType:MTLIndexTypeUInt32 indexBuffer:things[i].m->indices indexBufferOffset:0];
-                        }
-                    }
+                    camera_gpu camera = draw_world(enc, &w, &sc, views[e].pose, views[e].fov,
+                                                   (float)(CFAbsoluteTimeGetCurrent() - start), &ball);
                     for (int h = 0; h < 2; h++) {
                         if (!show_controller[h]) continue;
-                        [enc setRenderPipelineState:mesh_pso];
-                        [enc setDepthStencilState:depth_write];
+                        [enc setRenderPipelineState:w.mesh_pso];
+                        [enc setDepthStencilState:w.depth_write];
                         [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
                         [enc setFragmentTexture:controllers[h].texture atIndex:0];
+                        [enc setFragmentBytes:&sc.look length:sizeof sc.look atIndex:1];
                         for (int i = 0; i < controllers[h].count; i++) {
                             const part *p = &controllers[h].parts[i];
                             simd_float4 glow;
-                            simd_float4x4 m = simd_mul(controller_model[h], part_pose(p, &input[h], &glow));
+                            simd_float4x4 m = simd_mul(controller_model[h], part_pose(p, &input[h], &sc, &glow));
                             [enc setVertexBuffer:p->m.vertices offset:0 atIndex:0];
                             [enc setVertexBytes:&m length:sizeof m atIndex:2];
                             [enc setFragmentBytes:&glow length:sizeof glow atIndex:0];
@@ -1189,8 +1328,8 @@ int main(int argc, char **argv) {
                         }
                     }
                     if (nlines) {
-                        [enc setRenderPipelineState:line_pso];
-                        [enc setDepthStencilState:depth_test];
+                        [enc setRenderPipelineState:w.line_pso];
+                        [enc setDepthStencilState:w.depth_test];
                         [enc setVertexBytes:lines length:sizeof(segment) * nlines atIndex:0];
                         [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
                         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:nlines];

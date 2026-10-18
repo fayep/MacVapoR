@@ -25,13 +25,29 @@ clang -dynamiclib -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall -Wno-u
     -framework Foundation -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework ImageIO -framework CoreGraphics -framework CoreAudio \
     -L "$out" -lalvr_server_core -Wl,-rpath,@loader_path \
     -install_name @rpath/libalvrxr.dylib -o "$out/libalvrxr.dylib"
-# The home scene (home/vapord.m), which MacVapoR keeps running while no game holds the headset.
-{ printf 'static const char scene_metal[] =\n'; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/\\n"/' "$here/home/scene.metal"; printf ';\n'; } \
-    > "$here/build/scene_metal.h"
+# The home scene (home/vapord.m), which MacVapoR keeps running while no game holds the headset,
+# and the scenes it can show (home/scenes), each a folder: their pictures are drawn here.
+embed() { { printf 'static const char %s[] =\n' "$1"; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/\\n"/' "$2"; printf ';\n'; } > "$here/build/$1.h"; }
+embed prelude_metal "$here/home/prelude.metal"
+embed objects_metal "$here/home/objects.metal"
 clang -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall \
     -I "$here/build" -I "$OPENXR/build/include" -I "$OPENXR/include" \
-    "$here/home/vapord.m" -framework Foundation -framework Metal -framework CoreText -framework CoreGraphics \
+    "$here/home/vapord.m" -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO \
     -o "$out/vapord"
+rm -rf "$out/scenes"
+mkdir -p "$out/scenes"
+cp "$here/home/SCENES.md" "$here/home/prelude.metal" "$out/scenes/"
+for dir in "$here"/home/scenes/*/; do
+    name=$(basename "$dir")
+    mkdir -p "$out/scenes/$name"
+    cp "$dir"scene.json "$dir"*.metal "$out/scenes/$name/"
+    find "$dir" -maxdepth 1 -name '*.png' -exec cp {} "$out/scenes/$name/" \;
+    if [ -f "$dir/pictures.m" ]; then
+        clang -fobjc-arc -O2 -Wall "$dir/pictures.m" -framework Foundation -framework CoreGraphics -framework CoreText \
+            -framework ImageIO -framework UniformTypeIdentifiers -o "$here/build/pictures-$name"
+        "$here/build/pictures-$name" "$out/scenes/$name"
+    fi
+done
 cat > "$out/alvrxr.json" <<JSON
 {
     "file_format_version": "1.0.0",

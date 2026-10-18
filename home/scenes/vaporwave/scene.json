@@ -1,0 +1,153 @@
+{
+  "name": "Vaporwave",
+  "about": "A neon grid down to a silver beach, palms, and a striped sun setting into the sea. Purple, cyan and silver.",
+  "pictures": [
+    {
+      "image": "name.png",
+      "centre": [
+        0,
+        6.6,
+        -18
+      ],
+      "size": [
+        19,
+        7.125
+      ]
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        -15,
+        4.0,
+        -14.2
+      ],
+      "size": [
+        4.0,
+        8
+      ],
+      "flip": true
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        -10.5,
+        3.25,
+        -14.2
+      ],
+      "size": [
+        3.25,
+        6.5
+      ]
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        -6.8,
+        4.4,
+        -14.2
+      ],
+      "size": [
+        4.4,
+        8.8
+      ],
+      "flip": true
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        6.8,
+        3.6,
+        -14.2
+      ],
+      "size": [
+        3.6,
+        7.2
+      ]
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        10.8,
+        4.5,
+        -14.2
+      ],
+      "size": [
+        4.5,
+        9
+      ],
+      "flip": true
+    },
+    {
+      "image": "palm.png",
+      "centre": [
+        15.5,
+        3.4,
+        -14.2
+      ],
+      "size": [
+        3.4,
+        6.8
+      ]
+    }
+  ],
+  "ball": "ball.png",
+  "table": "table.png",
+  "light": {
+    "from": [
+      0,
+      0.3,
+      -1
+    ],
+    "colour": [
+      0.93,
+      0.93,
+      1.0
+    ],
+    "shade": 0.35
+  },
+  "rim": {
+    "colour": [
+      0,
+      0.92,
+      1
+    ],
+    "strength": 0.8
+  },
+  "ambient": {
+    "colour": [
+      0.62,
+      0.3,
+      0.95
+    ],
+    "strength": 0.05
+  },
+  "hands": {
+    "bones": [
+      0,
+      0.92,
+      1
+    ],
+    "palm": [
+      0.62,
+      0.3,
+      0.95
+    ],
+    "tips": [
+      0.86,
+      0.89,
+      0.96
+    ]
+  },
+  "controls": {
+    "touched": [
+      0,
+      0.6,
+      0.65
+    ],
+    "pressed": [
+      0.7,
+      0.42,
+      0.88
+    ]
+  }
+}

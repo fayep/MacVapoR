@@ -1,0 +1,72 @@
+{
+  "name": "Studio",
+  "about": "A quiet grey studio floor under a pale sky.",
+  "ball": [
+    0.95,
+    0.52,
+    0.22
+  ],
+  "table": [
+    0.36,
+    0.37,
+    0.4
+  ],
+  "light": {
+    "from": [
+      0.3,
+      1,
+      0.4
+    ],
+    "colour": [
+      1,
+      0.98,
+      0.95
+    ],
+    "shade": 0.45
+  },
+  "rim": {
+    "colour": [
+      1,
+      1,
+      1
+    ],
+    "strength": 0.2
+  },
+  "ambient": {
+    "colour": [
+      0.55,
+      0.6,
+      0.7
+    ],
+    "strength": 0.03
+  },
+  "hands": {
+    "bones": [
+      0.25,
+      0.55,
+      1.0
+    ],
+    "palm": [
+      0.45,
+      0.4,
+      0.95
+    ],
+    "tips": [
+      1,
+      1,
+      1
+    ]
+  },
+  "controls": {
+    "touched": [
+      0.3,
+      0.55,
+      0.95
+    ],
+    "pressed": [
+      1.0,
+      0.58,
+      0.25
+    ]
+  }
+}

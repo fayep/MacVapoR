@@ -1,48 +1,12 @@
-// MacVapoR's home scene, drawn per pixel from each eye's ray: a purple sky over a striped sun
-// setting into the sea, a neon grid running down to a silver beach lined with palms, and the
-// name in chrome lettering. Purple, cyan and silver. Only the sea moves: a moving floor makes
-// people queasy.
-
-#include <metal_stdlib>
-using namespace metal;
-
-struct Eye {
-    float4 rot0, rot1, rot2;   // the eye's orientation, as the columns of a rotation
-    float4 pos;                // the eye's position, metres, floor at y = 0
-    float4 tan;                // tangents of the left, right, up and down field of view angles
-    float4 time;               // seconds
-    float4 ball;               // the ball's centre and radius, for its shadow
-};
-
-struct Board {                 // an upright picture facing +z: centre and half size, metres
-    float3 centre;
-    float2 half_size;
-    int texture;               // 0 the name, 1 a palm
-    bool flip;
-};
-
-struct VOut {
-    float4 position [[position]];
-    float2 uv;
-};
-
-vertex VOut vs(uint id [[vertex_id]]) {
-    float2 p = float2((id << 1) & 2, id & 2);
-    VOut o;
-    o.position = float4(p * 2 - 1, 0, 1);
-    o.uv = float2(p.x, 1 - p.y);
-    return o;
-}
-
-static float3 lin(float3 srgb) { return pow(srgb, 2.2); }
+// Vaporwave: a purple sky over a striped sun setting into the sea, a neon grid running down to a
+// silver beach lined with palms (pictures), and the name in chrome lettering. Purple, cyan and
+// silver. Only the sea moves: a moving floor makes people queasy.
 
 constant float3 kDeep = float3(0.05, 0.01, 0.12);
 constant float3 kPurple = float3(0.40, 0.12, 0.72);
 constant float3 kViolet = float3(0.62, 0.30, 0.95);
 constant float3 kCyan = float3(0.00, 0.92, 1.00);
 constant float3 kSilver = float3(0.84, 0.87, 0.94);
-
-static float hash(float2 p) { return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
 
 // The sun: low over the sea, ahead.
 constant float kSunElevation = 0.16;   // radians
@@ -116,128 +80,7 @@ static float3 ground(float3 o, float3 d, float t, float4 ball, thread float &dis
     return mix(horizon, c, exp(-dist * 0.018));   // haze to the horizon
 }
 
-fragment float4 fs(VOut in [[stage_in]], constant Eye &eye [[buffer(0)]], constant Board *boards [[buffer(1)]],
-                   constant int &board_count [[buffer(2)]], texture2d<float> name [[texture(0)]],
-                   texture2d<float> palm [[texture(1)]]) {
-    constexpr sampler smp(filter::linear, mip_filter::linear, address::clamp_to_edge);
-    float t = eye.time.x;
-    float3 v = normalize(float3(mix(eye.tan.x, eye.tan.y, in.uv.x), mix(eye.tan.z, eye.tan.w, in.uv.y), -1.0));
-    float3 d = normalize(float3x3(eye.rot0.xyz, eye.rot1.xyz, eye.rot2.xyz) * v);
-    float3 o = eye.pos.xyz;
-
-    float depth = INFINITY;
-    float3 c;
-    if (d.y < -1e-4) c = ground(o, d, t, eye.ball, depth);
-    else c = sky(d, t);
-
-    // The pictures, furthest first, each over what's behind it.
-    for (int i = 0; i < board_count; i++) {
-        Board b = boards[i];
-        if (d.z >= -1e-4) continue;
-        float k = (b.centre.z - o.z) / d.z;
-        if (k <= 0 || k > depth) continue;
-        float3 p = o + d * k;
-        float2 q = (p.xy - b.centre.xy) / b.half_size;
-        if (any(abs(q) > 1.0)) continue;
-        float2 uv = float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5);
-        if (b.flip) uv.x = 1.0 - uv.x;
-        float4 s = b.texture == 0 ? name.sample(smp, uv) : palm.sample(smp, uv);
-        s *= smoothstep(1.0, 0.96, max(abs(q.x), abs(q.y)));   // no seam where the picture ends
-        c = c * (1.0 - s.a) + s.rgb;
-    }
-    return float4(c, 1.0);
-}
-
-// ------------------------------------------------------------------------------ hands, controllers
-
-struct Camera {
-    float4x4 view, proj;
-};
-
-// A controller: Sony's model where it's been converted, lit by the sun ahead, with a cyan rim, and
-// its buttons, sticks and triggers lit (glow) as they're touched and pressed.
-struct MeshVertex {
-    packed_float3 pos;
-    packed_float3 normal;
-    float2 uv;
-};
-
-struct MeshOut {
-    float4 position [[position]];
-    float3 normal;
-    float3 to_eye;
-    float2 uv;
-};
-
-vertex MeshOut mesh_vs(uint id [[vertex_id]], const device MeshVertex *v [[buffer(0)]], constant Camera &cam [[buffer(1)]],
-                       constant float4x4 &model [[buffer(2)]]) {
-    MeshVertex m = v[id];
-    float4 world = model * float4(float3(m.pos), 1);
-    MeshOut o;
-    o.position = cam.proj * cam.view * world;
-    o.normal = normalize((model * float4(float3(m.normal), 0)).xyz);
-    float4 eye = cam.view * world;   // the eye looks down -z in view space
-    o.to_eye = normalize(-(transpose(float3x3(cam.view[0].xyz, cam.view[1].xyz, cam.view[2].xyz)) * eye.xyz));
-    o.uv = m.uv;
-    return o;
-}
-
-fragment float4 mesh_fs(MeshOut in [[stage_in]], texture2d<float> tex [[texture(0)]], constant float4 &glow [[buffer(0)]]) {
-    constexpr sampler smp(filter::linear, mip_filter::linear, address::repeat);
-    float3 n = normalize(in.normal);
-    float3 sun = normalize(float3(0, 0.3, -1));
-    float3 base = tex.sample(smp, in.uv).rgb;
-    float lit = 0.35 + 0.65 * max(dot(n, sun), 0.0);
-    float rim = pow(1.0 - max(dot(n, normalize(in.to_eye)), 0.0), 3.0);
-    return float4(base * lit * float3(0.85, 0.85, 1.0) + lin(kCyan) * rim * 0.8 + lin(kViolet) * 0.05 + glow.rgb, 1);
-}
-
-// A hand in neon: a glowing line along each bone, and a dot on each fingertip (a line from the
-// tip to itself). Each is a quad around the line, facing the eye, with room for the glow.
-struct Segment {
-    float4 a_radius;
-    float4 b;
-    float4 colour;
-};
-
-struct SegmentOut {
-    float4 position [[position]];
-    float2 q;        // along and across the line, in radii from its start
-    float length_;   // its length, in radii
-    float4 colour;
-};
-
-constant float kGlow = 2.6;   // how far the glow reaches, in radii
-
-vertex SegmentOut line_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Segment *segs [[buffer(0)]],
-                          constant Camera &cam [[buffer(1)]]) {
-    Segment s = segs[iid];
-    float r = s.a_radius.w;
-    float4 a = cam.view * float4(s.a_radius.xyz, 1), b = cam.view * float4(s.b.xyz, 1);
-    // Aimed along the line as it appears, which perspective turns from its run across the view:
-    // a finger pointing away runs mostly in depth.
-    float2 d = b.xy / max(-b.z, 1e-3) - a.xy / max(-a.z, 1e-3);
-    float len = length(b.xyz - a.xyz);
-    float2 along = length(d) > 1e-6 ? normalize(d) : float2(1, 0), across = float2(-along.y, along.x);
-    bool end = vid >= 2;
-    float side = (vid & 1) ? 1 : -1;
-    float4 v = end ? b : a;
-    v.xy += along * (end ? 1 : -1) * r * kGlow + across * side * r * kGlow;
-    SegmentOut o;
-    o.position = cam.proj * v;
-    o.q = float2(end ? len / r + kGlow : -kGlow, side * kGlow);
-    o.length_ = len / r;
-    o.colour = s.colour;
-    return o;
-}
-
-fragment float4 line_fs(SegmentOut in [[stage_in]]) {
-    float dx = max(max(-in.q.x, in.q.x - in.length_), 0.0);
-    float r = length(float2(dx, in.q.y));
-    float core = smoothstep(1.0, 0.6, r);
-    float glow = exp(-max(r - 0.6, 0.0) * 1.6) * 0.6 * smoothstep(kGlow, kGlow * 0.6, r);
-    float a = clamp(core + glow * (1 - core), 0.0, 1.0);
-    if (a < 0.01) discard_fragment();
-    float3 c = mix(in.colour.rgb, float3(1.0), core * 0.45);
-    return float4(c * a, a);
+float3 backdrop(float3 o, float3 d, constant Eye &eye, thread float &depth) {
+    if (d.y < -1e-4) return ground(o, d, eye.time.x, eye.ball, depth);
+    return sky(d, eye.time.x);
 }

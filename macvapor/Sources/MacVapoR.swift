@@ -20,6 +20,12 @@ enum Paths {
     static let runner = home.appending(path: "Library/Application Support/notproton/runners/current")
     static let steam = home.appending(path: "Library/Application Support/Steam")
     static let log = home.appending(path: "Library/Logs/alvrxr.log")
+    static let builtInScenes = runtime.appending(path: "scenes")
+    static let userScenes = support.appending(path: "scenes")
+    static let homeChoice = support.appending(path: "home.json")
+    static let homeAgentLabel = "com.zippysoft.macvapor.home"
+    static let homeAgent = home.appending(path: "Library/LaunchAgents/\(homeAgentLabel).plist")
+    static let homeLog = home.appending(path: "Library/Logs/vapord.log")
 
     // Code is in Contents/Library, data in Contents/Resources.
     static let bundledCode = Bundle.main.bundleURL.appending(path: "Contents/Library/MacVapoR")
@@ -31,6 +37,14 @@ struct Headset: Identifiable {
     let id: String
     let name: String
     var trusted: Bool
+}
+
+/// A home scene: a folder with a scene.json (see home/SCENES.md).
+struct HomeScene: Identifiable {
+    let id: String
+    let name: String
+    let about: String
+    let userMade: Bool
 }
 
 struct Game: Identifiable {
@@ -59,6 +73,9 @@ final class Model: ObservableObject {
     /// Whether MacVapoR Audio may record games' audio: nil while checking.
     @Published var audioAllowed: Bool?
     @Published var audioChecking = false
+    @Published var scenes: [HomeScene] = []
+    @Published var chosenScene = "vaporwave"
+    @Published var homeEnabled = false
 
     let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     var hasRunner: Bool { FileManager.default.fileExists(atPath: Paths.runner.path) }
@@ -67,6 +84,13 @@ final class Model: ObservableObject {
     init() {
         refresh()
         checkAudioPermission()
+        // A check that failed is checked again when MacVapoR comes forward: the permission may
+        // have been given meanwhile, or the check may have missed it.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                if self.audioAllowed == false && !self.audioChecking { self.checkAudioPermission() }
+            }
+        }
     }
 
     // MARK: game audio
@@ -96,6 +120,7 @@ final class Model: ObservableObject {
         installedVersion = try? String(contentsOf: Paths.version, encoding: .utf8)
         loadHeadsets()
         games = GameScanner.scan()
+        loadScenes()
     }
 
     // MARK: runtime
@@ -103,10 +128,15 @@ final class Model: ObservableObject {
     func installRuntime() {
         do {
             let fm = FileManager.default
+            // The home scene runs from the runtime folder: stopped while that's replaced.
+            let firstInstall = installedVersion == nil
+            let homeWasOn = FileManager.default.fileExists(atPath: Paths.homeAgent.path)
+            Self.launchctl(["bootout", "gui/\(getuid())/\(Paths.homeAgentLabel)"])
             try? fm.removeItem(at: Paths.runtime)
             try? fm.removeItem(at: Paths.wineopenxr)
             try fm.createDirectory(at: Paths.support, withIntermediateDirectories: true)
             try fm.copyItem(at: Paths.bundledCode.appending(path: "runtime"), to: Paths.runtime)
+            try fm.copyItem(at: Paths.bundledData.appending(path: "scenes"), to: Paths.builtInScenes)
             // wineopenxr's layout, as the setup script and Wine expect it: the PE half is data,
             // the unix half is code.
             try fm.createDirectory(at: Paths.wineopenxr, withIntermediateDirectories: true)
@@ -129,6 +159,7 @@ final class Model: ObservableObject {
             try bundleVersion.write(to: Paths.version, atomically: true, encoding: .utf8)
             Self.clearQuarantine(Paths.support)
             output = "Runtime \(bundleVersion) installed."
+            if firstInstall || homeWasOn { try setHomeEnabled(true) }
             checkAudioPermission()
         } catch {
             output = "Install failed: \(error.localizedDescription)"
@@ -168,6 +199,76 @@ final class Model: ObservableObject {
 
             """
         try manifest.write(to: Paths.activeRuntime, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: home scene
+
+    func loadScenes() {
+        let fm = FileManager.default
+        var found: [String: HomeScene] = [:]
+        // The user's own last, so one with a built-in scene's folder name takes its place.
+        for (root, userMade) in [(Paths.builtInScenes, false), (Paths.userScenes, true)] {
+            for dir in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] {
+                guard let data = try? Data(contentsOf: root.appending(path: "\(dir)/scene.json")),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                found[dir] = HomeScene(id: dir, name: json["name"] as? String ?? dir, about: json["about"] as? String ?? "",
+                                       userMade: userMade)
+            }
+        }
+        scenes = found.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let choice = (try? Data(contentsOf: Paths.homeChoice))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            .flatMap { $0["scene"] as? String }
+        chosenScene = choice ?? "vaporwave"
+        homeEnabled = fm.fileExists(atPath: Paths.homeAgent.path)
+    }
+
+    /// The home scene notices the change itself, within a second.
+    func chooseScene(_ id: String) {
+        try? JSONSerialization.data(withJSONObject: ["scene": id], options: .prettyPrinted).write(to: Paths.homeChoice, options: .atomic)
+        loadScenes()
+    }
+
+    /// The home scene runs under launchd: started at login, and again each time it exits, which it
+    /// does whenever a game takes the headset.
+    func setHomeEnabled(_ on: Bool) throws {
+        let fm = FileManager.default
+        let target = "gui/\(getuid())"
+        Self.launchctl(["bootout", "\(target)/\(Paths.homeAgentLabel)"])
+        if on {
+            let plist: [String: Any] = [
+                "Label": Paths.homeAgentLabel,
+                "ProgramArguments": [Paths.runtime.appending(path: "vapord").path],
+                "RunAtLoad": true,
+                "KeepAlive": true,
+                "ThrottleInterval": 2,
+                "ProcessType": "Interactive",
+                "StandardErrorPath": Paths.homeLog.path,
+            ]
+            try fm.createDirectory(at: Paths.homeAgent.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: Paths.homeAgent)
+            Self.launchctl(["bootstrap", target, Paths.homeAgent.path])
+        } else {
+            try? fm.removeItem(at: Paths.homeAgent)
+        }
+        loadScenes()
+    }
+
+    func openScenesFolder() {
+        try? FileManager.default.createDirectory(at: Paths.userScenes, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(Paths.userScenes)
+    }
+
+    @discardableResult
+    static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
     }
 
     // MARK: headsets
@@ -439,6 +540,7 @@ struct ContentView: View {
                 runtimeSection
                 headsetSection
                 gamesSection
+                homeSection
                 if !model.output.isEmpty {
                     Text(model.output)
                         .font(.system(.caption, design: .monospaced))
@@ -500,6 +602,41 @@ struct ContentView: View {
                 }
                 Button("Check Again") { model.checkAudioPermission() }
             }
+        }
+    }
+
+    private var homeSection: some View {
+        GroupBox("Home Scene") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Shown in the headset while no game is running: your hands or controllers, and a ball to throw.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Toggle("Show a home scene between games", isOn: Binding(get: { model.homeEnabled }, set: { on in
+                    do { try model.setHomeEnabled(on) } catch { model.output = "Home scene: \(error.localizedDescription)" }
+                }))
+                .disabled(model.installedVersion == nil)
+                if model.homeEnabled {
+                    Picker("Scene", selection: Binding(get: { model.chosenScene }, set: { model.chooseScene($0) })) {
+                        ForEach(model.scenes) { scene in
+                            Text(scene.userMade ? "\(scene.name) (yours)" : scene.name).tag(scene.id)
+                        }
+                    }
+                    .frame(maxWidth: 320)
+                    if let scene = model.scenes.first(where: { $0.id == model.chosenScene }), !scene.about.isEmpty {
+                        Text(scene.about).font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Button("Open Scenes Folder") { model.openScenesFolder() }
+                        Button("Home Scene Log") { NSWorkspace.shared.open(Paths.homeLog) }
+                        Spacer()
+                    }
+                    Text("To make your own, copy a scene from runtime/scenes into the scenes folder and change it; see SCENES.md beside them.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(4)
         }
     }
 
