@@ -85,6 +85,8 @@ list)
 JSON
     if [ -f "$plist" ]; then
         plutil -replace ProgramArguments -json "[\"$dir/vapord\", \"$dir/libalvrxr.dylib\"]" "$plist"
+        # Games reach the compositor through this; a build without one never looks it up.
+        plutil -replace MachServices -json '{"com.zippysoft.macvapor.compositor": true}' "$plist"
         launchctl bootout "$domain/$label" 2>/dev/null || true
         # bootout returns before the job is gone, and bootstrap fails until it is.
         i=0
