@@ -1,6 +1,13 @@
 #!/bin/sh
 # Builds libalvrxr.dylib (the OpenXR runtime) and its loader manifest into out/.
+#   ./build.sh --install-variant NAME   also puts the runtime and vapord in MacVapoR/runtimes/NAME,
+#                                       for tools/runtime-switch.sh to choose
 set -eu
+variant=
+if [ "${1:-}" = --install-variant ]; then
+    variant=${2:?--install-variant needs a name}
+    case "$variant" in installed | */* | .*) echo "can't use $variant as a variant name" >&2; exit 2 ;; esac
+fi
 here=$(cd "$(dirname "$0")" && pwd)
 ALVR=${ALVR:-$HOME/Source/ALVR-20.14.1}
 OPENXR=${OPENXR:-$HOME/Source/OpenXR-SDK-Source}
@@ -58,3 +65,12 @@ cat > "$out/alvrxr.json" <<JSON
 }
 JSON
 echo "built $out/libalvrxr.dylib (XR_RUNTIME_JSON=$out/alvrxr.json)"
+if [ -n "$variant" ]; then
+    dest="$HOME/Library/Application Support/MacVapoR/runtimes/$variant"
+    mkdir -p "$dest"
+    # Replaced by rename, so a running game or vapord keeps the copy it loaded.
+    for f in libalvrxr.dylib libalvr_server_core.dylib vapord; do
+        cp "$out/$f" "$dest/.$f.new" && mv -f "$dest/.$f.new" "$dest/$f"
+    done
+    echo "installed into $dest (choose it with tools/runtime-switch.sh $variant)"
+fi
