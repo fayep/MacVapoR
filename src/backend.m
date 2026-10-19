@@ -598,7 +598,8 @@ static void start_core(void) {
     g_eye_h = target.stream_height;
     apply_setup();
     pthread_mutex_unlock(&g_lock);
-    alvr_start_connection();
+    // Headless (ALVRXR_DUMP) doesn't listen for a headset, so it can run beside vapord.
+    if (!g_dump) alvr_start_connection();
 }
 
 static bool finite_fov(const AlvrFov *f) {
@@ -791,6 +792,7 @@ static void *event_thread(void *arg) {
 // it runs, to be gone. vapord starts again, and waits out the claim, once the game has ended.
 static void claim_headset(void) {
     if (getenv("ALVRXR_HOME")) return;   // vapord itself
+    if (getenv("ALVRXR_DUMP")) return;   // headless: leaves the headset to whoever has it
     NSString *claim = [g_config_dir stringByAppendingPathComponent:@"claim.pid"];
     [[NSString stringWithFormat:@"%d\n", getpid()] writeToFile:claim atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSString *home = [NSString stringWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"home.pid"]
@@ -868,7 +870,7 @@ void axr_backend_start(void) {
     CVMetalTextureCacheCreate(NULL, NULL, dev, NULL, &g_texture_cache);
 
     start_core();
-    axr_audio_start();
+    if (!g_dump) axr_audio_start();
     pthread_t t;
     pthread_create(&t, NULL, event_thread, NULL);
     pthread_detach(t);
