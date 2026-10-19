@@ -1,7 +1,7 @@
-// slots-check: a minimal OpenXR Metal app that draws a fixed picture for 40 frames, to compare
+// slots-check: a minimal OpenXR Metal app that draws a fixed picture for 40 frames (or FRAMES), to compare
 // what a runtime encodes (ALVRXR_DUMP) before and after a change to its frame path.
 //
-// Usage: slots-check RUNTIME.dylib bgra|half|quad
+// Usage: slots-check RUNTIME.dylib bgra|half|quad [FRAMES]
 //   bgra   projection only, BGRA8Unorm_sRGB swapchains
 //   half   projection only, RGBA16Float swapchains (linear)
 //   quad   bgra's projection plus a half-transparent quad 1 m ahead in VIEW space
@@ -57,9 +57,10 @@ typedef struct {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        if (argc < 3) { fprintf(stderr, "usage: slots-check RUNTIME.dylib bgra|half|quad\n"); return 2; }
+        if (argc < 3) { fprintf(stderr, "usage: slots-check RUNTIME.dylib bgra|half|quad [FRAMES]\n"); return 2; }
         const char *mode = argv[2];
         bool half = !strcmp(mode, "half"), with_quad = !strcmp(mode, "quad");
+        int frames = argc > 3 ? atoi(argv[3]) : 40;
         void *lib = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
         if (!lib) { fprintf(stderr, "%s\n", dlerror()); return 1; }
         PFN_xrNegotiateLoaderRuntimeInterface negotiate = dlsym(lib, "xrNegotiateLoaderRuntimeInterface");
@@ -181,7 +182,7 @@ int main(int argc, char **argv) {
             XR(xrReleaseSwapchainImage(c->chain, NULL));
         };
 
-        for (int frame = 0; frame < 40; frame++) {
+        for (int frame = 0; frame < frames; frame++) {
             XrFrameState fs = {XR_TYPE_FRAME_STATE};
             XR(xrWaitFrame(session, NULL, &fs));
             XR(xrBeginFrame(session, NULL));
