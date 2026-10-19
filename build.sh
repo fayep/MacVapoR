@@ -37,10 +37,11 @@ clang -dynamiclib -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall -Wno-u
 embed() { { printf 'static const char %s[] =\n' "$1"; sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/\\n"/' "$2"; printf ';\n'; } > "$here/build/$1.h"; }
 embed prelude_metal "$here/home/prelude.metal"
 embed objects_metal "$here/home/objects.metal"
+embed dashboard_metal "$here/home/dashboard.metal"
 clang -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall \
-    -I "$here/build" -I "$OPENXR/build/include" -I "$OPENXR/include" \
-    "$here/home/vapord.m" -framework Foundation -framework Metal -framework CoreGraphics -framework ImageIO \
-    -o "$out/vapord"
+    -I "$here/build" -I "$here/src" -I "$OPENXR/build/include" -I "$OPENXR/include" \
+    "$here/home/vapord.m" "$here/home/dashboard.m" -framework Foundation -framework Metal -framework CoreGraphics \
+    -framework CoreText -framework ImageIO -o "$out/vapord"
 rm -rf "$out/scenes"
 mkdir -p "$out/scenes"
 cp "$here/home/SCENES.md" "$here/home/prelude.metal" "$out/scenes/"
