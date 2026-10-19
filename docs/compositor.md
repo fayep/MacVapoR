@@ -21,8 +21,11 @@ stays installable: `tools/runtime-switch.sh legacy` (tag `known-good-2026-10-19`
 Chosen at the first `xrGetSystem` (not `xrCreateInstance`: OpenComposite creates and destroys
 instances to probe for a headset, and those must not hand anything over). A CLIENT still links
 libalvr_server_core for LEGACY fallback but never calls `alvr_initialize`. It calls
-`alvr_path_to_id` for input paths: WP1 must confirm that is a pure hash usable without a
-running server, or the server publishes the ids it needs.
+`alvr_path_to_id` for input paths, which is a pure function: `alvr_common::hash_string`
+(common/src/version.rs), the standard library's `DefaultHasher::new()` (SipHash-1-3 with fixed
+keys) over the string, touching no server state, so it needs neither `alvr_initialize` nor
+`alvr_initialize_environment`, and the same dylib gives every process the same ids. tracking.m
+relies on this: the ids in the header (`buttons`, `fake_press`) are matched against it.
 
 ## Shared memory (axr_shm.h)
 
