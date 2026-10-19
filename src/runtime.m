@@ -189,10 +189,9 @@ static void set_state(session *s, XrSessionState st) {
 // The compositor decides who has the headset; the session follows with the state machine's own
 // steps, one event per step, never skipping a state: FOCUSED <-> VISIBLE <-> SYNCHRONIZED.
 
-// TODO(lead): return s->slots once WP2 adds it. NULL means a standalone session: always FOCUSED.
+// NULL (no slots yet) means always FOCUSED.
 static axr_slots *session_slots(session *s) {
-    (void)s;
-    return NULL;
+    return s->slots;
 }
 
 // TEST ONLY: ALVRXR_TEST_FOCUS_FILE holds "focus [should_render]" (AXR_FOCUS_* 0/1/2) and

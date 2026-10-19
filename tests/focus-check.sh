@@ -6,5 +6,5 @@ OPENXR=${OPENXR:-$HOME/Source/OpenXR-SDK-Source}
 scratch=$(mktemp -d)
 clang -fobjc-arc -O1 -Wall -I "$OPENXR/build/include" -I "$OPENXR/include" -framework Foundation -framework Metal \
     "$here/tests/focus-check.m" -o "$scratch/focus-check"
-ALVRXR_CONFIG_DIR=$scratch ALVRXR_TEST_FOCUS_FILE=$scratch/focus ALVRXR_RUNTIME=$here/out/libalvrxr.dylib \
+ALVRXR_DUMP=$scratch/dump.bin ALVRXR_CONFIG_DIR=$scratch ALVRXR_TEST_FOCUS_FILE=$scratch/focus ALVRXR_RUNTIME=$here/out/libalvrxr.dylib \
     "$scratch/focus-check"
