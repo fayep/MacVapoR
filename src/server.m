@@ -294,11 +294,29 @@ static void compute_foveation(void) {
 // compose.metal, embedded by build.sh as a C string.
 #include "compose_metal.h"
 
+typedef struct { float x, y, z, w; } quat;
+static quat qmul(quat a, quat b) {
+    return (quat){a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                  a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+static axr_views current_views(void);
+
+
+// compose.metal's Source: a source's turn relative to the frame being encoded, per eye.
+typedef struct {
+    float rot[6][4];           // eye * 3 + column, of a 3x3 (target eye frame -> source eye frame)
+    uint32_t identity, present, pad[2];
+} compose_source;
 
 typedef struct {
     float rect[2][4];
     uint32_t slice[2];
     ffr_uniform ffr;           // offset 40, as Metal places it
+    uint32_t blend;            // 0: LEGACY, the one source as it is (zero-filled by axr_submit)
+    float alpha;
+    uint32_t pad[2];
+    float tanfov[2][4];        // offset 96
+    compose_source src[2];     // offset 128: foreground, other
 } compose_uniform;
 
 static id<MTLDevice> g_device;
@@ -310,7 +328,12 @@ static dispatch_queue_t g_encode_queue;
 static dispatch_semaphore_t g_in_flight;
 static NSMapTable<id<MTLTexture>, id<MTLTexture>> *g_array_views;
 static NSMutableData *g_last_config;
-_Static_assert(sizeof(compose_uniform) == 80 && __builtin_offsetof(compose_uniform, ffr) == 40, "Compose layout");
+_Static_assert(sizeof(compose_uniform) == 352 && __builtin_offsetof(compose_uniform, ffr) == 40 &&
+                   __builtin_offsetof(compose_uniform, tanfov) == 96 && __builtin_offsetof(compose_uniform, src) == 128,
+               "Compose layout");
+static id<MTLCommandQueue> g_compose_queue;   // the compositor's own (SERVER): never a source's
+static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4], id<MTLCommandQueue> queue, uint64_t ts, bool idr,
+                         uint32_t out_w, uint32_t out_h, void (^done)(void));
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_pts_to_ts;
 static float g_bitrate = 30e6f;
 static unsigned g_stat_frames, g_stat_bytes, g_stat_submit_calls, g_stat_not_ready;
@@ -522,7 +545,17 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
         u.rect[e][3] = eyes[e].height / th;
         u.slice[e] = eyes[e].slice;
     }
-    if (dispatch_semaphore_wait(g_in_flight, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) != 0) return;
+    id<MTLTexture> tex[4] = {eyes[0].texture, eyes[1].texture, eyes[0].texture, eyes[1].texture};
+    encode_frame(&u, tex, queue, ts, idr, out_w, out_h, nil);
+}
+
+// Draws the composition u of tex (foreground left, right; other left, right) into a pixel buffer
+// from the pool with one command buffer on queue and, once the GPU is done, encodes it for the
+// client's sample ts (an IDR if idr) and runs done (if any). At most 2 in flight; false if the
+// frame had to be dropped, in which case done never runs.
+static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4], id<MTLCommandQueue> queue, uint64_t ts, bool idr,
+                         uint32_t out_w, uint32_t out_h, void (^done)(void)) {
+    if (dispatch_semaphore_wait(g_in_flight, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) != 0) return false;
 
     CVPixelBufferRef pb = NULL;
     CVPixelBufferPoolCreatePixelBuffer(NULL, g_pool, &pb);
@@ -535,7 +568,7 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
         if (cvtex) CFRelease(cvtex);
         if (pb) CVPixelBufferRelease(pb);
         dispatch_semaphore_signal(g_in_flight);
-        return;
+        return false;
     }
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
@@ -543,12 +576,12 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
     [enc setRenderPipelineState:g_pipeline];
-    [enc setFragmentTexture:array_view(eyes[0].texture) atIndex:0];
-    [enc setFragmentTexture:array_view(eyes[1].texture) atIndex:1];
-    [enc setFragmentBytes:&u length:sizeof u atIndex:0];
+    for (int i = 0; i < 4; i++) [enc setFragmentTexture:array_view(tex[i]) atIndex:i];
+    [enc setFragmentBytes:u length:sizeof *u atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [enc endEncoding];
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> _) {
+        if (done) done();
         dispatch_async(g_encode_queue, ^{
             pthread_mutex_lock(&g_lock);
             VTCompressionSessionRef encoder = g_encoder;
@@ -578,6 +611,62 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
         g_force_idr = false;
         pthread_mutex_unlock(&g_lock);
     }
+    return true;
+}
+
+static quat qconj(quat q) { return (quat){-q.x, -q.y, -q.z, q.w}; }
+
+// compose.metal's Source for a frame drawn with head pose src, shown in the frame drawn with
+// head pose target: per eye, the rotation taking a ray in the target's eye frame into the
+// source's. Rotation only: positions are left alone. identity when the two agree, so one source
+// in one place samples exactly as LEGACY does.
+static compose_source source_uniform(axr_pose src, axr_pose target, const axr_views *v) {
+    compose_source s = {.present = 1, .identity = 1};
+    quat hs = {src.orientation[0], src.orientation[1], src.orientation[2], src.orientation[3]};
+    quat ht = {target.orientation[0], target.orientation[1], target.orientation[2], target.orientation[3]};
+    for (int e = 0; e < 2; e++) {
+        const float *o = v->eye_in_head[e].orientation;
+        quat qe = {o[0], o[1], o[2], o[3]};
+        quat r = qmul(qconj(qmul(hs, qe)), qmul(ht, qe));
+        float n = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+        if (n > 0) { r.x /= n; r.y /= n; r.z /= n; r.w /= n; }
+        if (r.x * r.x + r.y * r.y + r.z * r.z > 1e-10f) s.identity = 0;   // a turn of over ~0.001 degrees
+        float x = r.x, y = r.y, z = r.z, w = r.w;
+        float col[3][3] = {{1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)},
+                           {2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)},
+                           {2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)}};
+        for (int c = 0; c < 3; c++) memcpy(s.rot[e * 3 + c], col[c], sizeof col[c]);
+    }
+    return s;
+}
+
+bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, float alpha, void (^done)(void)) {
+    if (!fg || !fg->texture) return false;
+    uint64_t ts = g_dump ? (uint64_t)fg->display_time : fg->client_ts;
+    pthread_mutex_lock(&g_lock);
+    bool ready = (g_connected || g_dump) && g_encoder && g_pool;
+    if (!ts && g_connected) ts = (uint64_t)fg->display_time;   // as axr_submit: ours until the client tracks
+    g_stat_submit_calls++;
+    if (!ready) g_stat_not_ready++;
+    compose_uniform u = {.ffr = g_ffr, .blend = 1, .alpha = other ? alpha : 1};
+    bool idr = g_force_idr;
+    uint32_t out_w = g_out_w, out_h = g_out_h;
+    axr_views views = current_views();
+    if (!g_compose_queue) g_compose_queue = [g_device newCommandQueue];
+    id<MTLCommandQueue> queue = g_compose_queue;
+    pthread_mutex_unlock(&g_lock);
+    if (!ready || !ts) return false;
+
+    // Output slots: each eye is its half of the one texture.
+    for (int e = 0; e < 2; e++) {
+        u.rect[e][0] = e * 0.5f; u.rect[e][1] = 0; u.rect[e][2] = 0.5f; u.rect[e][3] = 1;
+        for (int k = 0; k < 4; k++) u.tanfov[e][k] = tanf(views.fov[e][k]);
+    }
+    u.src[0] = (compose_source){.identity = 1, .present = 1};   // the driving frame is the target
+    if (other && other->texture) u.src[1] = source_uniform(other->head, fg->head, &views);
+    id<MTLTexture> ot = other && other->texture ? other->texture : fg->texture;
+    id<MTLTexture> tex[4] = {fg->texture, fg->texture, ot, ot};
+    return encode_frame(&u, tex, queue, ts, idr, out_w, out_h, done);
 }
 
 // ------------------------------------------------------------------------------ ALVR events
@@ -825,17 +914,19 @@ static void *event_thread(void *arg) {
                 uint64_t audio_frames;
                 float audio_peak;
                 axr_audio_stats(&audio_frames, &audio_peak);
-                if (g_stat_frames || axr_stat_wait)
+                char compositor[512];
+                axr_compositor_stats(compositor, sizeof compositor);   // "" unless this is SERVER
+                if (g_stat_frames || axr_stat_wait || compositor[0])
                     axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
                             " | headset: %.0f samples/s, every %.1f ms, %u bunched, %u late"
                             " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads"
-                            " | audio: %llu frames tapped, peak %.3f",
+                            " | audio: %llu frames tapped, peak %.3f%s",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
                             axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
                             g_stat_samples / dt, g_stat_samples ? g_stat_ts_span / 1e6 / g_stat_samples : 0.0,
                             g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_nbuttons, axr_stat_syncs,
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
-                            audio_peak);
+                            audio_peak, compositor);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
                 axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
@@ -978,6 +1069,8 @@ int axr_shm_readonly_fd(int fd) {
     return fd == g_shm_fd && g_shm_ro_fd >= 0 ? dup(g_shm_ro_fd) : -1;
 }
 
+int axr_shm_global_fd(void) { return g_shm_fd; }
+
 static void clear_samples(void) {
     if (!g_shm) return;
     for (unsigned i = 0; i < AXR_SAMPLE_RING; i++) {
@@ -1013,11 +1106,6 @@ static NSSet<NSString *> *g_fake_press;
 static uint64_t g_fake_press_id[AXR_MAX_FAKE_PRESS];
 static unsigned g_nfake_press;
 
-typedef struct { float x, y, z, w; } quat;
-static quat qmul(quat a, quat b) {
-    return (quat){a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-                  a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
-}
 static void qrot3(quat q, const float v[3], float out[3]) {
     quat r = qmul(qmul(q, (quat){v[0], v[1], v[2], 0}), (quat){-q.x, -q.y, -q.z, q.w});
     out[0] = r.x; out[1] = r.y; out[2] = r.z;
