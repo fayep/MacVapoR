@@ -43,13 +43,23 @@ static CGGradientRef gradient(int n, const CGFloat *colors, const CGFloat *stops
     return g;
 }
 
-// A line of text, sheared into an 80s italic, centred on (x, y).
+// A line of text, sheared into an 80s italic, centred on (x, y). Lower case comes out as smaller
+// capitals, for a font that has none (MacVapoR's M, V and R stay tall), as on the dashboard.
 static CTLineRef text_line(NSString *s, NSString *font_name, CGFloat size, CGFloat kern) {
     CGAffineTransform shear = CGAffineTransformMake(1, 0, 0.22, 1, 0, 0);
     CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)font_name, size, &shear);
-    NSAttributedString *a = [[NSAttributedString alloc]
+    CTFontRef small = CTFontCreateWithName((__bridge CFStringRef)font_name, size * 0.76, &shear);
+    NSMutableAttributedString *a = [[NSMutableAttributedString alloc]
         initWithString:s attributes:@{(id)kCTFontAttributeName : (__bridge id)font, (id)kCTKernAttributeName : @(kern)}];
+    NSCharacterSet *lower = NSCharacterSet.lowercaseLetterCharacterSet;
+    for (NSUInteger i = 0; i < s.length; i++) {
+        if (![lower characterIsMember:[s characterAtIndex:i]]) continue;
+        NSRange r = NSMakeRange(i, 1);
+        [a replaceCharactersInRange:r withString:[s substringWithRange:r].uppercaseString];
+        [a addAttribute:(id)kCTFontAttributeName value:(__bridge id)small range:r];
+    }
     CFRelease(font);
+    CFRelease(small);
     return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)a);
 }
 
@@ -58,10 +68,10 @@ static CGPoint centred(CGContextRef c, CTLineRef line, CGFloat x, CGFloat y) {
     return CGPointMake(x - b.size.width / 2 - b.origin.x, y - b.size.height / 2 - b.origin.y);
 }
 
-// "MACVAPOR" in chrome, with a neon glow, and a smaller line under it.
+// "MacVapoR" in chrome, with a neon glow, and a smaller line under it.
 static CGContextRef draw_name(void) {
     CGContextRef c = canvas(2048, 768);
-    CTLineRef title = text_line(@"MACVAPOR", @"Futura-CondensedExtraBold", 330, 10);
+    CTLineRef title = text_line(@"MacVapoR", @"Futura-CondensedExtraBold", 330, 10);
     CGPoint at = centred(c, title, 1024, 470);
     CGRect b = CTLineGetImageBounds(title, c);
     b.origin.x += at.x;
