@@ -48,7 +48,7 @@ typedef struct {
     double clock_offset;
     int64_t last_sample_ns;
     double refresh_hz;
-    uint32_t eye_w, eye_h, recenter_gen;
+    uint32_t eye_w, eye_h, render_w, render_h, recenter_gen;
     axr_views views;
     axr_pose aim[2];
     float height_offset, eye_height;
@@ -87,6 +87,8 @@ static bool read_header(header *h) {
         h->refresh_hz = g->refresh_hz;
         h->eye_w = g->eye_w;
         h->eye_h = g->eye_h;
+        h->render_w = g->render_w;
+        h->render_h = g->render_h;
         h->recenter_gen = g->recenter_gen;
         h->views = g->views;
         h->aim[0] = g->aim[0];
@@ -122,9 +124,15 @@ double axr_refresh_hz(void) {
     return h.refresh_hz > 0 ? h.refresh_hz : 90;
 }
 
-// The stream's eye size; backend.m preferred openvr_config's target size, which the header has
-// no field for yet. The two are equal in every session.json seen.
+// The size games are asked to render each eye at: openvr_config's target size, else the stream's.
 void axr_recommended_eye_size(uint32_t *w, uint32_t *h_) {
+    header h;
+    read_header(&h);
+    *w = h.render_w ?: (h.eye_w ?: 2144);
+    *h_ = h.render_h ?: (h.eye_h ?: 2048);
+}
+
+void axr_stream_eye_size(uint32_t *w, uint32_t *h_) {
     header h;
     read_header(&h);
     *w = h.eye_w ?: 2144;

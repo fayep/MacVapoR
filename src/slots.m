@@ -10,6 +10,7 @@
 
 #include "alvrxr.h"
 #include "compositor.h"
+#include "tracking.h"
 
 // --------------------------------------------------------------------------------------- modes
 
@@ -38,7 +39,7 @@ axr_slots *axr_slots_open(id<MTLDevice> device, id<MTLCommandQueue> queue) {
     axr_slots *s = calloc(1, sizeof *s);
     s->device = device;
     s->queue = queue;
-    axr_recommended_eye_size(&s->eye_w, &s->eye_h);
+    axr_stream_eye_size(&s->eye_w, &s->eye_h);
     for (int i = 0; i < AXR_SLOTS; i++) {
         s->surfaces[i] = [[IOSurface alloc] initWithProperties:@{
             IOSurfacePropertyKeyWidth : @(s->eye_w * 2),
@@ -86,7 +87,7 @@ void axr_slots_close(axr_slots *s) {
 
 bool axr_slots_stale(const axr_slots *s) {
     uint32_t w, h;
-    axr_recommended_eye_size(&w, &h);
+    axr_stream_eye_size(&w, &h);
     return w != s->eye_w || h != s->eye_h;
 }
 

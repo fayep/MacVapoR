@@ -31,7 +31,9 @@ static FILE *g_logfile;
 void axr_log(const char *fmt, ...) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
+        // A scratch config dir (tests) keeps its log there, out of the real one.
+        NSString *dir = NSProcessInfo.processInfo.environment[@"ALVRXR_CONFIG_DIR"]
+                            ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
         g_logfile = fopen([[dir stringByAppendingPathComponent:@"alvrxr.log"] fileSystemRepresentation], "a");
     });
     char msg[1024];
@@ -1241,6 +1243,8 @@ void axr_publish_state(void) {
     // The stream's size, as the field says; the size games should render at (openvr_config's
     // target, which axr_recommended_eye_size used to prefer) has no field of its own yet.
     g->eye_w = g_eye_w;
+    g->render_w = g_setup.target_w;
+    g->render_h = g_setup.target_h;
     g->eye_h = g_eye_h;
     g->config_gen = g_config_gen;
     g->recenter_gen = g_recenter_generation;
