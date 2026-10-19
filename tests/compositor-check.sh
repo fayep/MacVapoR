@@ -100,6 +100,7 @@ run_handover() {
 run_watchdog() {
     echo "== watchdog: as handover, but the game just stops sending; the lounge comes back after 300 ms"
     : > "$scratch/alvrxr.log"
+    printf '{"watchdog_ms": 300}' > "$scratch/tune.json"   # the default is 1500
     ALVRXR_DUMP=$scratch/watchdog.hevc "$bin" handover --watchdog > "$scratch/watchdog.out" 2> "$scratch/watchdog.err" || { tail -5 "$scratch/watchdog.err"; fail "watchdog run"; }
     grep -h "compositor:" "$scratch/alvrxr.log" | grep -v "composed" | sed 's/^/   log: /'
     "$dumpcheck" "$scratch/watchdog.hevc" > "$scratch/watchdog.txt" || { fail "watchdog dump didn't decode"; return; }

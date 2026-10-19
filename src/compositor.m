@@ -19,7 +19,6 @@
 #include "tracking.h"
 
 #define MAX_SOURCES 4
-#define WATCHDOG_NS 300000000LL        // no frame from the foreground game for this long: fade back
 #define LOUNGE_IDLE_NS 2000000000LL    // after a fade to a game, the lounge idles this much later
 #define FIRST_FRAMES 3                 // content frames in a row (each within 2 periods) before a game shows
 
@@ -77,6 +76,9 @@ static int64_t g_fade_start_ns;
 static unsigned g_fade_frames;
 static int64_t g_lounge_idle_at_ns;          // when the lounge's should_render goes to 0; 0 = not scheduled
 static uint64_t g_fade_ms = 400;
+// No frame from the foreground game for this long: fade back to the lounge. Its last frame is held,
+// reprojected, until then, so a game's loading hitch needn't bounce the player to the lounge.
+static _Atomic int64_t g_watchdog_ns = 1500000000LL;
 
 // Stats: composes, and the time from the frame's listener firing to its command buffer's commit.
 static unsigned g_stat_composed, g_stat_dropped;
@@ -101,12 +103,16 @@ static NSString *config_dir(void) {
     return dir.length ? dir : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
 }
 
-// tune.json "fade_ms", read as each fade starts so it can be tuned live.
+// tune.json "fade_ms" and "watchdog_ms", read as each fade starts and each source is added, so
+// they can be tuned live.
 static void read_tune(void) {
     NSData *d = [NSData dataWithContentsOfFile:[config_dir() stringByAppendingPathComponent:@"tune.json"]];
     NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     id v = [t isKindOfClass:NSDictionary.class] ? t[@"fade_ms"] : nil;
     g_fade_ms = [v respondsToSelector:@selector(unsignedLongLongValue)] && [v unsignedLongLongValue] > 0 ? [v unsignedLongLongValue] : 400;
+    v = [t isKindOfClass:NSDictionary.class] ? t[@"watchdog_ms"] : nil;
+    long long w = [v respondsToSelector:@selector(longLongValue)] && [v longLongValue] > 0 ? [v longLongValue] : 1500;
+    atomic_store(&g_watchdog_ns, w * 1000000LL);
 }
 
 // ------------------------------------------------------------------------------------- focus
@@ -365,7 +371,7 @@ static void tick(void) {
     pthread_mutex_lock(&g_lock);
     int64_t now = axr_now_ns();
     axr_source *fg = g_fg;
-    if (fg && !fg->local && !fg->gone && fg->last_frame_ns && now - fg->last_frame_ns > WATCHDOG_NS && g_lounge) {
+    if (fg && !fg->local && !fg->gone && fg->last_frame_ns && now - fg->last_frame_ns > atomic_load(&g_watchdog_ns) && g_lounge) {
         axr_log("compositor: watchdog: no frame from %s for %.0f ms", name_of(fg), (now - fg->last_frame_ns) / 1e6);
         fg->passed = false;   // it may come back, through the first-frame check again
         fg->streak = 0;
