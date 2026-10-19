@@ -1,0 +1,52 @@
+diff --git a/alvr/common/src/logging.rs b/alvr/common/src/logging.rs
+index 1ca163a..aa4811f 100644
+--- a/alvr/common/src/logging.rs
++++ b/alvr/common/src/logging.rs
+@@ -193,7 +193,7 @@ pub fn set_panic_hook() {
+ 
+         log::error!("ALVR panicked: {err_str}");
+ 
+-        #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
++        #[cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos")))]
+         std::thread::spawn({
+             let panic_str = panic_info.to_string();
+             move || {
+@@ -210,7 +210,7 @@ pub fn set_panic_hook() {
+ pub fn show_w<W: Display + Send + 'static>(w: W) {
+     log::warn!("{w}");
+ 
+-    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
++    #[cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos")))]
+     std::thread::spawn(move || {
+         rfd::MessageDialog::new()
+             .set_title("ALVR warning")
+@@ -228,7 +228,7 @@ pub fn show_warn<T, E: Display + Send + 'static>(res: Result<T, E>) -> Option<T>
+ fn show_e_block<E: Display>(e: E, blocking: bool) {
+     log::error!("{e}");
+ 
+-    #[cfg(all(not(target_os = "android"), not(target_os = "ios")))]
++    #[cfg(all(not(target_os = "android"), not(target_os = "ios"), not(target_os = "macos")))]
+     {
+         // Store the last error shown in a message box. Do not open a new message box if the content
+         // of the error has not changed
+diff --git a/alvr/server_core/src/web_server.rs b/alvr/server_core/src/web_server.rs
+index 80434bb..d01e74f 100644
+--- a/alvr/server_core/src/web_server.rs
++++ b/alvr/server_core/src/web_server.rs
+@@ -393,10 +393,10 @@ pub async fn web_server(connection_context: Arc<ConnectionContext>) -> Result<()
+         }
+     });
+ 
+-    Ok(hyper::Server::bind(&SocketAddr::new(
+-        "0.0.0.0".parse().unwrap(),
+-        web_server_port,
+-    ))
+-    .serve(service)
+-    .await?)
++    // bind() panics when the port is taken (another ALVR server still holds it); the dashboard is
++    // optional, so say so and carry on without it.
++    let addr = SocketAddr::new("0.0.0.0".parse().unwrap(), web_server_port);
++    let server = hyper::Server::try_bind(&addr)
++        .map_err(|e| anyhow::anyhow!("web server not started, port {web_server_port}: {e}"))?;
++    Ok(server.serve(service).await?)
+ }
