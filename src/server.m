@@ -1255,6 +1255,9 @@ static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, 
 // The controller pose as the headset reports it can sit turned from the controller in hand (PS VR2
 // Sense through visionOS read about 10 degrees low): tune.json grip_pitch, grip_yaw, grip_roll.
 static float g_grip_rotation[3], g_grip_offset[3];   // degrees; metres in the grip's frame
+// Each hand's own move, in its own frame, unmirrored, when given: the two can be off differently.
+static float g_grip_hand_offset[2][3];
+static bool g_grip_hand_set[2];
 
 static axr_pose grip_turn(int hand) {
     float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw and roll
@@ -1262,6 +1265,9 @@ static axr_pose grip_turn(int hand) {
     quat ry = {0, sinf(m * g_grip_rotation[1] * d), 0, cosf(m * g_grip_rotation[1] * d)};
     quat rz = {0, 0, sinf(m * g_grip_rotation[2] * d), cosf(m * g_grip_rotation[2] * d)};
     quat q = qmul(qmul(ry, rx), rz);
+    int h = hand == AXR_RIGHT;
+    if (g_grip_hand_set[h])
+        return (axr_pose){{q.x, q.y, q.z, q.w}, {g_grip_hand_offset[h][0], g_grip_hand_offset[h][1], g_grip_hand_offset[h][2]}};
     return (axr_pose){{q.x, q.y, q.z, q.w}, {m * g_grip_offset[0], g_grip_offset[1], g_grip_offset[2]}};
 }
 
@@ -1301,6 +1307,22 @@ static void read_tune(void) {
     float grip_offset[3] = {0, 0, 0};
     NSArray *go = [t[@"grip_offset"] isKindOfClass:NSArray.class] ? t[@"grip_offset"] : nil;
     for (NSUInteger i = 0; i < 3 && i < go.count; i++) grip_offset[i] = [go[i] floatValue];
+    float hand_offset[2][3] = {{0}};
+    bool hand_set[2] = {false, false};
+    for (int h = 0; h < 2; h++) {
+        NSArray *a = t[h ? @"grip_offset_right" : @"grip_offset_left"];
+        if (![a isKindOfClass:NSArray.class]) continue;
+        hand_set[h] = true;
+        for (NSUInteger i = 0; i < 3 && i < a.count; i++) hand_offset[h][i] = [a[i] floatValue];
+    }
+    if (memcmp(hand_offset, g_grip_hand_offset, sizeof hand_offset) || memcmp(hand_set, g_grip_hand_set, sizeof hand_set)) {
+        memcpy(g_grip_hand_offset, hand_offset, sizeof hand_offset);
+        memcpy(g_grip_hand_set, hand_set, sizeof hand_set);
+        for (int h = 0; h < 2; h++)
+            if (hand_set[h])
+                axr_log("grip: %s moved (%.3f, %.3f, %.3f) m", h ? "right" : "left", hand_offset[h][0], hand_offset[h][1],
+                        hand_offset[h][2]);
+    }
     if (memcmp(grip_rotation, g_grip_rotation, sizeof grip_rotation) || memcmp(grip_offset, g_grip_offset, sizeof grip_offset)) {
         memcpy(g_grip_rotation, grip_rotation, sizeof grip_rotation);
         memcpy(g_grip_offset, grip_offset, sizeof grip_offset);
