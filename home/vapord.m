@@ -870,7 +870,12 @@ static int preview(NSString *dir, NSString *png, float yaw, float pitch) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc >= 4 && !strcmp(argv[1], "--preview")) return preview(@(argv[2]), @(argv[3]), argc > 4 ? atof(argv[4]) : 0, argc > 5 ? atof(argv[5]) : -8);
-        g_config_dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
+        // Tests point ALVRXR_CONFIG_DIR at a scratch folder so a second vapord can't touch the live
+        // home.pid or claim.pid (the runtime inside reads the same variable for everything else).
+        const char *cfg_env = getenv("ALVRXR_CONFIG_DIR");
+        g_config_dir = cfg_env && *cfg_env ? @(cfg_env)
+                                           : [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/alvrxr"];
+        [NSFileManager.defaultManager createDirectoryAtPath:g_config_dir withIntermediateDirectories:YES attributes:nil error:nil];
         g_pid_path = [g_config_dir stringByAppendingPathComponent:@"home.pid"];
 
         // A game holding the headset keeps it until it ends.
@@ -879,6 +884,8 @@ int main(int argc, char **argv) {
         [[NSString stringWithFormat:@"%d\n", getpid()] writeToFile:g_pid_path atomically:YES
                                                          encoding:NSUTF8StringEncoding error:nil];
         int token;
+        // A scratch run must not exit when a real game claims the real headset, and posts no claim itself.
+        if (!(cfg_env && *cfg_env))
         notify_register_dispatch("com.zippysoft.macvapor.claim", &token, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
                                  ^(int t) {
                                      (void)t;
@@ -1100,6 +1107,9 @@ int main(int argc, char **argv) {
 
         say(@"home scene up");
         bool running = false;
+        // Only FOCUSED takes input; under a game (VISIBLE) the scene is still drawn but doesn't
+        // react, and SYNCHRONIZED/VISIBLE/FOCUSED can come and go without the session ending.
+        bool focused = false;
         CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
         for (;;) {
             @autoreleasepool {
@@ -1115,6 +1125,10 @@ int main(int argc, char **argv) {
                         } else if (st == XR_SESSION_STATE_STOPPING) {
                             xrEndSession(session);
                             running = false;
+                            focused = false;
+                        } else if (st == XR_SESSION_STATE_FOCUSED || st == XR_SESSION_STATE_VISIBLE ||
+                                   st == XR_SESSION_STATE_SYNCHRONIZED) {
+                            focused = st == XR_SESSION_STATE_FOCUSED;
                         } else if (st == XR_SESSION_STATE_EXITING || st == XR_SESSION_STATE_LOSS_PENDING) {
                             unlink(g_pid_path.fileSystemRepresentation);
                             return 0;
@@ -1157,11 +1171,11 @@ int main(int argc, char **argv) {
                 // Each hand: a controller where one's held, its joints where it's bare.
                 XrActiveActionSet active = {set, XR_NULL_PATH};
                 XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO, NULL, 1, &active};
-                xrSyncActions(session, &sync);
+                if (focused) xrSyncActions(session, &sync);
                 bool show_controller[2] = {false, false};
                 simd_float4x4 controller_model[2];
                 hand_input input[2] = {0};
-                for (int h = 0; h < 2; h++) {
+                for (int h = 0; h < 2 && focused; h++) {
                     for (int i = 0; i < A_COUNT; i++) {
                         XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO, NULL, control[i], hands[h]};
                         if (controls[i].type == XR_ACTION_TYPE_FLOAT_INPUT) {
@@ -1256,7 +1270,7 @@ int main(int argc, char **argv) {
                         simd_float3 t3 = simd_make_float3(th.x, th.y, th.z), i3 = simd_make_float3(ix.x, ix.y, ix.z);
                         simd_float3 at = (t3 + i3) * 0.5f;
                         float gap = simd_distance(t3, i3);
-                        bool now = pinching[h] ? gap < 0.045f : gap < 0.022f;
+                        bool now = focused && (pinching[h] ? gap < 0.045f : gap < 0.022f);
                         // The last few pinch points, for the throw.
                         int k = pinch_n[h] % 4;
                         pinch_at[h][k] = at;

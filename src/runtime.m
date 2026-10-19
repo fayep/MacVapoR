@@ -16,6 +16,7 @@
 #include <openxr/openxr_reflection.h>
 
 #include "alvrxr.h"
+#include "compositor.h"
 
 extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
 extern unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
@@ -89,6 +90,7 @@ struct session {
     VkDevice vk_device;
     XrSessionState state;
     bool running, exit_requested;
+    bool lost;                               // LOSS_PENDING sent: no further state changes
     NSMutableArray<NSValue *> *action_sets;
     XrPath profile;                          // active interaction profile
     XrPosef local;                           // LOCAL's origin in STAGE
@@ -182,9 +184,83 @@ static void set_state(session *s, XrSessionState st) {
     push_event(&ev, sizeof ev);
 }
 
+// ---- focus from the compositor
+// The compositor decides who has the headset; the session follows with the state machine's own
+// steps, one event per step, never skipping a state: FOCUSED <-> VISIBLE <-> SYNCHRONIZED.
+
+// TODO(lead): return s->slots once WP2 adds it. NULL means a standalone session: always FOCUSED.
+static axr_slots *session_slots(session *s) {
+    (void)s;
+    return NULL;
+}
+
+// TEST ONLY: ALVRXR_TEST_FOCUS_FILE holds "focus [should_render]" (AXR_FOCUS_* 0/1/2) and
+// overrides the compositor's answer, so a driver can flip focus without a compositor.
+static bool test_focus_override(uint32_t *focus, bool *render) {
+    static const char *path;
+    static int init;
+    static uint64_t checked;
+    static uint32_t f = AXR_FOCUS_FOCUSED;
+    static bool r = true, have;
+    if (!init) { init = 1; path = getenv("ALVRXR_TEST_FOCUS_FILE"); }
+    if (!path) return false;
+    uint64_t now = (uint64_t)axr_now_ns();
+    if (now - checked > 100000000ull) {   // at most every 100 ms
+        checked = now;
+        FILE *fp = fopen(path, "r");
+        unsigned a = 0, b = 1;
+        if (fp) {
+            int n = fscanf(fp, "%u %u", &a, &b);
+            fclose(fp);
+            if (n >= 1) { f = a > AXR_FOCUS_FOCUSED ? AXR_FOCUS_FOCUSED : a; r = n < 2 || b; have = true; }
+        }
+    }
+    if (!have) return false;
+    *focus = f;
+    *render = r;
+    return true;
+}
+
+static void desired_focus(session *s, uint32_t *focus, bool *render) {
+    *focus = AXR_FOCUS_FOCUSED;
+    *render = true;
+    if (test_focus_override(focus, render)) return;
+    axr_slots *slots = session_slots(s);
+    if (!slots) return;
+    *focus = axr_slots_focus(slots);
+    *render = axr_slots_should_render(slots);
+}
+
+// Caller holds g_lock. Only while running: before the begin sequence and after the stop
+// sequence the state belongs to those functions.
+static void follow_focus(session *s) {
+    if (!s || !s->running || s->lost || s->exit_requested) return;
+    if (s->state != XR_SESSION_STATE_SYNCHRONIZED && s->state != XR_SESSION_STATE_VISIBLE &&
+        s->state != XR_SESSION_STATE_FOCUSED) return;
+    uint32_t focus;
+    bool render;
+    desired_focus(s, &focus, &render);
+    XrSessionState target = focus >= AXR_FOCUS_FOCUSED ? XR_SESSION_STATE_FOCUSED
+                            : focus == AXR_FOCUS_VISIBLE ? XR_SESSION_STATE_VISIBLE : XR_SESSION_STATE_SYNCHRONIZED;
+    while (s->state > target) set_state(s, (XrSessionState)(s->state - 1));
+    while (s->state < target) set_state(s, (XrSessionState)(s->state + 1));
+}
+
+// The compositor has gone and didn't come back: tells the app to destroy the session. Called by
+// the compositor client (WP5); the lead declares it in a header. Safe from any thread.
+void axr_session_loss_pending(void) {
+    pthread_mutex_lock(&g_lock);
+    if (g_session && !g_session->lost) {
+        g_session->lost = true;
+        set_state(g_session, XR_SESSION_STATE_LOSS_PENDING);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 static XrResult xrPollEvent_(XrInstance inst, XrEventDataBuffer *out) {
     CHECK_HANDLE(inst, instance, MAGIC_INSTANCE);
     pthread_mutex_lock(&g_lock);
+    follow_focus(g_session);
     NSData *ev = g_instance->events.firstObject;
     if (ev) [g_instance->events removeObjectAtIndex:0];
     pthread_mutex_unlock(&g_lock);
@@ -493,6 +569,7 @@ static XrResult xrRequestExitSession_(XrSession h) {
     session *s = (session *)h;
     pthread_mutex_lock(&g_lock);
     if (!s->running) { pthread_mutex_unlock(&g_lock); return XR_ERROR_SESSION_NOT_RUNNING; }
+    if (s->lost) { pthread_mutex_unlock(&g_lock); return XR_SUCCESS; }   // LOSS_PENDING is the last state
     s->exit_requested = true;
     set_state(s, XR_SESSION_STATE_VISIBLE);
     set_state(s, XR_SESSION_STATE_SYNCHRONIZED);
@@ -1012,7 +1089,14 @@ static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameSt
     axr_stat_wait++;
     st->predictedDisplayTime = axr_wait_frame();
     st->predictedDisplayPeriod = (XrDuration)(1e9 / axr_refresh_hz());
-    st->shouldRender = s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED;
+    pthread_mutex_lock(&g_lock);
+    follow_focus(s);
+    uint32_t focus;
+    bool render;
+    desired_focus(s, &focus, &render);
+    bool visible = s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED;
+    pthread_mutex_unlock(&g_lock);
+    st->shouldRender = visible && render;
     // The home scene draws only for a headset; games always do, for their window on the Mac.
     static int home = -1;
     if (home < 0) home = getenv("ALVRXR_HOME") != NULL;
@@ -1395,7 +1479,9 @@ static XrResult xrAttachSessionActionSets_(XrSession h, const XrSessionActionSet
         for (NSString *hand in @[ @"/user/hand/left", @"/user/hand/right" ]) {
             XrEventDataInteractionProfileChanged ev = {XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED, NULL, h};
             (void)hand;
+            pthread_mutex_lock(&g_lock);
             push_event(&ev, sizeof ev);
+            pthread_mutex_unlock(&g_lock);
             break;
         }
     }
