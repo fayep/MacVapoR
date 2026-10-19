@@ -191,13 +191,27 @@ static CGRect cg(box b) { return CGRectMake(b.x, CH - b.y - b.h, b.w, b.h); }
 static CGPathRef rounded(box b, CGFloat r) { return CGPathCreateWithRoundedRect(cg(b), r, r, NULL); }
 
 // A line of text: sheared into the lounge's 80s italic when slanted, cut short with an ellipsis
-// to fit.
-static CTLineRef text_line(NSString *s, NSString *font_name, CGFloat size, CGFloat kern, bool slanted, CGFloat fit) {
+// to fit. With small_caps, lower case is drawn as smaller capitals, for a font that has no lower
+// case (MacVapoR's M, V and R stay tall).
+static CTLineRef text_line(NSString *s, NSString *font_name, CGFloat size, CGFloat kern, bool slanted, CGFloat fit,
+                           bool small_caps) {
     CGAffineTransform shear = CGAffineTransformMake(1, 0, slanted ? 0.22 : 0, 1, 0, 0);
     CTFontRef font = CTFontCreateWithName((__bridge CFStringRef)font_name, size, &shear);
     NSDictionary *attrs = @{(id)kCTFontAttributeName : (__bridge id)font, (id)kCTKernAttributeName : @(kern),
                             (id)kCTForegroundColorFromContextAttributeName : @YES};
-    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)[[NSAttributedString alloc] initWithString:s attributes:attrs]);
+    NSMutableAttributedString *str = [[NSMutableAttributedString alloc] initWithString:s attributes:attrs];
+    if (small_caps) {
+        CTFontRef small = CTFontCreateWithName((__bridge CFStringRef)font_name, size * 0.76, &shear);
+        NSCharacterSet *lower = NSCharacterSet.lowercaseLetterCharacterSet;
+        for (NSUInteger i = 0; i < s.length; i++) {
+            if (![lower characterIsMember:[s characterAtIndex:i]]) continue;
+            NSRange r = NSMakeRange(i, 1);
+            [str replaceCharactersInRange:r withString:[s substringWithRange:r].uppercaseString];
+            [str addAttribute:(id)kCTFontAttributeName value:(__bridge id)small range:r];
+        }
+        CFRelease(small);
+    }
+    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)str);
     if (fit > 0 && CTLineGetTypographicBounds(line, NULL, NULL, NULL) > fit) {
         CTLineRef dots = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)[[NSAttributedString alloc] initWithString:@"…" attributes:attrs]);
         CTLineRef cut = CTLineCreateTruncatedLine(line, fit, kCTLineTruncationEnd, dots);
@@ -221,7 +235,7 @@ static CGPoint place(CTLineRef line, box b, int align, CGFloat size) {
 }
 
 static void text(CGContextRef c, NSString *s, NSString *font, CGFloat size, box b, int align, CGColorRef colour) {
-    CTLineRef line = text_line(s, font, size, 0, false, b.w);
+    CTLineRef line = text_line(s, font, size, 0, false, b.w, false);
     CGPoint at = place(line, b, align, size);
     CGContextSetTextDrawingMode(c, kCGTextFill);
     CGContextSetFillColorWithColor(c, colour);
@@ -233,7 +247,7 @@ static void text(CGContextRef c, NSString *s, NSString *font, CGFloat size, box 
 // Chrome lettering, as the Vaporwave scene's name: a cyan glow, a gradient of cyan floor, purple
 // horizon and silver sky inside the letters, and a bright rim.
 static void chrome(CGContextRef c, NSString *s, CGFloat size, box b, int align) {
-    CTLineRef line = text_line(s, @"Futura-CondensedExtraBold", size, size * 0.03, true, b.w);
+    CTLineRef line = text_line(s, @"Futura-CondensedExtraBold", size, size * 0.03, true, b.w, true);
     CGPoint at = place(line, b, align, size);
     CGRect ink = CTLineGetImageBounds(line, c);
     ink.origin.x += at.x;
@@ -291,7 +305,7 @@ static void rule(CGContextRef c, CGFloat y) {
 // then its percentage. Returns where the next thing goes.
 static CGFloat battery(CGContextRef c, NSString *label, float level, bool charging, CGFloat x, CGFloat y) {
     CGFloat size = 42;
-    CTLineRef l = text_line(label, @"AvenirNext-DemiBold", size, 1, false, 0);
+    CTLineRef l = text_line(label, @"AvenirNext-DemiBold", size, 1, false, 0, false);
     CGFloat lw = CTLineGetTypographicBounds(l, NULL, NULL, NULL);
     CFRelease(l);
     text(c, label, @"AvenirNext-DemiBold", size, (box){x, y, lw + 4, 60}, 0, CYAN(1));
@@ -459,7 +473,7 @@ static id<MTLTexture> draw_picture(void) {
     }
     rule(c, 665);
     text(c, @"Press the system button to close", @"AvenirNext-Medium", 36, (box){80, 860, 900, 60}, 0, SILVER(0.55));
-    chrome(c, @"MACVAPOR", 48, (box){1100, 855, 420, 70}, 2);
+    chrome(c, @"MacVapoR", 48, (box){1100, 855, 420, 70}, 2);
 
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
                                                                                  width:CW height:CH mipmapped:YES];
