@@ -45,7 +45,7 @@ run_parity() {
     echo "   server: $(tail -1 "$scratch/server.txt"), commonest fill:$sf"
     echo "   legacy: $(tail -1 "$scratch/legacy.txt"), commonest fill:$lf"
     grep -q " 0 release violations" "$scratch/server.out" || fail "release violations in the server run"
-    "$bin" compare "$scratch/server.hevc" "$scratch/legacy.hevc" | tee "$scratch/compare.txt"
+    "$bin" compare "$scratch/server.hevc" "$scratch/legacy.hevc" "$scratch/server.txt" "$scratch/legacy.txt" | tee "$scratch/compare.txt"
     # The pictures are identical before encoding; the hardware encoder's rate control is not
     # deterministic frame for frame, so a few levels of difference are noise.
     awk '{max=$(NF-4) + 0; mean=$NF} END {exit !(max <= 24 && mean < 1.0)}' "$scratch/compare.txt" \

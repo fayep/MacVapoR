@@ -329,15 +329,46 @@ static FILE *decode(const char *file, int *W, int *H) {
     return popen(cmd, "r");
 }
 
-static int run_compare(const char *fa, const char *fb) {
+// The frame numbers dumpcheck read from each decoded frame's bars, in order.
+static int read_bars(const char *txt, int out[], int max) {
+    FILE *f = fopen(txt, "r");
+    int n = 0, idx, bars;
+    char line[512];
+    while (f && n < max && fgets(line, sizeof line, f))
+        if (sscanf(line, "frame %d", &idx) == 1 && strstr(line, "bars ") && sscanf(strstr(line, "bars ") + 5, "%d", &bars) == 1)
+            out[n++] = bars;
+    if (f) fclose(f);
+    return n;
+}
+
+// Pairs the frames by the number drawn into them: the compositor may take the newer of two
+// frames that arrive together, so one stream can be missing a few.
+static int run_compare(const char *fa, const char *fb, const char *ta, const char *tb) {
     int wa, ha, wb, hb;
     FILE *a = decode(fa, &wa, &ha), *b = decode(fb, &wb, &hb);
     if (wa != wb || ha != hb) { printf("sizes differ: %dx%d vs %dx%d\n", wa, ha, wb, hb); return 1; }
+    static int bars_a[4096], bars_b[4096];
+    int na = ta ? read_bars(ta, bars_a, 4096) : 0, nb = tb ? read_bars(tb, bars_b, 4096) : 0;
     size_t n = (size_t)wa * ha * 3;
     uint8_t *fa_ = malloc(n), *fb_ = malloc(n);
-    int frames = 0, worst = 0;
+    int frames = 0, worst = 0, ia = 0, ib = 0;
     double mean_sum = 0;
-    while (fread(fa_, 1, n, a) == n && fread(fb_, 1, n, b) == n) {
+    bool have_b = false;   // fb_ holds a frame of b not yet compared, numbered got
+    int got = -1;
+    while (fread(fa_, 1, n, a) == n) {
+        int want = ia < na ? bars_a[ia] : -1;
+        ia++;
+        bool ended = false;
+        while (!have_b || (want >= 0 && got < want)) {
+            if (fread(fb_, 1, n, b) != n) { ended = true; break; }
+            got = ib < nb ? bars_b[ib] : -1;
+            ib++;
+            have_b = true;
+            if (want < 0) break;
+        }
+        if (ended) break;
+        if (want >= 0 && got != want) continue;   // b lacks this one
+        have_b = false;
         int max = 0;
         double sum = 0;
         for (size_t i = 0; i < n; i++) { int d = abs(fa_[i] - fb_[i]); sum += d; if (d > max) max = d; }
@@ -375,7 +406,7 @@ int main(int argc, char **argv) {
         g_t0 = axr_now_ns();
         setvbuf(stdout, NULL, _IOLBF, 0);
         const char *mode = argv[1];
-        if (!strcmp(mode, "compare") && argc > 3) return run_compare(argv[2], argv[3]);
+        if (!strcmp(mode, "compare") && argc > 3) return run_compare(argv[2], argv[3], argc > 5 ? argv[4] : NULL, argc > 5 ? argv[5] : NULL);
         if (!strcmp(mode, "stripe") && argc > 2) return run_stripe(argv[2]);
         if (!getenv("ALVRXR_CONFIG_DIR") || !getenv("ALVRXR_DUMP")) { fprintf(stderr, "set ALVRXR_CONFIG_DIR (scratch) and ALVRXR_DUMP\n"); return 2; }
         axr_backend_start();
