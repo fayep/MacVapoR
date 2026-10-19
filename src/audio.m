@@ -273,10 +273,14 @@ void axr_audio_remove_source(axr_audio_source *src) {
     atomic_store(&src->removing, true);
 }
 
+static axr_audio_source *g_local;   // this process's own: the lounge's, which the compositor fades
+
 void axr_audio_start(void) {
     if (!axr_audio_available()) {
         axr_log("audio: MacVapoR Audio is not installed; no game audio");
         return;
     }
-    if (axr_audio_add_source(getpid())) axr_log("audio: MacVapoR Audio taps the game");
+    if ((g_local = axr_audio_add_source(getpid()))) axr_log("audio: MacVapoR Audio taps the game");
 }
+
+axr_audio_source *axr_audio_local_source(void) { return g_local; }

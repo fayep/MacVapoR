@@ -5,6 +5,7 @@
 // publishes tracking and input into shared memory, which tracking.m reads.
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __OBJC__
@@ -52,6 +53,7 @@ typedef struct axr_audio_source axr_audio_source;
 axr_audio_source *axr_audio_add_source(pid_t pid);   // NULL if there's no helper or no room
 void axr_audio_set_gain(axr_audio_source *src, float gain);
 void axr_audio_remove_source(axr_audio_source *src);   // src is gone after this
+axr_audio_source *axr_audio_local_source(void);        // the one axr_audio_start added (NULL if none)
 bool axr_backend_connected(void);
 bool axr_fake_tracking(void);       // tune.json fake_tpose, with no client: report the head as tracked
 // The aim pose in the controller's (grip) frame: tune.json "aim_yaw", "aim_pitch" and "aim_roll"
@@ -92,4 +94,23 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
 
 // A 2D texture as a one-slice 2D array view (cached), so shaders can take either.
 id<MTLTexture> axr_array_view(id<MTLTexture> t);
+
+// SERVER mode (compositor.m): a source's frame as its descriptor gives it, in its output slot.
+typedef struct {
+    id<MTLTexture> texture;    // the slot: both eyes, left in the left half
+    axr_pose head;             // the head pose it was drawn for
+    uint64_t client_ts;
+    int64_t display_time;
+} axr_compose_frame;
+// Blends fg over other (reprojected for the turn between their head poses; none if NULL) at alpha
+// (fg's weight) on vapord's own queue, applies FFR and encodes the result for fg's time exactly as
+// axr_submit does. done runs when the GPU has finished reading the textures; false (and no done)
+// when the frame was dropped: not ready, or 2 already in flight.
+bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, float alpha, void (^done)(void));
+#endif
+// The global region's writable fd (-1 before axr_backend_start); axr_shm_readonly_fd takes it.
+int axr_shm_global_fd(void);
+// The compositor's part of the 5 s stats line, " | compositor: ..." or "" when it isn't running.
+void axr_compositor_stats(char *buf, size_t n);
+#ifdef __OBJC__
 #endif
