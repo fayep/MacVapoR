@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs scenarios against the runtime with no headset, checking what ends up in the encoded stream.
-#   tests/headless.sh single|handover|crash|two-clients [--runtime PATH] [--keep]
+#   tests/headless.sh single|handover|crash|two-clients [--runtime PATH] [--keep]   (handover: tests/compositor-check.sh)
 # Always runs with a scratch ALVRXR_CONFIG_DIR and ALVRXR_DUMP (see docs/compositor.md, "Testing
 # without a headset"); never uses the real config, never installs, never starts vapord.
 set -eu
@@ -94,13 +94,19 @@ single)
     [ $ok -eq 1 ] && echo "PASS: decoded fill $fill and quad $other match what the client drew"
     [ $ok -eq 1 ]
     ;;
-handover|crash|two-clients)
-    # STUB. Needs the compositor (vapord honouring ALVRXR_CONFIG_DIR, other packages):
-    #   handover:    start out/vapord against the scratch dir, then a client with --exit-after, checking the
-    #                dump shows home, the client's colour fading in, then home again fading out.
+handover)
+    # The compositor core in one process, the lounge and a game driven through the slot protocol
+    # (tests/compositor-check.sh): parity with LEGACY, the cross-fades both ways, the watchdog,
+    # reprojection. End to end through vapord and XPC needs vapord to honour ALVRXR_CONFIG_DIR (WP6).
+    cleanup   # compositor-check.sh makes its own scratch dir; exec skips the trap
+    trap - EXIT
+    exec "$here/compositor-check.sh" all ${keep:+--keep}
+    ;;
+crash|two-clients)
+    # STUB. Needs vapord honouring ALVRXR_CONFIG_DIR:
     #   crash:       a client with --crash-after, checking the stream falls back to home with no black frames.
     #   two-clients: two clients with different --color, checking only the focused one's colour is encoded.
-    echo "scenario '$scenario' is not implemented yet: it needs the compositor and vapord's ALVRXR_CONFIG_DIR" >&2
+    echo "scenario '$scenario' is not implemented yet: it needs vapord's ALVRXR_CONFIG_DIR" >&2
     exit 3
     ;;
 *) echo "usage: $0 single|handover|crash|two-clients [--runtime PATH] [--keep]" >&2; exit 2 ;;
