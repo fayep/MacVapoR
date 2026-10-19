@@ -168,3 +168,27 @@ ALVRXR_DUMP stream, prints per-frame colours and the frame number read from xrcl
 `tests/headless.sh single` runs one client end to end with a scratch config dir. The handover,
 crash and two-clients scenarios are stubs until the compositor exists. Anything about feel is
 checked in the headset.
+
+## Dashboard
+
+Holding the right controller's system button (the PS VR2 right Options button, which the
+visionOS client sends as system) for 0.5 s opens a panel over whatever is running, like SteamVR's
+dashboard; pressing it again closes it. The system button never reaches games.
+
+- The compositor watches the button itself (server side, from the published buttons), since the
+  lounge has no input focus while a game runs. Open: `dashboard = 1` in every source's session
+  region; the lounge becomes FOCUSED with `should_render = 1`, the foreground game VISIBLE (it
+  keeps drawing, gets no input).
+- Composing while open: the game dimmed (to ~35%) with the lounge's slot drawn over it with its
+  alpha (premultiplied). The lounge, with `dashboard` set, draws only the panel and its pointer,
+  over transparency (alpha 0 elsewhere). With no game, the lounge draws its scene behind the panel
+  as usual (alpha 1).
+- The panel is world-locked: placed ~1 m ahead at eye height, facing the user, when it opens; it
+  doesn't follow the head. A laser from either controller's aim pose, or a hand's pinch ray,
+  points at it; trigger or pinch presses.
+- Contents: height (standing / seated at an eye height, set from where the head is now, nudged
+  ±5 cm), recenter, quit the game (when one is foreground), and a status line (game name,
+  battery, stream fps/bitrate).
+- vapord drives it through the private functions in alvrxr_ext.h. Quit sets the game's
+  `exit_request`; its runtime goes VISIBLE → SYNCHRONIZED → STOPPING as for
+  xrRequestExitSession, and the compositor fades back to the lounge as the session ends.

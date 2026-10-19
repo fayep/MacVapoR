@@ -63,6 +63,9 @@ typedef struct {
     uint32_t nfake_press;
     struct { uint64_t id; float value; uint32_t _pad; } buttons[AXR_MAX_BUTTONS];
     uint64_t fake_press[AXR_MAX_FAKE_PRESS];   // alvr_path_to_id of tune.json fake_press paths
+    float battery[AXR_DEVICE_COUNT];           // 0..1, -1 unknown (ALVR_EVENT_BATTERY)
+    uint8_t charging[AXR_DEVICE_COUNT];
+    float stream_fps, stream_mbps;             // over the last stats period
 
     // ---- tracking ring (per-slot seqlocks)
     _Atomic uint32_t sample_word;   // bumped (and woken) on every sample: wait on this
@@ -93,6 +96,9 @@ typedef struct {
     _Atomic uint32_t focus;         // compositor writes: AXR_FOCUS_*
     _Atomic uint32_t should_render; // compositor writes: 0 lets the session idle
     _Atomic uint32_t closing;       // compositor writes: 1 = the compositor is going away
+    _Atomic uint32_t dashboard;     // compositor writes: 1 = the dashboard is open (the lounge
+                                    // draws the panel over transparency; games just lose focus)
+    _Atomic uint32_t exit_request;  // compositor writes: 1 = end the session, as xrRequestExitSession
     _Atomic uint64_t heartbeat_ns;  // runtime writes, each xrWaitFrame
     _Atomic uint64_t frame_head;    // runtime writes: seq of the newest descriptor
     axr_frame_desc frames[AXR_FRAME_RING];   // runtime writes frames[seq % RING] before seq
