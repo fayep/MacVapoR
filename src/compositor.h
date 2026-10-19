@@ -53,6 +53,9 @@ bool axr_slots_should_render(const axr_slots *s);
 
 // Haptics go to the compositor in CLIENT mode, to ALVR otherwise (axr_haptics does this).
 
+// The compositor went away and didn't come back: the session reports LOSS_PENDING (runtime.m).
+void axr_session_loss_pending(void);
+
 // ------------------------------------------------------------------------------ vapord side
 // The core (compositor.m, WP4) and the transport (XPC, WP5) meet here.
 
@@ -73,4 +76,8 @@ MTLSharedEventHandle *axr_source_release_event(axr_source *src);   // compositor
 int axr_source_session_fd(axr_source *src);
 // The source has gone (XPC invalidated, process exited, session ended): fade out and free.
 void axr_compositor_remove_source(axr_source *src);
+
+// Serves the XPC protocol (axr_ipc.h) on AXR_COMPOSITOR_SERVICE (transport.m). The runtime calls
+// it after axr_compositor_start when it is SERVER.
+void axr_transport_start(void);
 #endif

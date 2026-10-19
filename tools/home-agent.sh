@@ -24,6 +24,7 @@ install)
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>2</integer>
+    <key>MachServices</key><dict><key>com.zippysoft.macvapor.compositor</key><true/></dict>
     <key>ProcessType</key><string>Interactive</string>
     <key>StandardErrorPath</key><string>$HOME/Library/Logs/vapord.log</string>
 </dict>

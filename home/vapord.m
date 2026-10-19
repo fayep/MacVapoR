@@ -878,14 +878,21 @@ int main(int argc, char **argv) {
         [NSFileManager.defaultManager createDirectoryAtPath:g_config_dir withIntermediateDirectories:YES attributes:nil error:nil];
         g_pid_path = [g_config_dir stringByAppendingPathComponent:@"home.pid"];
 
-        // A game holding the headset keeps it until it ends.
-        for (pid_t game; (game = pid_in(@"claim.pid")) > 0 && game != getpid() && kill(game, 0) == 0;) sleep(2);
+        // With the compositor (tune.json "compositor": true; the runtime makes vapord its SERVER from
+        // the same flag) games draw through vapord, which keeps the headset: no claims to wait out
+        // or to exit for. Without it, a game holding the headset keeps it until it ends.
+        NSData *tune_json = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
+        NSDictionary *tune = tune_json ? [NSJSONSerialization JSONObjectWithData:tune_json options:0 error:nil] : nil;
+        id compositor_flag = [tune isKindOfClass:NSDictionary.class] ? tune[@"compositor"] : nil;
+        bool compositor = [compositor_flag respondsToSelector:@selector(boolValue)] && [compositor_flag boolValue];
+        if (!compositor)
+            for (pid_t game; (game = pid_in(@"claim.pid")) > 0 && game != getpid() && kill(game, 0) == 0;) sleep(2);
 
         [[NSString stringWithFormat:@"%d\n", getpid()] writeToFile:g_pid_path atomically:YES
                                                          encoding:NSUTF8StringEncoding error:nil];
         int token;
         // A scratch run must not exit when a real game claims the real headset, and posts no claim itself.
-        if (!(cfg_env && *cfg_env))
+        if (!(cfg_env && *cfg_env) && !compositor)
         notify_register_dispatch("com.zippysoft.macvapor.claim", &token, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
                                  ^(int t) {
                                      (void)t;

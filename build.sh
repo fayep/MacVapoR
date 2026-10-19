@@ -28,7 +28,7 @@ codesign -f -s - "$out/libalvr_server_core.dylib" 2>/dev/null
     > "$here/build/compose_metal.h"
 clang -dynamiclib -mmacosx-version-min="$MIN_VER" -fobjc-arc -O2 -g -Wall -Wno-unused-function -fvisibility=hidden \
     -I "$here/src" -I "$here/build" -I "$OPENXR/build/include" -I /opt/homebrew/include \
-    "$here/src/runtime.m" "$here/src/slots.m" "$here/src/backend.m" "$here/src/vulkan.m" "$here/src/audio.m" \
+    "$here/src/runtime.m" "$here/src/slots.m" "$here/src/client.m" "$here/src/transport.m" "$here/src/pending.m" "$here/src/backend.m" "$here/src/vulkan.m" "$here/src/audio.m" \
     -framework Foundation -framework Metal -framework CoreVideo -framework CoreMedia -framework VideoToolbox -framework ImageIO -framework CoreGraphics -framework CoreAudio -framework IOSurface \
     -L "$out" -lalvr_server_core -Wl,-rpath,@loader_path \
     -install_name @rpath/libalvrxr.dylib -o "$out/libalvrxr.dylib"
