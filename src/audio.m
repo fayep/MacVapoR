@@ -34,6 +34,9 @@ extern char **environ;
 
 struct axr_audio_source {
     char name[64];
+    pid_t pid;
+    int refs;   // under g_lock: a game's sessions share its one source, ring and helper
+    bool orphan;   // under g_lock: no session left, kept, silent, until its process exits
     axr_audio_ring *ring;
     _Atomic float target;
     _Atomic bool removing;
@@ -187,6 +190,8 @@ static void *mixer(void *arg) {
             axr_audio_source *s = g_sources[i];
             int j = 0;
             while (j < count && src[j] != s) j++;
+            // A helper taps its process until that exits, so the source and ring stay until then.
+            if (s->orphan && kill(s->pid, 0) != 0) atomic_store(&s->removing, true);
             bool quiet = j == count || !s->started || s->gain == 0 || (!live[j] && avail[j] <= total);
             if (atomic_load(&s->removing) && quiet) {
                 gone[ngone++] = s;
@@ -210,7 +215,21 @@ static void start_mixer(void) {
 
 axr_audio_source *axr_audio_add_source(pid_t pid) {
     if (!no_helper() && !axr_audio_available()) return NULL;
+    // A game opens several sessions (OpenComposite's probes, then the real one): one helper may
+    // tap it, and another ring under the same name would leave that helper writing unheard.
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_count; i++) {
+        axr_audio_source *o = g_sources[i];
+        if (o->pid != pid || atomic_load(&o->removing)) continue;
+        o->refs++;
+        o->orphan = false;
+        pthread_mutex_unlock(&g_lock);
+        return o;
+    }
+    pthread_mutex_unlock(&g_lock);
     axr_audio_source *s = calloc(1, sizeof *s);
+    s->pid = pid;
+    s->refs = 1;
     const char *prefix = getenv("ALVRXR_AUDIO_RING_PREFIX");
     if (prefix) snprintf(s->name, sizeof s->name, "%s%d", prefix, pid);
     else snprintf(s->name, sizeof s->name, AXR_AUDIO_RING_NAME_FORMAT, pid);
@@ -254,7 +273,8 @@ axr_audio_source *axr_audio_add_source(pid_t pid) {
         pid_t child;
         if (posix_spawn(&child, "/usr/bin/open", NULL, NULL, args, environ) != 0) {
             axr_log("audio: could not start MacVapoR Audio");
-            axr_audio_remove_source(s);   // silent, so the mixer lets it go at once
+            atomic_store(&s->target, 0.0f);   // silent, so the mixer lets it go at once
+            atomic_store(&s->removing, true);
             return NULL;
         }
     }
@@ -265,12 +285,18 @@ void axr_audio_set_gain(axr_audio_source *src, float gain) {
     if (src) atomic_store(&src->target, fmaxf(0.0f, fminf(1.0f, gain)));
 }
 
-// The mixer fades it out and lets it go. The helper exits with its process; while that lives on,
-// the helper keeps tapping into the ring it has mapped, unheard, and the process stays muted.
+// When a process's last session goes, its source falls silent and stays, with its ring, until the
+// process exits, as its helper does; a new session for it takes the same source back.
 void axr_audio_remove_source(axr_audio_source *src) {
     if (!src) return;
+    pthread_mutex_lock(&g_lock);
+    bool last = --src->refs <= 0;
+    // Tests' rings have no helper and no process to outlive: they go at once.
+    if (last && !no_helper()) src->orphan = true;
+    pthread_mutex_unlock(&g_lock);
+    if (!last) return;
     atomic_store(&src->target, 0.0f);
-    atomic_store(&src->removing, true);
+    if (no_helper()) atomic_store(&src->removing, true);
 }
 
 static axr_audio_source *g_local;   // this process's own: the lounge's, which the compositor fades
