@@ -72,5 +72,6 @@ if [ -n "$variant" ]; then
     for f in libalvrxr.dylib libalvr_server_core.dylib vapord; do
         cp "$out/$f" "$dest/.$f.new" && mv -f "$dest/.$f.new" "$dest/$f"
     done
+    rm -rf "$dest/scenes.new" && cp -R "$out/scenes" "$dest/scenes.new" && rm -rf "$dest/scenes" && mv "$dest/scenes.new" "$dest/scenes"
     echo "installed into $dest (choose it with tools/runtime-switch.sh $variant)"
 fi

@@ -167,8 +167,11 @@ static NSString *chosen_scene_dir(void) {
     NSData *json = [NSData dataWithContentsOfFile:[support_dir() stringByAppendingPathComponent:@"home.json"]];
     NSDictionary *home = json ? dict_or_empty([NSJSONSerialization JSONObjectWithData:json options:0 error:nil]) : @{};
     NSString *chosen = [home[@"scene"] isKindOfClass:NSString.class] ? home[@"scene"] : @"vaporwave";
+    // A runtime variant (tools/runtime-switch.sh) carries its own scenes beside vapord.
+    NSString *beside = [NSBundle.mainBundle.executablePath.stringByDeletingLastPathComponent
+                           stringByAppendingPathComponent:@"scenes"];
     NSArray *roots = @[[support_dir() stringByAppendingPathComponent:@"scenes"],
-                       [support_dir() stringByAppendingPathComponent:@"runtime/scenes"]];
+                       [support_dir() stringByAppendingPathComponent:@"runtime/scenes"], beside];
     for (NSString *name in @[chosen, @"vaporwave"]) {
         if ([name containsString:@"/"] || [name hasPrefix:@"."]) continue;
         for (NSString *root in roots) {
