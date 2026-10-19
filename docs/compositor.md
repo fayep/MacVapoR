@@ -27,6 +27,16 @@ keys) over the string, touching no server state, so it needs neither `alvr_initi
 `alvr_initialize_environment`, and the same dylib gives every process the same ids. tracking.m
 relies on this: the ids in the header (`buttons`, `fake_press`) are matched against it.
 
+How it starts (runtime.m `start_for_mode`, slots.m `axr_mode_init`). Without the flag ALVR still
+starts at `xrCreateInstance`, as at the tag. With it, `xrGetSystem` decides: SERVER starts ALVR,
+then `axr_compositor_start` and the XPC listener (`axr_transport_start`); a CLIENT's `hello`
+there maps the global region and attaches tracking, and its session is opened lazily, by
+`axr_slots_open` at `xrCreateSession`. The graphics API isn't known at `xrGetSystem`, so a Vulkan
+`xrCreateSession` in a CLIENT calls `axr_mode_force_legacy` (drops the connection, detaches
+tracking) and starts ALVR then: the game runs LEGACY. vapord reads the same flag itself and,
+with it, neither waits out claims nor exits on one. `ALVRXR_COMPOSITOR_SERVICE` overrides the
+Mach service name, for tests.
+
 ## Shared memory (axr_shm.h)
 
 Two kinds of region, created by vapord with `shm_open` + `shm_unlink` and passed as fds.

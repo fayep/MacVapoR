@@ -242,6 +242,8 @@ final class Model: ObservableObject {
                 "RunAtLoad": true,
                 "KeepAlive": true,
                 "ThrottleInterval": 2,
+                // Games reach the compositor (tune.json "compositor") through this name.
+                "MachServices": ["com.zippysoft.macvapor.compositor": true],
                 "ProcessType": "Interactive",
                 "StandardErrorPath": Paths.homeLog.path,
             ]

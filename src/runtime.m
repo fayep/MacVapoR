@@ -17,6 +17,7 @@
 
 #include "alvrxr.h"
 #include "compositor.h"
+#include "transport.h"
 #include "tracking.h"
 
 extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
@@ -311,7 +312,9 @@ static XrResult xrCreateInstance_(const XrInstanceCreateInfo *info, XrInstance *
     if (!g_paths) g_paths = [NSMutableArray array];
     pthread_mutex_unlock(&g_lock);
     axr_log("instance for \"%s\" (engine \"%s\")", info->applicationInfo.applicationName, info->applicationInfo.engineName);
-    axr_backend_start();
+    // Without the compositor flag this is LEGACY whatever happens, and ALVR starts here as it
+    // always has; with it, xrGetSystem decides (start_for_mode).
+    if (!axr_compositor_flag()) axr_backend_start();
     *out = (XrInstance)inst;
     return XR_SUCCESS;
 }
@@ -369,9 +372,24 @@ static XrResult xrConvertTimeToTimespecTimeKHR_(XrInstance h, XrTime t, struct t
 
 #define SYSTEM_ID ((XrSystemId)1)
 
+// The mode is decided at the first xrGetSystem, not at xrCreateInstance, which OpenComposite
+// calls just to probe. A CLIENT starts nothing of its own: vapord has the headset.
+static void start_for_mode(void) {
+    axr_mode m = axr_mode_init();
+    if (m == AXR_MODE_CLIENT) return;
+    axr_backend_start();
+    static dispatch_once_t once;
+    if (m == AXR_MODE_SERVER)
+        dispatch_once(&once, ^{
+            axr_compositor_start();
+            axr_transport_start();
+        });
+}
+
 static XrResult xrGetSystem_(XrInstance h, const XrSystemGetInfo *info, XrSystemId *out) {
     CHECK_HANDLE(h, instance, MAGIC_INSTANCE);
     if (info->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) return XR_ERROR_FORM_FACTOR_UNSUPPORTED;
+    start_for_mode();
     *out = SYSTEM_ID;
     return XR_SUCCESS;
 }
@@ -513,6 +531,11 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     if (binding) queue = (__bridge id<MTLCommandQueue>)binding->commandQueue;
     else if (vk) queue = axr_vk_session_queue(vk->instance, vk->device, vk->queueFamilyIndex, vk->queueIndex);
     if (!queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+    // The compositor takes Metal frames only (v1): a Vulkan game runs the headset itself.
+    if (vk && axr_mode_current() == AXR_MODE_CLIENT) {
+        axr_mode_force_legacy();
+        axr_backend_start();
+    }
     pthread_mutex_lock(&g_lock);
     if (g_session) { pthread_mutex_unlock(&g_lock); return XR_ERROR_LIMIT_REACHED; }
     session *s = calloc(1, sizeof *s);
@@ -1099,6 +1122,7 @@ static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameSt
     uint32_t focus;
     bool render;
     desired_focus(s, &focus, &render);
+    axr_slots_heartbeat(session_slots(s));
     bool visible = s->state == XR_SESSION_STATE_VISIBLE || s->state == XR_SESSION_STATE_FOCUSED;
     pthread_mutex_unlock(&g_lock);
     st->shouldRender = visible && render;
@@ -1675,6 +1699,12 @@ static XrResult xrCreateActionSpace_(XrSession h, const XrActionSpaceCreateInfo 
                                            .offset = info->poseInActionSpace}, out);
 }
 
+// A CLIENT has no ALVR of its own: vapord passes its haptics on.
+static void haptics(int hand, float duration_s, float frequency, float amplitude) {
+    if (axr_mode_current() == AXR_MODE_CLIENT) axr_client_haptics(hand, duration_s, frequency, amplitude);
+    else axr_haptics(hand, duration_s, frequency, amplitude);
+}
+
 static XrResult xrApplyHapticFeedback_(XrSession h, const XrHapticActionInfo *info, const XrHapticBaseHeader *hap) {
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     CHECK_HANDLE(info->action, action, MAGIC_ACTION);
@@ -1690,7 +1720,7 @@ static XrResult xrApplyHapticFeedback_(XrSession h, const XrHapticActionInfo *in
     for (NSString *b in a->bindings) {
         int bu = sub_of(b);
         if (u != SUB_NONE && bu != u) continue;
-        axr_haptics(bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT, duration, freq, vib->amplitude);
+        haptics(bu == SUB_LEFT ? AXR_LEFT : AXR_RIGHT, duration, freq, vib->amplitude);
     }
     return XR_SUCCESS;
 }
@@ -1699,7 +1729,7 @@ static XrResult xrStopHapticFeedback_(XrSession h, const XrHapticActionInfo *inf
     CHECK_HANDLE(h, session, MAGIC_SESSION);
     CHECK_HANDLE(info->action, action, MAGIC_ACTION);
     action *a = (action *)info->action;
-    for (NSString *b in a->bindings) axr_haptics(sub_of(b) == SUB_LEFT ? AXR_LEFT : AXR_RIGHT, 0, 160, 0);
+    for (NSString *b in a->bindings) haptics(sub_of(b) == SUB_LEFT ? AXR_LEFT : AXR_RIGHT, 0, 160, 0);
     return XR_SUCCESS;
 }
 
