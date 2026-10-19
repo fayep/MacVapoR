@@ -141,7 +141,14 @@ Rules for test runs, because Faye's real lounge is running on this machine:
 - Never run vapord against the real config dir: until WP6 makes it honour `ALVRXR_CONFIG_DIR`
   (vapord.m:873) it writes the live home.pid. Never call runtime-switch.sh, never install a
   variant, never touch launchd, the OpenXR manifest or MacVapoR's folders: the lead does that.
-- `alvr_initialize` starts ALVR's web server on session.json's `web_server_port` (8082), which the
-  real vapord holds; a scratch config dir's session.json must use another port (e.g. 18082).
- tests/xrclient and tests/headless.sh (WP3) drive sources and check the decoded
-frames' colours and fade. Anything about feel is checked in the headset.
+- ALVR's web server may start on session.json's `web_server_port` (8082), which the real vapord
+  holds: give a scratch config dir's session.json another port (e.g. 18082). headless.sh copies
+  macvapor/session-template.json, so prepare_session doesn't borrow the real one.
+
+tests/ drives sources and checks the decoded frames' colours and fade (ffmpeg decodes):
+`tests/build.sh` builds `xrclient` (a Metal client: `--color`, `--quad`, `--black-first`,
+`--stall-after`, `--exit-after`, `--crash-after`, `--format`) and `dumpcheck` (decodes an
+ALVRXR_DUMP stream, prints per-frame colours and the frame number read from xrclient's bar row);
+`tests/headless.sh single` runs one client end to end with a scratch config dir. The handover,
+crash and two-clients scenarios are stubs until the compositor exists. Anything about feel is
+checked in the headset.
