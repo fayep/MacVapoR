@@ -27,7 +27,9 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/alvrxr-headless.XXXXXX")
 cleanup() { if [ -n "$keep" ]; then echo "kept $scratch"; else rm -rf "$scratch"; fi; }
 trap cleanup EXIT
 # prepare_session (backend.m) otherwise borrows the spike's session from the real home directory.
-cp "$repo/macvapor/session-template.json" "$scratch/session.json"
+# On its own web server port: 8082 belongs to the real vapord, and ALVR panics in a loop (filling
+# session_log.txt by hundreds of MB a second) when it can't bind.
+sed 's/"web_server_port": 8082/"web_server_port": 18082/' "$repo/macvapor/session-template.json" > "$scratch/session.json"
 export ALVRXR_CONFIG_DIR=$scratch
 
 # summarize DUMPCHECK_OUTPUT: frames, the colours in order with their frame ranges, and gaps in the numbers.
