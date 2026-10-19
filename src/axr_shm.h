@@ -56,6 +56,8 @@ typedef struct {
     uint32_t recenter_gen;          // as axr_recenter_generation()
     axr_views views;                // with tune.json ipd_scale, fov_scale, swap_eyes applied
     axr_pose aim[2];                // axr_aim_offset(AXR_LEFT), (AXR_RIGHT)
+    axr_pose world;                 // recentering: every tracked pose p becomes world * p (a turn
+                                    // about Y, then a move); zero quaternion = none
     axr_pose grip[2];               // a turn applied to each controller's pose in its own frame
                                     // (tune.json grip_pitch/yaw/roll); zero quaternion = none
     float height_offset;            // seated raise in metres, valid when height_offset_set

@@ -717,6 +717,10 @@ static void clear_samples(void);
 
 // Bumped when the user asks to recenter: the visionOS client syncs its playspace when the Digital
 // Crown is held (with "keep SteamVR center" off, its default) and expects the server to recenter.
+// Recentering turns and moves the whole tracked world, as SteamVR's does, so every app (the lounge
+// and STAGE-space games included, not only LOCAL space) has the user at the origin facing -Z.
+static axr_pose g_world = {{0, 0, 0, 1}, {0, 0, 0}};
+static void recenter(const char *why);
 static _Atomic uint32_t g_recenter_generation;   // the dashboard bumps it from vapord's render thread too
 static uint32_t g_config_gen;   // bumped when ALVR restarts (the stream, and so the eye size, may change)
 
@@ -783,9 +787,7 @@ static void *event_thread(void *arg) {
                 axr_log("headset connected");
                 break;
             case ALVR_EVENT_PLAYSPACE_SYNC:
-                g_recenter_generation++;
-                axr_publish_state();
-                axr_log("recenter requested");
+                recenter("Digital Crown");
                 break;
             case ALVR_EVENT_CLIENT_DISCONNECTED:
                 pthread_mutex_lock(&g_lock);
@@ -1415,6 +1417,7 @@ void axr_publish_state(void) {
     g->views = current_views();
     g->aim[0] = aim_offset(AXR_LEFT);
     g->aim[1] = aim_offset(AXR_RIGHT);
+    g->world = g_world;
     g->grip[0] = grip_turn(AXR_LEFT);
     g->grip[1] = grip_turn(AXR_RIGHT);
     g->height_offset = g_height_offset;
@@ -1442,10 +1445,48 @@ void axr_publish_state(void) {
 // compositor side is compositor.m. These run on vapord's render thread, under g_lock with the
 // event thread, which is why axr_publish_state takes it.
 
-void axr_server_recenter(void) {
+// The newest head pose the headset sent (as tracked, before any recentering), false with none.
+static bool newest_head_pose(axr_pose *out);
+
+
+static void recenter(const char *why) {
+    axr_pose head;
+    if (newest_head_pose(&head)) {
+        quat q = {head.orientation[0], head.orientation[1], head.orientation[2], head.orientation[3]};
+        float fwd[3], minus_z[3] = {0, 0, -1};
+        qrot3(q, minus_z, fwd);
+        float yaw = atan2f(-fwd[0], -fwd[2]);   // the turn about Y that takes -Z to where the head faces
+        quat r = {0, sinf(-yaw / 2), 0, cosf(-yaw / 2)};
+        float at[3] = {head.position[0], 0, head.position[2]}, moved[3];
+        qrot3(r, at, moved);
+        pthread_mutex_lock(&g_lock);
+        g_world = (axr_pose){{r.x, r.y, r.z, r.w}, {-moved[0], 0, -moved[2]}};
+        pthread_mutex_unlock(&g_lock);
+        axr_log("recenter (%s): turned %.0f deg, moved (%.2f, %.2f) m", why, -yaw * 180 / (float)M_PI, -at[0], -at[2]);
+    } else {
+        axr_log("recenter (%s): no head pose yet", why);
+    }
     g_recenter_generation++;
     axr_publish_state();
-    axr_log("recenter requested (dashboard)");
+}
+
+void axr_server_recenter(void) { recenter("dashboard"); }
+
+static bool newest_head_pose(axr_pose *out) {
+    axr_shm_global *g = g_shm;
+    if (!g) return false;
+    uint64_t head = atomic_load_explicit(&g->sample_head, memory_order_acquire);
+    if (!head) return false;
+    axr_shm_sample *slot = &g->samples[(head - 1) % AXR_SAMPLE_RING];
+    axr_shm_sample s;
+    uint32_t seq;
+    do {
+        seq = axr_seq_read_begin(&slot->seq);
+        s = *slot;
+    } while (!axr_seq_read_ok(&slot->seq, seq));
+    if (!s.ts || !s.dev[AXR_HEAD].valid) return false;
+    *out = s.dev[AXR_HEAD].pose;
+    return true;
 }
 
 // The newest head position the headset sent, false while there is none.

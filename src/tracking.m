@@ -54,6 +54,7 @@ typedef struct {
     axr_views views;
     axr_pose aim[2];
     axr_pose grip[2];
+    axr_pose world;
     float height_offset, eye_height;
     uint64_t input_gen;
 } header;
@@ -96,6 +97,7 @@ static bool read_header(header *h) {
         h->views = g->views;
         h->aim[0] = g->aim[0];
         h->aim[1] = g->aim[1];
+        h->world = g->world;
         h->grip[0] = g->grip[0];
         h->grip[1] = g->grip[1];
         h->height_offset = g->height_offset;
@@ -306,6 +308,22 @@ static void turn_grip(axr_pose *p, const axr_pose *t) {
     memcpy(p->orientation, q, sizeof q);
 }
 
+// Recentering (header world): the pose turned about Y and moved, with its velocities turned too.
+// A zero quaternion (an older compositor that doesn't publish it) leaves it alone.
+static void apply_world(axr_pose *p, float *lin, float *ang, const axr_pose *w) {
+    const float *r = w->orientation;
+    if (r[0] == 0 && r[1] == 0 && r[2] == 0 && r[3] == 0) return;
+    simd_quatf q = simd_quaternion(r[0], r[1], r[2], r[3]);
+    simd_float3 at = simd_act(q, simd_make_float3(p->position[0], p->position[1], p->position[2]));
+    for (int i = 0; i < 3; i++) p->position[i] = at[i] + w->position[i];
+    simd_quatf o = simd_mul(q, simd_quaternion(p->orientation[0], p->orientation[1], p->orientation[2], p->orientation[3]));
+    p->orientation[0] = o.vector.x; p->orientation[1] = o.vector.y; p->orientation[2] = o.vector.z; p->orientation[3] = o.vector.w;
+    for (float *v = lin; v; v = v == lin ? ang : NULL) {
+        simd_float3 t = simd_act(q, simd_make_float3(v[0], v[1], v[2]));
+        v[0] = t.x; v[1] = t.y; v[2] = t.z;
+    }
+}
+
 axr_motion axr_device_motion(int device, int64_t time) {
     axr_motion m = {0};
     header h;
@@ -321,6 +339,7 @@ axr_motion axr_device_motion(int device, int64_t time) {
             memcpy(m.angular_velocity, s.fit_w[device == AXR_RIGHT], sizeof m.angular_velocity);
         }
         if (device != AXR_HEAD) turn_grip(&m.pose, &h.grip[device == AXR_RIGHT]);
+        apply_world(&m.pose, m.linear_velocity, m.angular_velocity, &h.world);
         if (h.eye_height > 0 && h.height_offset_set) m.pose.position[1] += h.height_offset;
         m.valid = true;
     } else if (device == AXR_HEAD) {
@@ -352,6 +371,7 @@ bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]) {
         return false;
     for (int i = 0; i < AXR_HAND_JOINTS; i++) {
         out[i] = s.skel[which][i];
+        apply_world(&out[i], NULL, NULL, &h.world);
         out[i].position[1] += raise;
     }
     return true;
