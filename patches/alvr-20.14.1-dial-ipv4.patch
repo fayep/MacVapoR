@@ -1,0 +1,49 @@
+diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
+index 6b83904..11d2936 100644
+--- a/alvr/server_core/src/connection.rs
++++ b/alvr/server_core/src/connection.rs
+@@ -372,6 +372,13 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+                 for ip in &connection_info.manual_ips {
+                     manual_client_ips.insert(*ip, hostname.clone());
+                 }
++                // A trusted client is dialled at the address it last had too, so a restarted
++                // server reaches it without waiting for its next announcement.
++                if connection_info.trusted {
++                    if let Some(ip) = connection_info.current_ip.filter(|ip| ip.is_ipv4()) {
++                        manual_client_ips.insert(ip, hostname.clone());
++                    }
++                }
+             }
+             manual_client_ips
+         };
+@@ -448,7 +455,7 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+                         Arc::clone(&lifecycle_state),
+                         [(client_ip, client_hostname.clone())].into_iter().collect(),
+                     ) {
+-                        error!("Could not initiate connection for {client_hostname}: {e}");
++                        error!("Could not initiate connection for {client_hostname} at {client_ip}: {e}");
+                     }
+                 }
+ 
+diff --git a/alvr/server_core/src/sockets.rs b/alvr/server_core/src/sockets.rs
+index 4dd7bca..4c3b926 100644
+--- a/alvr/server_core/src/sockets.rs
++++ b/alvr/server_core/src/sockets.rs
+@@ -90,7 +90,16 @@ impl WelcomeSocket {
+                         let hostname = info
+                             .get_property_val_str(alvr_sockets::MDNS_DEVICE_ID_KEY)
+                             .unwrap_or_else(|| info.get_hostname());
+-                        let address = *info.get_addresses().iter().next().to_any()?;
++                        // The client listens on IPv4 only (LOCAL_IP), and its advertisement also
++                        // lists IPv6 addresses (link-local, unscoped, so undialable): picking one
++                        // at random from the set made each connection attempt a dice roll.
++                        let address = info
++                            .get_addresses_v4()
++                            .iter()
++                            .next()
++                            .map(|a| IpAddr::V4(**a))
++                            .or_else(|| info.get_addresses().iter().find(|a| a.is_ipv4()).copied())
++                            .to_any()?;
+ 
+                         let client_protocol = info
+                             .get_property_val_str(alvr_sockets::MDNS_PROTOCOL_KEY)
