@@ -18,7 +18,9 @@ enum Paths {
     static let height = home.appending(path: "Library/Application Support/alvrxr/height.json")
     static let activeRuntime = home.appending(path: ".config/openxr/1/active_runtime.json")
     static let runner = home.appending(path: "Library/Application Support/notproton/runners/current")
-    static let steam = home.appending(path: "Library/Application Support/Steam")
+    // MACVAPOR_STEAM points everything at another Steam folder, for tests/cleanup-check.sh.
+    static let steam = ProcessInfo.processInfo.environment["MACVAPOR_STEAM"].map { URL(fileURLWithPath: $0) }
+        ?? home.appending(path: "Library/Application Support/Steam")
     static let log = home.appending(path: "Library/Logs/alvrxr.log")
     static let builtInScenes = runtime.appending(path: "scenes")
     static let userScenes = support.appending(path: "scenes")
@@ -26,11 +28,20 @@ enum Paths {
     static let homeAgentLabel = "com.zippysoft.macvapor.home"
     static let homeAgent = home.appending(path: "Library/LaunchAgents/\(homeAgentLabel).plist")
     static let homeLog = home.appending(path: "Library/Logs/vapord.log")
+    static let cleanupLog = home.appending(path: "Library/Logs/macvapor-cleanup.log")
 
     // Code is in Contents/Library, data in Contents/Resources.
     static let bundledCode = Bundle.main.bundleURL.appending(path: "Contents/Library/MacVapoR")
     static let bundledData = Bundle.main.resourceURL!
     static let bundledAudioHelper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/MacVapoR Audio.app")
+
+    /// Cleaning up runs the app's own copy of the script, which may be newer than the installed
+    /// one: the installed copy goes with the installed runtime, and an old one has no --scan.
+    static var cleanupScript: URL {
+        if let path = ProcessInfo.processInfo.environment["MACVAPOR_SETUP_SCRIPT"] { return URL(fileURLWithPath: path) }
+        let bundled = bundledData.appending(path: "notproton-vr-setup.sh")
+        return FileManager.default.fileExists(atPath: bundled.path) ? bundled : script
+    }
 }
 
 struct Headset: Identifiable {
@@ -76,6 +87,11 @@ final class Model: ObservableObject {
     @Published var scenes: [HomeScene] = []
     @Published var chosenScene = "vaporwave"
     @Published var homeEnabled = false
+    @Published var cleanupShown = false
+    @Published var cleanupScanning = false
+    @Published var cleanupGames: [Cleanup.Entry] = []
+    @Published var cleanupNotProton = Cleanup.NotProton.missing
+    @Published var cleanupResult = ""
 
     let bundleVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     var hasRunner: Bool { FileManager.default.fileExists(atPath: Paths.runner.path) }
@@ -350,27 +366,59 @@ final class Model: ObservableObject {
         busy = true
         output = ""
         Task.detached {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/sh")
-            p.arguments = args
-            p.environment = env
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = pipe
             let text: String
-            do {
-                try p.run()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-                let status = p.terminationStatus == 0 ? "" : "\n(failed, status \(p.terminationStatus))"
-                text = String(decoding: data, as: UTF8.self) + status
-            } catch {
-                text = "Could not run the setup script: \(error.localizedDescription)"
+            if let r = Cleanup.run(args, env: env) {
+                let status = r.status == 0 ? "" : "\n(failed, status \(r.status))"
+                text = r.out + r.err + status
+            } else {
+                text = "Could not run the setup script."
             }
             await MainActor.run {
                 self.output = text
                 self.busy = false
                 self.refresh()
+            }
+        }
+    }
+
+    // MARK: cleaning up old setups
+
+    func showCleanup() {
+        cleanupResult = ""
+        cleanupShown = true
+        scanForCleanup()
+    }
+
+    func scanForCleanup() {
+        cleanupScanning = true
+        cleanupGames = []
+        let games = self.games
+        Task.detached {
+            let (np, found) = Cleanup.scan(games)
+            await MainActor.run {
+                self.cleanupNotProton = np
+                self.cleanupGames = found
+                self.cleanupScanning = false
+            }
+        }
+    }
+
+    func setCleanupItem(game: String, item: String, on: Bool) {
+        guard let g = cleanupGames.firstIndex(where: { $0.id == game }),
+              let i = cleanupGames[g].items.firstIndex(where: { $0.id == item }) else { return }
+        cleanupGames[g].items[i].selected = on
+    }
+
+    func applyCleanup() {
+        let chosen = cleanupGames, np = cleanupNotProton
+        cleanupScanning = true
+        Task.detached {
+            let text = Cleanup.apply(chosen, notProton: np, log: Paths.cleanupLog)
+            await MainActor.run {
+                self.cleanupResult = text
+                self.output = text
+                self.refresh()
+                self.scanForCleanup()
             }
         }
     }
@@ -409,6 +457,154 @@ enum OpenComposite {
         let pe = Int(d[0x3C]) | Int(d[0x3D]) << 8 | Int(d[0x3E]) << 16 | Int(d[0x3F]) << 24
         guard pe + 6 < d.count, d[pe] == 0x50, d[pe + 1] == 0x45, d[pe + 4] == 0x64, d[pe + 5] == 0x86 else { return false }
         return d.range(of: Data("IVRCompositor_".utf8)) != nil
+    }
+}
+
+/// Cleaning up what Set Up left in games' folders and prefixes, through the setup script's
+/// --scan and --clean (see the script's "Cleaning up" notes for what each kind is).
+enum Cleanup {
+    enum NotProton: String {
+        /// NotProton sets VR up by itself at each launch, so per-game setups can go.
+        case zeroSetup = "zero-setup"
+        /// It still needs them; only leftovers that are junk anyway can go.
+        case old
+        case missing
+    }
+
+    struct Item: Identifiable {
+        enum Mode: String { case any, zeroSetup = "zero-setup", kept }
+        var id: String { "\(kind):\(target)" }
+        let kind: String
+        let target: String
+        let reason: String
+        let mode: Mode
+        var selected: Bool
+
+        var title: String {
+            switch kind {
+            case "oc-restore": return "Put the game's own openvr_api.dll back"
+            case "oc-ini", "orphan-ini": return "Remove opencomposite.ini"
+            case "stale-orig": return "Remove a spare openvr_api.dll.orig"
+            case "stray-backup": return "Remove a spare copy"
+            case "vr-key": return "Remove the saved VR registry key"
+            case "wineopenxr": return "Remove wineopenxr from the prefix"
+            case "khronos-runtime": return "Remove the OpenXR runtime registry value"
+            case "d3d11-override": return "Remove the DXVK d3d11 override"
+            case "d3d11-dll": return "Remove DXVK's d3d11.dll"
+            case "oc-no-orig": return "OpenComposite in place of openvr_api.dll"
+            default: return kind
+            }
+        }
+    }
+
+    /// What was found for one game.
+    struct Entry: Identifiable {
+        let id: String
+        let name: String
+        let dir: String
+        /// The game's graphics in NotProton, which --clean checks again.
+        let graphics: String?
+        var running = false
+        var items: [Item] = []
+        var error: String?
+    }
+
+    /// Whether an item can be taken out with this NotProton.
+    static func applies(_ item: Item, _ np: NotProton) -> Bool {
+        item.mode == .any || (item.mode == .zeroSetup && np == .zeroSetup)
+    }
+
+    static func run(_ args: [String], env: [String: String]) -> (status: Int32, out: String, err: String)? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = args
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        // stderr goes to a file, so that neither stream can fill up and stall the script.
+        let errFile = FileManager.default.temporaryDirectory.appending(path: "macvapor-\(UUID().uuidString).err")
+        guard FileManager.default.createFile(atPath: errFile.path, contents: nil),
+              let err = try? FileHandle(forWritingTo: errFile) else { return nil }
+        defer { try? FileManager.default.removeItem(at: errFile) }
+        p.standardError = err
+        guard (try? p.run()) != nil else { return nil }
+        let outData = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        try? err.close()
+        let errText = (try? String(contentsOf: errFile, encoding: .utf8)) ?? ""
+        return (p.terminationStatus, String(decoding: outData, as: UTF8.self), errText)
+    }
+
+    static func env(for game: String, graphics: String?) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["STEAM"] = Paths.steam.path
+        env["GFX"] = graphics ?? ""
+        return env
+    }
+
+    /// Every game MacVapoR knows, scanned one after another; the ones with nothing found are left out.
+    static func scan(_ games: [Game]) -> (NotProton, [Entry]) {
+        var np = NotProton.missing
+        var found: [Entry] = []
+        for g in games {
+            var game = Entry(id: g.id, name: g.name, dir: g.dir.path, graphics: g.graphics)
+            guard let r = run([Paths.cleanupScript.path, "--scan", g.id], env: env(for: g.id, graphics: g.graphics)) else {
+                game.error = "Could not run the setup script."
+                found.append(game)
+                continue
+            }
+            for line in r.out.split(separator: "\n") {
+                let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+                if f.count == 3, f[0] == "status" {
+                    if f[1] == "notproton" { np = NotProton(rawValue: f[2]) ?? .missing }
+                    if f[1] == "running" { game.running = f[2] == "1" }
+                } else if f.count == 6, f[0] == "item", let mode = Item.Mode(rawValue: f[5]) {
+                    game.items.append(Item(kind: f[1], target: f[2], reason: f[3], mode: mode, selected: f[4] == "1"))
+                }
+            }
+            if r.status != 0 { game.error = r.err.isEmpty ? "scan failed, status \(r.status)" : r.err }
+            for i in game.items.indices where !applies(game.items[i], np) || game.running {
+                game.items[i].selected = false
+            }
+            if !game.items.isEmpty || game.error != nil { found.append(game) }
+        }
+        return (np, found)
+    }
+
+    /// Runs --clean for each game with ticked items, and appends what it did to the log.
+    static func apply(_ games: [Entry], notProton: NotProton, log: URL?) -> String {
+        var text = ""
+        for g in games where !g.running {
+            let picked = g.items.filter { $0.selected && applies($0, notProton) }
+            guard !picked.isEmpty else { continue }
+            let args = [Paths.cleanupScript.path, "--clean", g.id] + picked.map(\.id)
+            text += "\(g.name):\n"
+            if let r = run(args, env: env(for: g.id, graphics: g.graphics)) {
+                text += r.out + r.err
+                if r.status != 0 { text += "(failed, status \(r.status))\n" }
+            } else {
+                text += "Could not run the setup script.\n"
+            }
+        }
+        if text.isEmpty { text = "Nothing was ticked." }
+        if let log {
+            let entry = "== \(Date())\n\(text)\n"
+            if let h = try? FileHandle(forWritingTo: log) {
+                h.seekToEndOfFile()
+                h.write(Data(entry.utf8))
+                try? h.close()
+            } else {
+                try? entry.write(to: log, atomically: true, encoding: .utf8)
+            }
+        }
+        return text
+    }
+
+    /// A path shown from the game's folder, or the prefix's, rather than from /.
+    static func shortTarget(_ target: String, game: Entry) -> String {
+        if target.hasPrefix(game.dir + "/") { return String(target.dropFirst(game.dir.count + 1)) }
+        if target.hasSuffix("/pfx") { return "the game's Wine prefix" }
+        return target
     }
 }
 
@@ -555,6 +751,7 @@ struct ContentView: View {
             .padding(20)
         }
         .disabled(model.busy)
+        .sheet(isPresented: $model.cleanupShown) { CleanupSheet().environmentObject(model) }
         .toolbar {
             Button("Refresh", systemImage: "arrow.clockwise") { model.refresh() }
             Button("Runtime Log", systemImage: "doc.text") { NSWorkspace.shared.open(Paths.log) }
@@ -696,6 +893,7 @@ struct ContentView: View {
                     Button(model.hasOpenComposite ? "Update OpenComposite" : "Download OpenComposite") {
                         model.downloadOpenComposite()
                     }
+                    Button("Clean up old setups") { model.showCleanup() }
                 }
                 ForEach(model.games.filter { !vrOnly || $0.kind != .other }) { game in
                     GameRow(game: game)
@@ -759,9 +957,149 @@ struct GameRow: View {
     }
 }
 
+struct CleanupSheet: View {
+    @EnvironmentObject var model: Model
+    @Environment(\.dismiss) private var dismiss
+
+    private var anyTicked: Bool {
+        model.cleanupGames.contains { g in !g.running && g.items.contains { $0.selected && Cleanup.applies($0, model.cleanupNotProton) } }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Clean up old setups").font(.title2).bold()
+            Group {
+                switch model.cleanupNotProton {
+                case .zeroSetup:
+                    Text("This NotProton sets VR up by itself each time a game starts, so what Set Up put in each game is no longer needed, and some of it gets in the way.")
+                case .old:
+                    Text("The installed NotProton still needs each game's setup, so only leftovers are offered. Once NotProton is updated to one that sets VR up by itself, the rest can go too.")
+                case .missing:
+                    Text("NotProton was not found, so only leftovers are offered.")
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            if model.cleanupScanning {
+                ProgressView(model.cleanupGames.isEmpty ? "Looking through \(model.games.count) games…" : "Working…")
+                    .frame(maxWidth: .infinity, minHeight: 200)
+            } else if model.cleanupGames.isEmpty {
+                Text("Nothing to clean up.")
+                    .frame(maxWidth: .infinity, minHeight: 200)
+            } else {
+                List {
+                    ForEach(model.cleanupGames) { game in
+                        Section {
+                            if let error = game.error {
+                                Text(error).font(.caption).foregroundStyle(.red)
+                            }
+                            ForEach(game.items) { item in
+                                CleanupRow(game: game, item: item)
+                            }
+                        } header: {
+                            HStack {
+                                Text(game.name).bold()
+                                if game.running {
+                                    Label("Running: quit it first", systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(minHeight: 300)
+            }
+
+            if !model.cleanupResult.isEmpty {
+                ScrollView {
+                    Text(model.cleanupResult)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 120)
+                .padding(6)
+                .background(.quaternary, in: .rect(cornerRadius: 6))
+            }
+
+            HStack {
+                Text("A copy of each file replaced or edited is kept beside it, ending in .before-macvapor-cleanup.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Scan Again") { model.scanForCleanup() }
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Clean up") { model.applyCleanup() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!anyTicked)
+            }
+            .disabled(model.cleanupScanning)
+        }
+        .padding(20)
+        .frame(minWidth: 640, minHeight: 480)
+    }
+}
+
+struct CleanupRow: View {
+    @EnvironmentObject var model: Model
+    let game: Cleanup.Entry
+    let item: Cleanup.Item
+
+    private var enabled: Bool { !game.running && Cleanup.applies(item, model.cleanupNotProton) }
+
+    var body: some View {
+        Toggle(isOn: Binding(get: { item.selected }, set: { model.setCleanupItem(game: game.id, item: item.id, on: $0) })) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack {
+                    Text(item.title)
+                    if item.mode == .kept {
+                        Text("kept").font(.caption).foregroundStyle(.secondary)
+                    } else if !Cleanup.applies(item, model.cleanupNotProton) {
+                        Text("kept: still needed by this NotProton").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text(Cleanup.shortTarget(item.target, game: game))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(item.reason).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .disabled(!enabled)
+    }
+}
+
 @main
 struct MacVapoRApp: App {
     @StateObject private var model = Model()
+
+    /// --cleanup-scan prints what "Clean up old setups" finds, without a window; with
+    /// --cleanup-ticked it then cleans up the ticked items, but only in a Steam folder given by
+    /// MACVAPOR_STEAM (tests/cleanup-check.sh), never the real one.
+    init() {
+        let args = CommandLine.arguments
+        guard args.contains("--cleanup-scan") else { return }
+        let (np, found) = Cleanup.scan(GameScanner.scan())
+        print("notproton: \(np.rawValue)")
+        for g in found {
+            print("\(g.id) \(g.name)\(g.running ? " (running)" : "")\(g.error.map { " error: \($0)" } ?? "")")
+            for i in g.items {
+                let state = Cleanup.applies(i, np) && !g.running ? (i.selected ? "[x]" : "[ ]") : "[-]"
+                print("  \(state) \(i.title): \(Cleanup.shortTarget(i.target, game: g))  (\(i.reason))")
+            }
+        }
+        if args.contains("--cleanup-ticked") {
+            guard ProcessInfo.processInfo.environment["MACVAPOR_STEAM"] != nil else {
+                print("--cleanup-ticked needs MACVAPOR_STEAM")
+                exit(2)
+            }
+            print(Cleanup.apply(found, notProton: np, log: nil))
+        }
+        exit(0)
+    }
 
     var body: some Scene {
         WindowGroup("MacVapoR") {

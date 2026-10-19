@@ -47,6 +47,25 @@ at that height instead of your real one.
 
 **Undo** puts a game back as it was. The runtime's log is at `~/Library/Logs/alvrxr.log`.
 
+### Clean up old setups
+
+A newer NotProton sets VR up by itself each time a game starts, and then a game needs no
+**Set Up**; an old setup even gets in its way. **Clean up old setups**, under **Games**, looks
+through every game and lists what Set Up left there, each with a reason and a tick box, and
+changes nothing until you click **Clean up**.
+
+- With a NotProton that still needs the setup, only leftovers are offered: spare copies of
+  `openvr_api.dll` or OpenComposite, and an `opencomposite.ini` beside the game's own
+  `openvr_api.dll`. The rest is kept, and offered once NotProton is updated.
+- With one that sets VR up by itself, the rest can go too: the game's own `openvr_api.dll` is put
+  back, and wineopenxr and the registry values Set Up wrote are taken out. An OpenComposite build
+  other than MacVapoR's, an `opencomposite.ini` with settings of your own, and DXVK in a game not
+  set to DXMT are listed but not ticked, or kept.
+
+Quit a game first; a running one is shown but can't be cleaned. A copy of each file replaced or
+edited is kept beside it, ending in `.before-macvapor-cleanup`, and what was done is logged to
+`~/Library/Logs/macvapor-cleanup.log`.
+
 Games from Meta's PC store for the Rift can be played too, brought over from the PC they're
 installed on: see [Meta Rift games](docs/rift-games.md). That isn't ready for everyone yet.
 
@@ -119,6 +138,7 @@ macOS 15, signs them with a Developer ID, notarizes and staples the app and the 
 To sign with your own Developer ID, copy `macvapor/release.env.example` to
 `macvapor/release.env` (ignored by git) and fill it in, or set `IDENTITY` and `NOTARY_PROFILE`
 in the environment. Without them the build is signed ad hoc and not notarized.
-`tools/notproton-vr-setup.sh` is the per-game setup MacVapoR runs, usable on its own.
+`tools/notproton-vr-setup.sh` is the per-game setup MacVapoR runs, usable on its own; its
+`--scan` and `--clean` are the clean-up. `tests/cleanup-check.sh` checks them on a made-up library.
 
 MIT licence; the bundled components keep their own, see `macvapor/LICENSES/NOTICE.txt`.
