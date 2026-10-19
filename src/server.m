@@ -255,6 +255,12 @@ static float g_eye_height;
 static float g_height_offset;
 static bool g_height_offset_set;
 
+// The dashboard's status line (alvrxr_ext.h): each device's charge, and the stream over the last
+// stats period.
+static float g_battery[AXR_DEVICE_COUNT] = {-1, -1, -1};
+static bool g_charging[AXR_DEVICE_COUNT];
+static float g_stream_fps, g_stream_mbps;
+
 static void read_eye_height(void) {
     NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"height.json"]];
     NSDictionary *h = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
@@ -312,8 +318,8 @@ typedef struct {
     float rect[2][4];
     uint32_t slice[2];
     ffr_uniform ffr;           // offset 40, as Metal places it
-    uint32_t blend;            // 0: LEGACY, the one source as it is (zero-filled by axr_submit)
-    float alpha;
+    uint32_t blend;            // 0: LEGACY, the one source as it is (zero-filled by axr_submit); 1: cross-fade; 2: overlay
+    float alpha;               // the fade (blend 1), or how much of the other shows through (blend 2)
     uint32_t pad[2];
     float tanfov[2][4];        // offset 96
     compose_source src[2];     // offset 128: foreground, other
@@ -640,7 +646,8 @@ static compose_source source_uniform(axr_pose src, axr_pose target, const axr_vi
     return s;
 }
 
-bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, float alpha, void (^done)(void)) {
+static bool encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, uint32_t blend, float alpha,
+                             void (^done)(void)) {
     if (!fg || !fg->texture) return false;
     uint64_t ts = g_dump ? (uint64_t)fg->display_time : fg->client_ts;
     pthread_mutex_lock(&g_lock);
@@ -648,7 +655,7 @@ bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *
     if (!ts && g_connected) ts = (uint64_t)fg->display_time;   // as axr_submit: ours until the client tracks
     g_stat_submit_calls++;
     if (!ready) g_stat_not_ready++;
-    compose_uniform u = {.ffr = g_ffr, .blend = 1, .alpha = other ? alpha : 1};
+    compose_uniform u = {.ffr = g_ffr, .blend = blend, .alpha = other || blend == 2 ? alpha : 1};
     bool idr = g_force_idr;
     uint32_t out_w = g_out_w, out_h = g_out_h;
     axr_views views = current_views();
@@ -667,6 +674,14 @@ bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *
     id<MTLTexture> ot = other && other->texture ? other->texture : fg->texture;
     id<MTLTexture> tex[4] = {fg->texture, fg->texture, ot, ot};
     return encode_frame(&u, tex, queue, ts, idr, out_w, out_h, done);
+}
+
+bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, float alpha, void (^done)(void)) {
+    return encode_composite(fg, other, 1, alpha, done);
+}
+
+bool axr_encode_overlay(const axr_compose_frame *fg, const axr_compose_frame *under, float dim, void (^done)(void)) {
+    return encode_composite(fg, under, 2, dim, done);
 }
 
 // ------------------------------------------------------------------------------ ALVR events
@@ -702,7 +717,7 @@ static void clear_samples(void);
 
 // Bumped when the user asks to recenter: the visionOS client syncs its playspace when the Digital
 // Crown is held (with "keep SteamVR center" off, its default) and expects the server to recenter.
-static uint32_t g_recenter_generation;
+static _Atomic uint32_t g_recenter_generation;   // the dashboard bumps it from vapord's render thread too
 static uint32_t g_config_gen;   // bumped when ALVR restarts (the stream, and so the eye size, may change)
 
 // The sample ALVR has at ts, as the header's readers want it: every device's motion with ALVR's
@@ -867,6 +882,11 @@ static void *event_thread(void *arg) {
                 AlvrBatteryInfo b = ev.battery.info;
                 for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
                     if (b.device_id != g_device_id[d] || b.gauge_value > 1.0f) continue;
+                    pthread_mutex_lock(&g_lock);
+                    g_battery[d] = b.gauge_value < 0 ? 0 : b.gauge_value;
+                    g_charging[d] = b.is_plugged;
+                    pthread_mutex_unlock(&g_lock);
+                    axr_publish_state();
                     int percent = (int)lroundf(b.gauge_value * 100);
                     if (percent == last_percent[d] && b.is_plugged == last_plugged[d]) break;
                     last_percent[d] = percent;
@@ -928,13 +948,16 @@ static void *event_thread(void *arg) {
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
                             audio_peak, compositor);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
-                g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
-                axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
                 pthread_mutex_lock(&g_lock);
+                g_stream_fps = g_stat_frames / dt;
+                g_stream_mbps = g_stat_bytes * 8 / dt / 1e6;
                 g_stat_samples = g_stat_bunched = g_stat_late = 0;
                 g_stat_ts_span = 0;
                 pthread_mutex_unlock(&g_lock);
+                g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
+                axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
                 g_stat_since = now;
+                axr_publish_state();   // the dashboard's fps and Mbps
             }
         }
     }
@@ -1349,7 +1372,83 @@ void axr_publish_state(void) {
     }
     g->nfake_press = g_nfake_press;
     memcpy(g->fake_press, g_fake_press_id, sizeof g->fake_press);
+    for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
+        g->battery[d] = g_battery[d];
+        g->charging[d] = g_charging[d];
+    }
+    g->stream_fps = g_stream_fps;
+    g->stream_mbps = g_stream_mbps;
     axr_seq_write_end(&g->seq);
+    pthread_mutex_unlock(&g_lock);
+}
+
+// ------------------------------------------------------------------------------- the dashboard
+// What vapord's panel does through the private functions (alvrxr_ext.h, runtime.m); the
+// compositor side is compositor.m. These run on vapord's render thread, under g_lock with the
+// event thread, which is why axr_publish_state takes it.
+
+void axr_server_recenter(void) {
+    g_recenter_generation++;
+    axr_publish_state();
+    axr_log("recenter requested (dashboard)");
+}
+
+// The newest head position the headset sent, false while there is none.
+static bool newest_head(float out[3]) {
+    axr_shm_global *g = g_shm;
+    if (!g) return false;
+    uint64_t head = atomic_load_explicit(&g->sample_head, memory_order_acquire);
+    if (!head) return false;
+    axr_shm_sample *slot = &g->samples[(head - 1) % AXR_SAMPLE_RING];
+    axr_shm_sample s;
+    uint32_t seq;
+    do {
+        seq = axr_seq_read_begin(&slot->seq);
+        s = *slot;
+    } while (!axr_seq_read_ok(&slot->seq, seq));
+    if (!s.ts || !s.dev[AXR_HEAD].valid) return false;
+    memcpy(out, s.dev[AXR_HEAD].pose.position, sizeof s.dev[AXR_HEAD].pose.position);
+    return true;
+}
+
+void axr_server_set_eye_height(float eye_height) {
+    if (!(eye_height > 0) || eye_height > 3) eye_height = 0;
+    float head[3];
+    bool have_head = newest_head(head);
+    pthread_mutex_lock(&g_lock);
+    g_eye_height = eye_height;
+    g_height_offset = 0;
+    g_height_offset_set = false;
+    // From where the head is now, not lazily at the next sample as read_eye_height's path does; with
+    // no headset the readers report the head at 1.6 m, so the offset is taken from there.
+    float head_y = have_head ? head[1] : g_connected ? 0 : 1.6f;
+    if (eye_height > 0 && head_y > 0.3f) {
+        g_height_offset = eye_height - head_y;
+        g_height_offset_set = true;
+    }
+    float offset = g_height_offset;
+    bool set = g_height_offset_set;
+    pthread_mutex_unlock(&g_lock);
+    axr_publish_state();
+    // 0 is standing (read_eye_height); the file is replaced whole so a reader never sees half of it.
+    NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"eye_height" : @(eye_height)} options:0 error:nil];
+    [json writeToFile:[g_config_dir stringByAppendingPathComponent:@"height.json"] atomically:YES];
+    if (eye_height > 0) axr_log("seated: eye height %.2f m (dashboard), head at %.2f m, raised %.2f m%s", eye_height, head_y, offset,
+                                set ? "" : " (once the head is tracked)");
+    else axr_log("standing (dashboard)");
+}
+
+void axr_server_dashboard_stats(float battery[AXR_DEVICE_COUNT], uint32_t charging[AXR_DEVICE_COUNT], float *fps, float *mbps,
+                                float *eye_height, float *height_offset) {
+    pthread_mutex_lock(&g_lock);
+    for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
+        battery[d] = g_battery[d];
+        charging[d] = g_charging[d];
+    }
+    *fps = g_stream_fps;
+    *mbps = g_stream_mbps;
+    *eye_height = g_eye_height;
+    *height_offset = g_height_offset_set ? g_height_offset : 0;
     pthread_mutex_unlock(&g_lock);
 }
 

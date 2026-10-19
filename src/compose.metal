@@ -7,8 +7,8 @@ struct Ffr { float2 eyeSizeRatio; float2 centerSize; float2 centerShift; float2 
 struct Source { float4 rot[6]; uint identity; uint present; uint2 pad; };
 struct Compose {
     float4 rect[2]; uint slice[2]; Ffr ffr;   // as axr_submit fills them (LEGACY)
-    uint blend;                               // 0: LEGACY, one source as it is; 1: the compositor's
-    float alpha;                              // weight of the foreground source (textures 0, 1)
+    uint blend;                               // 0: LEGACY, one source as it is; 1: cross-fade; 2: overlay (the dashboard)
+    float alpha;                              // 1: weight of the foreground source (textures 0, 1); 2: how bright the other stays
     uint2 pad;
     float4 tanfov[2];                         // per eye: tan of fov left, right, up, down
     Source src[2];                            // foreground, other (textures 2, 3)
@@ -82,6 +82,12 @@ fragment float4 fs(VOut in [[stage_in]], texture2d_array<float> left [[texture(0
     // textures are sRGB views and so is the target), the other reprojected to the foreground
     // frame's head pose.
     float4 fg = sample_source(c, 0, e, uv, isRight ? right : left);
+    if (c.blend == 2) {
+        // The dashboard: the lounge's panel, premultiplied, over the game dimmed to alpha; the
+        // lounge drives, so the game's held frame is the one reprojected.
+        float3 under = c.src[1].present != 0 ? sample_source(c, 1, e, uv, isRight ? oright : oleft).rgb * c.alpha : float3(0.0);
+        return float4(under * (1.0 - fg.a) + fg.rgb, 1.0);
+    }
     if (c.src[1].present == 0 || c.alpha >= 1.0) return float4(fg.rgb, 1.0);
     float4 ot = sample_source(c, 1, e, uv, isRight ? oright : oleft);
     return float4(mix(ot.rgb, fg.rgb, c.alpha), 1.0);

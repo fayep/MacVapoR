@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds tests/compositor-check.m straight from src/ (with the real ALVR core from out/) and runs
 # the compositor's scenarios headless, checking the decoded dumps:
-#   tests/compositor-check.sh [parity|handover|watchdog|reproject|all] [--keep]
+#   tests/compositor-check.sh [parity|handover|watchdog|reproject|dashboard|all] [--keep]
 # Always a scratch ALVRXR_CONFIG_DIR and ALVRXR_DUMP (docs/compositor.md "Testing without a
 # headset"); never the real config, never vapord, nothing installed.
 set -eu
@@ -123,13 +123,64 @@ run_reproject() {
         && pass "reprojection shifts by the fov's pixels per degree" || fail "reprojection shift"
 }
 
+# Classifies each frame of the dashboard dump by its left eye: the lounge (green), the game (red),
+# the dashboard (the game dimmed, with the panel's colour as the second colour), or a mix, and
+# checks the order lounge, game, dashboard (the button), game, dashboard (the API, then quit),
+# game, lounge: the fades in between are allowed.
+check_dashboard_sequence() {
+    dumpfile=$1; dim=$2; over=$3
+    awk -v dim="$dim" -v over="$over" '
+    function near(a, b) { return (a - b) <= 14 && (b - a) <= 14 }
+    function nearc(c, want,   x, y) { split(c, x, ","); split(want, y, ","); return near(x[1], y[1]) && near(x[2], y[2]) && near(x[3], y[3]) }
+    /^frame / {
+        n++
+        fill = $5; other = $7
+        # Either may be the commoner: the foveated centre, where the panel is, is sampled denser.
+        state = nearc(fill, "0,200,60") ? "lounge" : nearc(fill, "200,40,40") ? "game" : ((nearc(fill, dim) && nearc(other, over)) || (nearc(fill, over) && nearc(other, dim))) ? "dashboard" : "mix"
+        if (state == "dashboard") dash++
+        if (state == "mix") mix++
+        if (state != last) { runs[++k] = state; start[k] = n - 1; }
+        stop[k] = n - 1; last = state
+    }
+    END {
+        printf "   sequence:"
+        for (i = 1; i <= k; i++) printf " %s[%d-%d]", runs[i], start[i], stop[i]
+        printf "\n   %d dashboard frames (dimmed game %s with the panel %s over it), %d mixed\n", dash, dim, over, mix
+        # Without the fades: the states in order.
+        m = 0
+        for (i = 1; i <= k; i++) if (runs[i] != "mix" && (m == 0 || seq[m] != runs[i])) seq[++m] = runs[i]
+        want = "lounge game dashboard game dashboard game lounge"
+        got = ""
+        for (i = 1; i <= m; i++) got = got (i > 1 ? " " : "") seq[i]
+        printf "   order: %s\n", got
+        exit !(got == want && dash >= 90)
+    }' "$dumpfile"
+}
+
+run_dashboard() {
+    echo "== dashboard: as handover; the system button (a fake press) held 0.5 s opens the panel over the dimmed game, pressed again closes it; quit, eye height, recenter"
+    : > "$scratch/alvrxr.log"
+    ALVRXR_DUMP=$scratch/dashboard.hevc "$bin" dashboard > "$scratch/dashboard.out" 2> "$scratch/dashboard.err" || { tail -5 "$scratch/dashboard.err"; fail "dashboard run"; }
+    grep -h "compositor: dashboard\|compositor: quit\|seated\|standing\|recenter" "$scratch/alvrxr.log" | sed 's/^/   log: /'
+    grep -h "check\|focus\|dashboard [01]\|exit_request\|expected" "$scratch/dashboard.out" | sed 's/^/   driver: /'
+    [ "$(grep -c "check FAIL" "$scratch/dashboard.out")" -eq 0 ] && pass "dashboard: $(grep -c 'check ok' "$scratch/dashboard.out") checks (hold, focus, close, quit, eye height, recenter, name)" || fail "dashboard checks"
+    grep -q "lounge: focus FOCUSED, should_render 1" "$scratch/dashboard.out" && grep -q "game: focus VISIBLE, should_render 1" "$scratch/dashboard.out" \
+        && pass "focus while open: lounge FOCUSED, game VISIBLE and still drawing" || fail "focus while open"
+    "$dumpcheck" "$scratch/dashboard.hevc" > "$scratch/dashboard.txt" || { fail "dashboard dump didn't decode"; return; }
+    dim=$(sed -n 's/^expected: dimmed game \([0-9,]*\),.*/\1/p' "$scratch/dashboard.out")
+    over=$(sed -n 's/^expected: .*panel over it \([0-9,]*\).*/\1/p' "$scratch/dashboard.out")
+    check_dashboard_sequence "$scratch/dashboard.txt" "$dim" "$over" && pass "overlay compose: the game dimmed to 0.35 with the lounge's half-transparent panel over it, then back" || fail "dashboard sequence"
+    ! grep -q VIOLATION "$scratch/dashboard.out" && pass "release protocol held" || fail "release violations"
+}
+
 case "$what" in
 parity) run_parity ;;
 handover) run_handover ;;
 watchdog) run_watchdog ;;
 reproject) run_reproject ;;
-all) run_parity; run_handover; run_watchdog; run_reproject ;;
-*) echo "usage: $0 [parity|handover|watchdog|reproject|all] [--keep]" >&2; exit 2 ;;
+dashboard) run_dashboard ;;
+all) run_parity; run_handover; run_watchdog; run_reproject; run_dashboard ;;
+*) echo "usage: $0 [parity|handover|watchdog|reproject|dashboard|all] [--keep]" >&2; exit 2 ;;
 esac
 [ $fails -eq 0 ] && echo "compositor-check: all passed" || echo "compositor-check: $fails failed"
 [ $fails -eq 0 ]

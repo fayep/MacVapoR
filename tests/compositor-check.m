@@ -12,6 +12,9 @@
 //                                    the game is removed (or just stops, --watchdog) after 3.2 s
 //   compositor-check reproject       axr_encode_composite with the other source's head yawed
 //   compositor-check stripe DUMP     per frame, the x of the white stripe in the left eye
+//   compositor-check dashboard       lounge and game as handover; the system button (a tune.json fake
+//                                    press) held opens the dashboard, pressed again closes it; then
+//                                    quit, eye height and recenter through the compositor's API
 //
 // The sources draw as xrclient does (a fill and the frame number as a bar row), so dumpcheck
 // reads the dump the same way.
@@ -54,16 +57,28 @@ static id<MTLRenderPipelineState> g_pso;
 
 static float srgb_to_linear(float c) { return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f); }
 
-static void fill(id<MTLRenderCommandEncoder> enc, NSUInteger x, NSUInteger y, NSUInteger w, NSUInteger h, const float rgb[3]) {
-    float c[4] = {srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2]), 1};
+// An sRGB colour with a straight alpha, written premultiplied in linear light (as the lounge's
+// panel is: Metal blends sRGB targets in linear).
+static void fill_alpha(id<MTLRenderCommandEncoder> enc, NSUInteger x, NSUInteger y, NSUInteger w, NSUInteger h, const float rgb[3], float a) {
+    float c[4] = {srgb_to_linear(rgb[0]) * a, srgb_to_linear(rgb[1]) * a, srgb_to_linear(rgb[2]) * a, a};
     [enc setScissorRect:(MTLScissorRect){x, y, w, h}];
     [enc setFragmentBytes:c length:sizeof c atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
+static void fill(id<MTLRenderCommandEncoder> enc, NSUInteger x, NSUInteger y, NSUInteger w, NSUInteger h, const float rgb[3]) {
+    fill_alpha(enc, x, y, w, h, rgb, 1);
+}
+
+// The dashboard panel the lounge draws over transparency: the middle half of each eye, this colour
+// at this alpha.
+static const float kPanel[3] = {40 / 255.f, 80 / 255.f, 230 / 255.f};
+static const float kPanelAlpha = 0.5f;
+
 // Both eyes of a slot: the fill, and the frame number's bar row at each eye's centre (number < 0:
-// none). stripe_x >= 0 draws a 16 px white stripe there in each eye instead of bars.
-static void draw_slot(id<MTLCommandBuffer> cmd, id<MTLTexture> tex, const float rgb[3], int number, int stripe_x) {
+// none). stripe_x >= 0 draws a 16 px white stripe there in each eye instead of bars. panel draws
+// what the lounge does with the dashboard open instead: nothing (alpha 0) but kPanel.
+static void draw_slot(id<MTLCommandBuffer> cmd, id<MTLTexture> tex, const float rgb[3], int number, int stripe_x, bool panel) {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = tex;
     rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
@@ -72,6 +87,12 @@ static void draw_slot(id<MTLCommandBuffer> cmd, id<MTLTexture> tex, const float 
     [enc setRenderPipelineState:g_pso];
     NSUInteger W = tex.width / 2, H = tex.height;
     const float white[3] = {1, 1, 1}, black[3] = {0, 0, 0};
+    if (panel) {
+        fill_alpha(enc, 0, 0, W * 2, H, black, 0);
+        for (int e = 0; e < 2; e++) fill_alpha(enc, e * W + W / 4, H / 4, W / 2, H / 2, kPanel, kPanelAlpha);
+        [enc endEncoding];
+        return;
+    }
     fill(enc, 0, 0, W * 2, H, rgb);
     for (int e = 0; e < 2; e++) {
         NSUInteger ex = e * W;
@@ -138,6 +159,9 @@ typedef struct {
     int violations;           // slots not released in time
     uint32_t focus;
     bool render;
+    bool lounge;              // draws the panel while the dashboard is open
+    bool dashboard;
+    bool exit_seen;           // exit_request: a runtime would end the session; this stops sending
     pthread_t thread;
     int64_t last_sent_ns;
 } driver;
@@ -169,7 +193,7 @@ static bool driver_open(driver *d, const char *label, axr_source *src, const flo
     return true;
 }
 
-static void driver_frame(driver *d, bool content) {
+static void driver_frame(driver *d, bool content, bool panel) {
     uint64_t seq = ++d->seq;
     uint32_t slot = (uint32_t)(seq % AXR_SLOTS);
     if (seq > AXR_SLOTS && ![d->release waitUntilSignaledValue:seq - AXR_SLOTS timeoutMS:2000]) {
@@ -180,7 +204,7 @@ static void driver_frame(driver *d, bool content) {
     if (seq > AXR_FRAME_RING) [d->release waitUntilSignaledValue:seq - AXR_FRAME_RING timeoutMS:100];
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
     if (seq > AXR_SLOTS) [cmd encodeWaitForEvent:d->release value:seq - AXR_SLOTS];
-    draw_slot(cmd, d->tex[slot], d->rgb, content ? (int)seq : -1, -1);
+    draw_slot(cmd, d->tex[slot], d->rgb, content ? (int)seq : -1, -1, panel);
     int64_t display = axr_now_ns() + 20000000;
     axr_frame_desc *f = &d->region->frames[seq % AXR_FRAME_RING];
     *f = (axr_frame_desc){.seq = seq, .slot = slot, .flags = content ? AXR_FRAME_HAS_CONTENT : 0, .display_time = display,
@@ -206,9 +230,19 @@ static void *driver_thread(void *arg) {
                 render, d->frames);
         }
         atomic_store(&d->region->heartbeat_ns, (uint64_t)axr_now_ns());
+        bool dash = atomic_load(&d->region->dashboard) != 0;
+        if (dash != d->dashboard) {
+            d->dashboard = dash;
+            say("%s: dashboard %d (at frame %d)", d->label, dash, d->frames);
+        }
+        if (atomic_load(&d->region->exit_request) && !d->exit_seen) {
+            d->exit_seen = true;
+            say("%s: exit_request seen (at frame %d), stopping", d->label, d->frames);
+            break;
+        }
         bool content = render && d->frames >= d->black_first;
         if (d->frames == d->black_first) say("%s: first content frame", d->label);
-        driver_frame(d, content);
+        driver_frame(d, content, d->lounge && dash);
     }
     return NULL;
 }
@@ -230,7 +264,7 @@ static int run_server(int n) {
     driver d;
     if (!src || !driver_open(&d, "lounge", src, kGreen, 0)) return 1;
     int64_t next = axr_now_ns();
-    for (int i = 0; i < n; i++) { pace(&next); driver_frame(&d, true); }
+    for (int i = 0; i < n; i++) { pace(&next); driver_frame(&d, true, false); }
     usleep(500000);
     say("server: %d frames, %d release violations", d.frames, d.violations);
     axr_compositor_remove_source(src);
@@ -247,7 +281,7 @@ static int run_legacy(int n) {
         pace(&next);
         id<MTLTexture> t = tex[i % AXR_SLOTS];
         id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-        draw_slot(cmd, t, kGreen, i, -1);
+        draw_slot(cmd, t, kGreen, i, -1, false);
         [cmd enqueue];
         axr_eye_image eyes[2] = {{t, 0, 0, 0, (int32_t)w, (int32_t)h}, {t, 0, (int32_t)w, 0, (int32_t)w, (int32_t)h}};
         axr_submit(axr_now_ns() + 20000000, eyes, g_queue);
@@ -292,8 +326,8 @@ static int run_reproject(void) {
     id<MTLTexture> a = slot_texture(w * 2, h), b = slot_texture(w * 2, h);
     const float black[3] = {0, 0, 0};
     id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
-    draw_slot(cmd, a, black, -1, -1);
-    draw_slot(cmd, b, black, -1, (int)w / 2);
+    draw_slot(cmd, a, black, -1, -1, false);
+    draw_slot(cmd, b, black, -1, (int)w / 2, false);
     [cmd commit];
     [cmd waitUntilCompleted];
     axr_views v = axr_current_views();
@@ -315,6 +349,155 @@ static int run_reproject(void) {
     }
     usleep(500000);
     return 0;
+}
+
+// ------------------------------------------------------------------------------------- dashboard
+
+static int g_check_fails;
+static void check(bool ok, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void check(bool ok, const char *fmt, ...) {
+    va_list a;
+    va_start(a, fmt);
+    char msg[512];
+    vsnprintf(msg, sizeof msg, fmt, a);
+    va_end(a);
+    say("check %s: %s", ok ? "ok" : "FAIL", msg);
+    if (!ok) g_check_fails++;
+}
+
+// tune.json in the scratch config dir: the server re-reads it within a second.
+static void write_tune(const char *json) {
+    NSString *path = [@(getenv("ALVRXR_CONFIG_DIR")) stringByAppendingPathComponent:@"tune.json"];
+    [@(json) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    say("tune.json: %s", json);
+}
+
+static const char *focus_name(uint32_t f) { return f == 2 ? "FOCUSED" : f == 1 ? "VISIBLE" : "HIDDEN"; }
+
+typedef struct { float eye_height, height_offset; bool offset_set; uint32_t recenter_gen; } header_bits;
+static header_bits read_global(void) {
+    static const axr_shm_global *g;
+    if (!g) g = mmap(NULL, sizeof *g, PROT_READ, MAP_SHARED, axr_shm_global_fd(), 0);
+    header_bits h = {0};
+    if (g == MAP_FAILED) return h;
+    _Atomic uint32_t *seq = (_Atomic uint32_t *)&g->seq;
+    uint32_t s;
+    do {
+        s = axr_seq_read_begin(seq);
+        h.eye_height = g->eye_height;
+        h.height_offset = g->height_offset;
+        h.offset_set = g->height_offset_set;
+        h.recenter_gen = g->recenter_gen;
+    } while (!axr_seq_read_ok(seq, s));
+    return h;
+}
+
+static float linear_to_srgb(float c) { return c <= 0.0031308f ? c * 12.92f : 1.055f * powf(c, 1 / 2.4f) - 0.055f; }
+
+static int run_dashboard(void) {
+    // What the decoded frames should show while the panel is up: the game dimmed to 0.35, and
+    // under the panel the premultiplied panel over that.
+    float dim[3], over[3];
+    for (int i = 0; i < 3; i++) {
+        float g = srgb_to_linear(kRed[i]) * 0.35f;
+        dim[i] = linear_to_srgb(g) * 255;
+        over[i] = linear_to_srgb(g * (1 - kPanelAlpha) + srgb_to_linear(kPanel[i]) * kPanelAlpha) * 255;
+    }
+    printf("expected: dimmed game %.0f,%.0f,%.0f, panel over it %.0f,%.0f,%.0f\n", dim[0], dim[1], dim[2], over[0], over[1], over[2]);
+    write_tune("{}");
+    axr_compositor_start();
+    axr_source *lounge_src = axr_compositor_add_source(true, getpid());
+    driver lounge, game;
+    if (!lounge_src || !driver_open(&lounge, "lounge", lounge_src, kGreen, 0)) return 1;
+    lounge.lounge = true;
+    driver_start(&lounge);
+    usleep(600000);
+    axr_source *game_src = axr_compositor_add_source(false, 0);
+    if (!game_src || !driver_open(&game, "game", game_src, kRed, 20)) return 1;
+    say("game: starting");
+    driver_start(&game);
+    // Past the fade (~1.3 s in) and the lounge's idling 2 s later, so opening has to wake it.
+    usleep(3500000);
+    check(atomic_load(&lounge.region->should_render) == 0, "the lounge idles before the button (should_render %u)",
+          atomic_load(&lounge.region->should_render));
+    pid_t pid;
+    char name[64];
+    check(!axr_compositor_dashboard(&pid, name), "closed to begin with");
+
+    // Hold the system button: a fake press, read within a second, then the 0.5 s hold.
+    int64_t pressed = axr_now_ns();
+    write_tune("{\"fake_press\": [\"/user/hand/right/input/system/click\"]}");
+    usleep(2500000);
+    bool open = axr_compositor_dashboard(&pid, name);
+    check(open, "open after holding the button (%.1f s)", (axr_now_ns() - pressed) / 1e9);
+    check(atomic_load(&lounge.region->dashboard) == 1 && atomic_load(&game.region->dashboard) == 1, "dashboard set in both regions");
+    check(atomic_load(&lounge.region->focus) == AXR_FOCUS_FOCUSED && atomic_load(&lounge.region->should_render) == 1,
+          "lounge FOCUSED and drawing (focus %s, should_render %u)", focus_name(atomic_load(&lounge.region->focus)),
+          atomic_load(&lounge.region->should_render));
+    check(atomic_load(&game.region->focus) == AXR_FOCUS_VISIBLE && atomic_load(&game.region->should_render) == 1,
+          "game VISIBLE and drawing (focus %s)", focus_name(atomic_load(&game.region->focus)));
+    // Still held: nothing more happens.
+    usleep(1000000);
+    check(axr_compositor_dashboard(&pid, name), "stays open while the button is held");
+    write_tune("{}");
+    usleep(1500000);
+    check(axr_compositor_dashboard(&pid, name), "stays open after the release");
+    // A new press closes it at once.
+    pressed = axr_now_ns();
+    write_tune("{\"fake_press\": [\"/user/hand/right/input/system/click\"]}");
+    usleep(1500000);
+    check(!axr_compositor_dashboard(&pid, name), "closed by the next press (%.1f s)", (axr_now_ns() - pressed) / 1e9);
+    check(atomic_load(&game.region->focus) == AXR_FOCUS_FOCUSED, "game FOCUSED again (%s)", focus_name(atomic_load(&game.region->focus)));
+    check(atomic_load(&lounge.region->focus) == AXR_FOCUS_VISIBLE, "lounge VISIBLE again (%s)", focus_name(atomic_load(&lounge.region->focus)));
+    check(atomic_load(&lounge.region->dashboard) == 0 && atomic_load(&game.region->dashboard) == 0, "dashboard cleared in both regions");
+    write_tune("{}");
+    usleep(1500000);
+    check(!axr_compositor_dashboard(&pid, name), "stays closed after the release");
+
+    // Open through the API, then quit the game: exit_request, and the lounge comes back now.
+    axr_compositor_test_dashboard(true);
+    usleep(300000);
+    check(axr_compositor_dashboard(&pid, name), "open through the API");
+    check(axr_compositor_quit_game(), "quit_game with a game in front");
+    check(atomic_load(&game.region->exit_request) == 1, "exit_request set on the game");
+    check(!axr_compositor_dashboard(&pid, name), "quit closes the dashboard");
+    usleep(300000);
+    check(game.exit_seen, "the game's driver saw exit_request");
+    driver_stop(&game);
+    axr_compositor_remove_source(game_src);   // its session ending
+    say("game: removed");
+    usleep(1500000);
+    check(!axr_compositor_quit_game(), "quit_game with no game does nothing");
+
+    // Eye height: from the head now (1.6 m, the headless fallback), live in the header and in height.json.
+    header_bits h0 = read_global();
+    axr_server_set_eye_height(1.2f);
+    header_bits h1 = read_global();
+    check(fabsf(h1.eye_height - 1.2f) < 1e-6f && h1.offset_set && fabsf(h1.height_offset - (1.2f - 1.6f)) < 1e-5f,
+          "header: eye_height %.2f, height_offset %.2f (set %d)", h1.eye_height, h1.height_offset, h1.offset_set);
+    NSString *hpath = [@(getenv("ALVRXR_CONFIG_DIR")) stringByAppendingPathComponent:@"height.json"];
+    NSDictionary *hj = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:hpath] ?: [NSData data] options:0 error:nil];
+    check([hj isKindOfClass:NSDictionary.class] && fabs([hj[@"eye_height"] doubleValue] - 1.2) < 1e-6, "height.json: %s",
+          [hj description].UTF8String ?: "(none)");
+    axr_server_set_eye_height(0);
+    header_bits h2 = read_global();
+    hj = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfFile:hpath] ?: [NSData data] options:0 error:nil];
+    check(h2.eye_height == 0 && !h2.offset_set && [hj[@"eye_height"] doubleValue] == 0, "standing again: header %.2f (set %d), height.json %s",
+          h2.eye_height, h2.offset_set, [hj description].UTF8String ?: "(none)");
+    axr_server_recenter();
+    header_bits h3 = read_global();
+    check(h3.recenter_gen == h0.recenter_gen + 1, "recenter_gen %u -> %u", h0.recenter_gen, h3.recenter_gen);
+    axr_process_name(getpid(), name);
+    check(!strcmp(name, "compositor-check"), "process name of this process: \"%s\"", name);
+    char fake[64];
+    axr_process_name(0x7ffffff0, fake);
+    check(fake[0] == 0, "no name for a process that isn't there");
+
+    driver_stop(&lounge);
+    usleep(300000);
+    axr_compositor_remove_source(lounge_src);
+    say("dashboard: %d checks failed", g_check_fails);
+    return lounge.violations || game.violations || g_check_fails ? 1 : 0;
 }
 
 // ------------------------------------------------------------------------------------- decoding
@@ -418,6 +601,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(mode, "legacy")) r = run_legacy(n);
         else if (!strcmp(mode, "handover")) r = run_handover(argc > 2 && !strcmp(argv[2], "--watchdog"));
         else if (!strcmp(mode, "reproject")) r = run_reproject();
+        else if (!strcmp(mode, "dashboard")) r = run_dashboard();
         else { fprintf(stderr, "unknown mode %s\n", mode); return 2; }
         usleep(300000);   // the last encodes
         return r;

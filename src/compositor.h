@@ -50,6 +50,9 @@ void axr_slot_end(axr_slots *s, id<MTLCommandBuffer> cmd, uint32_t slot, int64_t
 // FOCUSED and true in LEGACY.
 uint32_t axr_slots_focus(const axr_slots *s);
 bool axr_slots_should_render(const axr_slots *s);
+// The session region's dashboard and exit_request flags (docs/compositor.md "Dashboard"); 0 in LEGACY.
+uint32_t axr_slots_dashboard(const axr_slots *s);
+uint32_t axr_slots_exit_request(const axr_slots *s);
 
 // Haptics go to the compositor in CLIENT mode, to ALVR otherwise (axr_haptics does this).
 
@@ -80,4 +83,17 @@ void axr_compositor_remove_source(axr_source *src);
 // Serves the XPC protocol (axr_ipc.h) on AXR_COMPOSITOR_SERVICE (transport.m). The runtime calls
 // it after axr_compositor_start when it is SERVER.
 void axr_transport_start(void);
+
+// ---- the dashboard (docs/compositor.md "Dashboard"). The compositor opens and closes it from the
+// system button itself; these are what the private functions in alvrxr_ext.h come down to.
+// Whether it is open; the foreground game's pid and executable name (0 and "" with none).
+bool axr_compositor_dashboard(pid_t *game_pid, char name[64]);
+void axr_compositor_close_dashboard(void);
+// Sets exit_request on the foreground game's session and fades to the lounge at once; false with no game.
+bool axr_compositor_quit_game(void);
+// A process's program name: argv[0]'s last path component (a Windows path for a Wine game),
+// without ".exe"; the executable's otherwise. "" if the process can't be read.
+void axr_process_name(pid_t pid, char out[64]);
+// TEST ONLY: opens or closes it as the button would.
+void axr_compositor_test_dashboard(bool open);
 #endif

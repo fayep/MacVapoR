@@ -16,6 +16,7 @@
 #include <openxr/openxr_reflection.h>
 
 #include "alvrxr.h"
+#include "alvrxr_ext.h"
 #include "compositor.h"
 #include "transport.h"
 #include "tracking.h"
@@ -196,8 +197,17 @@ static axr_slots *session_slots(session *s) {
     return s->slots;
 }
 
-// TEST ONLY: ALVRXR_TEST_FOCUS_FILE holds "focus [should_render]" (AXR_FOCUS_* 0/1/2) and
-// overrides the compositor's answer, so a driver can flip focus without a compositor.
+// vapord's own session (MacVapoR sets ALVRXR_HOME for it): the one the system button and the
+// private functions (alvrxr_ext.h) belong to.
+static bool is_home(void) {
+    static int home = -1;
+    if (home < 0) home = getenv("ALVRXR_HOME") != NULL;
+    return home;
+}
+
+// TEST ONLY: ALVRXR_TEST_FOCUS_FILE holds "focus [should_render [exit_request]]" (AXR_FOCUS_*
+// 0/1/2) and overrides the compositor's answer, so a driver can flip focus without a compositor.
+static bool g_test_exit;
 static bool test_focus_override(uint32_t *focus, bool *render) {
     static const char *path;
     static int init;
@@ -210,17 +220,35 @@ static bool test_focus_override(uint32_t *focus, bool *render) {
     if (now - checked > 100000000ull) {   // at most every 100 ms
         checked = now;
         FILE *fp = fopen(path, "r");
-        unsigned a = 0, b = 1;
+        unsigned a = 0, b = 1, c = 0;
         if (fp) {
-            int n = fscanf(fp, "%u %u", &a, &b);
+            int n = fscanf(fp, "%u %u %u", &a, &b, &c);
             fclose(fp);
-            if (n >= 1) { f = a > AXR_FOCUS_FOCUSED ? AXR_FOCUS_FOCUSED : a; r = n < 2 || b; have = true; }
+            if (n >= 1) { f = a > AXR_FOCUS_FOCUSED ? AXR_FOCUS_FOCUSED : a; r = n < 2 || b; g_test_exit = n >= 3 && c; have = true; }
         }
     }
     if (!have) return false;
     *focus = f;
     *render = r;
     return true;
+}
+
+// The compositor asked the session to end (the dashboard's quit): exit_request in its region.
+static bool exit_requested_by_compositor(session *s) {
+    uint32_t focus;
+    bool render;
+    if (test_focus_override(&focus, &render)) return g_test_exit;
+    axr_slots *slots = session_slots(s);
+    return slots && axr_slots_exit_request(slots);
+}
+
+// What xrRequestExitSession does, with g_lock held: the app sees the states down to STOPPING and
+// ends the session.
+static void request_exit(session *s) {
+    s->exit_requested = true;
+    set_state(s, XR_SESSION_STATE_VISIBLE);
+    set_state(s, XR_SESSION_STATE_SYNCHRONIZED);
+    set_state(s, XR_SESSION_STATE_STOPPING);
 }
 
 static void desired_focus(session *s, uint32_t *focus, bool *render) {
@@ -239,6 +267,11 @@ static void follow_focus(session *s) {
     if (!s || !s->running || s->lost || s->exit_requested) return;
     if (s->state != XR_SESSION_STATE_SYNCHRONIZED && s->state != XR_SESSION_STATE_VISIBLE &&
         s->state != XR_SESSION_STATE_FOCUSED) return;
+    if (exit_requested_by_compositor(s)) {
+        axr_log("the compositor asked the session to end");
+        request_exit(s);
+        return;
+    }
     uint32_t focus;
     bool render;
     desired_focus(s, &focus, &render);
@@ -598,10 +631,7 @@ static XrResult xrRequestExitSession_(XrSession h) {
     pthread_mutex_lock(&g_lock);
     if (!s->running) { pthread_mutex_unlock(&g_lock); return XR_ERROR_SESSION_NOT_RUNNING; }
     if (s->lost) { pthread_mutex_unlock(&g_lock); return XR_SUCCESS; }   // LOSS_PENDING is the last state
-    s->exit_requested = true;
-    set_state(s, XR_SESSION_STATE_VISIBLE);
-    set_state(s, XR_SESSION_STATE_SYNCHRONIZED);
-    set_state(s, XR_SESSION_STATE_STOPPING);
+    request_exit(s);
     pthread_mutex_unlock(&g_lock);
     return XR_SUCCESS;
 }
@@ -1127,9 +1157,7 @@ static XrResult xrWaitFrame_(XrSession h, const XrFrameWaitInfo *info, XrFrameSt
     pthread_mutex_unlock(&g_lock);
     st->shouldRender = visible && render;
     // The home scene draws only for a headset; games always do, for their window on the Mac.
-    static int home = -1;
-    if (home < 0) home = getenv("ALVRXR_HOME") != NULL;
-    if (home && !axr_backend_connected()) st->shouldRender = XR_FALSE;
+    if (is_home() && !axr_backend_connected()) st->shouldRender = XR_FALSE;
     return XR_SUCCESS;
 }
 
@@ -1278,7 +1306,7 @@ static bool log_layers(const XrFrameEndInfo *info) {
 // Draws the frame's projection layer (if any) and its quads into target with cmd, the left eye in
 // its left half; false if it can't.
 static bool compose_layers(const XrFrameEndInfo *info, const XrCompositionLayerProjection *proj, bool explain,
-                           id<MTLCommandBuffer> cmd, id<MTLTexture> target, axr_pose head_pose) {
+                           id<MTLCommandBuffer> cmd, id<MTLTexture> target, axr_pose head_pose, bool transparent) {
     if (!layer_pipelines(cmd.device)) return false;
     uint32_t w = (uint32_t)target.width / 2, h = (uint32_t)target.height;
     XrPosef head = from_axr(head_pose);
@@ -1286,7 +1314,10 @@ static bool compose_layers(const XrFrameEndInfo *info, const XrCompositionLayerP
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
     pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    // The layers' alpha is kept as they wrote it (the first draws unblended, the rest over it,
+    // premultiplied); the lounge's dashboard frames start from nothing so the game shows through
+    // where it drew nothing. Games always start from opaque black.
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, transparent ? 0 : 1);
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
     for (int e = 0; e < 2; e++) {
@@ -1392,7 +1423,8 @@ static XrResult end_frame(session *s, const XrFrameEndInfo *info) {
     uint32_t slot;
     id<MTLTexture> target = axr_slot_begin(s->slots, cmd, &slot);
     bool content = proj || quads;
-    if (content && !compose_layers(info, proj, changed, cmd, target, head)) content = false;
+    bool transparent = is_home() && axr_slots_dashboard(s->slots);
+    if (content && !compose_layers(info, proj, changed, cmd, target, head, transparent)) content = false;
     axr_slot_end(s->slots, cmd, slot, info->displayTime, content ? AXR_FRAME_HAS_CONTENT : 0, head);
     [cmd commit];
     return XR_SUCCESS;
@@ -1533,6 +1565,9 @@ static bool read_input(NSString *path, float *v) { return axr_input(path.UTF8Str
 // One binding's value: (x, y), with y only meaningful for vector2 actions.
 static bool binding_value(NSString *b, XrActionType type, float out[2]) {
     out[0] = out[1] = 0;
+    // The system button is the compositor's (it opens the dashboard): a game's binding to it is
+    // live but never pressed, so nothing the player does there reaches the game.
+    if (!is_home() && [b rangeOfString:@"/input/system/"].location != NSNotFound) return true;
     if (type == XR_ACTION_TYPE_VECTOR2F_INPUT) {
         bool ok = read_input([b stringByAppendingString:@"/x"], &out[0]);
         ok |= read_input([b stringByAppendingString:@"/y"], &out[1]);
@@ -1831,6 +1866,56 @@ static XrResult xrLocateHandJointsEXT_(XrHandTrackerEXT h, const XrHandJointsLoc
     return XR_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------------- dashboard
+//
+// The private functions of alvrxr_ext.h, for vapord's panel. Only its own session in SERVER mode
+// (the compositor is in this process) may call them.
+
+static bool dashboard_allowed(void) { return is_home() && axr_mode_current() == AXR_MODE_SERVER; }
+
+static XrResult xrGetDashboardStateALVRXR_(XrSession h, XrDashboardStateALVRXR *st) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (!st) return XR_ERROR_VALIDATION_FAILURE;
+    if (!dashboard_allowed()) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    memset(st, 0, sizeof *st);
+    pid_t pid;
+    char name[64];
+    st->open = axr_compositor_dashboard(&pid, name);
+    st->game_pid = pid > 0 ? (uint32_t)pid : 0;
+    snprintf(st->game_name, sizeof st->game_name, "%s", name);
+    axr_server_dashboard_stats(st->battery, st->charging, &st->fps, &st->mbps, &st->eye_height, &st->height_offset);
+    return XR_SUCCESS;
+}
+
+static XrResult xrCloseDashboardALVRXR_(XrSession h) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (!dashboard_allowed()) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    axr_compositor_close_dashboard();
+    return XR_SUCCESS;
+}
+
+static XrResult xrQuitGameALVRXR_(XrSession h) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (!dashboard_allowed()) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    axr_compositor_quit_game();   // nothing to do with no game
+    return XR_SUCCESS;
+}
+
+static XrResult xrRecenterALVRXR_(XrSession h) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (!dashboard_allowed()) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    axr_server_recenter();
+    return XR_SUCCESS;
+}
+
+static XrResult xrSetEyeHeightALVRXR_(XrSession h, float eye_height) {
+    CHECK_HANDLE(h, session, MAGIC_SESSION);
+    if (!dashboard_allowed()) return XR_ERROR_FUNCTION_UNSUPPORTED;
+    if (!isfinite(eye_height) || eye_height < 0 || eye_height > 3) return XR_ERROR_VALIDATION_FAILURE;
+    axr_server_set_eye_height(eye_height);
+    return XR_SUCCESS;
+}
+
 // ------------------------------------------------------------------------------------ dispatch
 
 #define FUNCTIONS(X)                                                                                      \
@@ -1854,6 +1939,8 @@ static XrResult xrLocateHandJointsEXT_(XrHandTrackerEXT h, const XrHandJointsLoc
     X(xrGetVulkanInstanceExtensionsKHR) X(xrGetVulkanDeviceExtensionsKHR) X(xrGetVulkanGraphicsDeviceKHR)  \
     X(xrGetVulkanGraphicsDevice2KHR) X(xrCreateVulkanInstanceKHR) X(xrCreateVulkanDeviceKHR) X(xrLocateSpaces) \
     X(xrSetSwapchainImagesALVRXR) X(xrSetSwapchainImageFenceALVRXR)                                      \
+    X(xrGetDashboardStateALVRXR) X(xrCloseDashboardALVRXR) X(xrQuitGameALVRXR) X(xrRecenterALVRXR)        \
+    X(xrSetEyeHeightALVRXR)                                                                               \
     X(xrCreateHandTrackerEXT) X(xrDestroyHandTrackerEXT) X(xrLocateHandJointsEXT)
 
 static XrResult xrGetInstanceProcAddr_(XrInstance inst, const char *name, PFN_xrVoidFunction *fn);
