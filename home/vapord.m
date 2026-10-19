@@ -541,6 +541,23 @@ static simd_float4x4 projection(XrFovf f, float n, float far) {
 }
 
 // The model's frame from the OpenXR grip: Sony's openxr_grip component, undone.
+// tune.json "model_scale": the controller models' size against the controllers in hand, scaled
+// about the grip, re-read once a second (for matching them by eye).
+static float model_scale(void) {
+    static float scale = 1;
+    static double checked;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - checked < 1) return scale;
+    checked = now;
+    NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
+    NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    id v = [t isKindOfClass:NSDictionary.class] ? t[@"model_scale"] : nil;
+    float s = [v respondsToSelector:@selector(floatValue)] && [v floatValue] > 0.5f && [v floatValue] < 2 ? [v floatValue] : 1;
+    if (s != scale) NSLog(@"vapord: controller models at %.3fx", s);
+    scale = s;
+    return scale;
+}
+
 static simd_float4x4 grip_to_model(bool left) {
     float a = 20.6f * (float)M_PI / 180;
     simd_float4x4 c = simd_matrix4x4(simd_quaternion(a, simd_make_float3(1, 0, 0)));
@@ -1336,7 +1353,9 @@ int main(int argc, char **argv) {
                         (sl.locationFlags & want) == want &&
                         simd_distance(simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z), head) > 0.25f) {
                         show_controller[h] = true;
-                        controller_model[h] = simd_mul(pose_matrix(sl.pose), grip_to_model(h == 0));
+                        float ms = model_scale();
+                        controller_model[h] = simd_mul(simd_mul(pose_matrix(sl.pose), simd_diagonal_matrix(simd_make_float4(ms, ms, ms, 1))),
+                                                       grip_to_model(h == 0));
                         // The ball: squeeze the trigger or grip with the controller in it, taking it from the other
                         // hand if that has it.
                         simd_float4x4 hand = pose_matrix(sl.pose);
