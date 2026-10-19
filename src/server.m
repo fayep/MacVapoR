@@ -1251,13 +1251,18 @@ static bool fit_velocity(int hand, uint64_t ts, float linear[3], float angular[3
 // Stereo tuning, read from <config>/tune.json while running: {"ipd_scale":1, "fov_scale":1,
 // "swap_eyes":false}. For finding which of the client's view numbers the picture disagrees with.
 static float g_ipd_scale = 1, g_fov_scale = 1;
-static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
-// The controller pose as the headset reports it can sit turned from the controller in hand (PS VR2
-// Sense through visionOS read about 10 degrees low): tune.json grip_pitch, grip_yaw, grip_roll.
-static float g_grip_rotation[3], g_grip_offset[3];   // degrees; metres in the grip's frame
-// Each hand's own move, in its own frame, unmirrored, when given: the two can be off differently.
-static float g_grip_hand_offset[2][3];
-static bool g_grip_hand_set[2];
+static float g_aim_rotation[3] = {-65, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
+// The controller pose as the headset reports it sits turned and moved from the PS VR2 Sense
+// controller in hand. Measured by eye against passthrough with the controllers' models, both
+// controllers touching (2026-10-19): turned up 20 degrees, and each moved in its own frame (x right,
+// y up, -z forward). tune.json grip_pitch/yaw/roll, grip_offset (x mirrored) and
+// grip_offset_left/right override them.
+#define GRIP_PITCH 20
+static const float k_grip_hand_offset[2][3] = {{0.004f, -0.001f, -0.005f}, {-0.008f, 0, -0.006f}};
+static float g_grip_rotation[3] = {GRIP_PITCH, 0, 0}, g_grip_offset[3];   // degrees; metres in the grip's frame
+// Each hand's own move, in its own frame, unmirrored: the two are off differently.
+static float g_grip_hand_offset[2][3] = {{0.004f, -0.001f, -0.005f}, {-0.008f, 0, -0.006f}};
+static bool g_grip_hand_set[2] = {true, true};
 
 static axr_pose grip_turn(int hand) {
     float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw and roll
@@ -1289,9 +1294,9 @@ static void read_tune(void) {
     bool swap = [t[@"swap_eyes"] boolValue];
     int snap = [t[@"snapshot"] intValue];
     bool tpose = [t[@"fake_tpose"] boolValue];
-    // Touch's aim points 45 degrees below the PS VR2 Sense grip ALVR reports: measured by hand, in
-    // Asgard's Wrath.
-    float aim_rotation[3] = {t[@"aim_pitch"] ? [t[@"aim_pitch"] floatValue] : -45, [t[@"aim_yaw"] floatValue],
+    // Touch's aim points 45 degrees below the PS VR2 Sense grip as ALVR reports it (measured by hand,
+    // in Asgard's Wrath); the grip is now turned up 20 degrees itself, so 65 from it.
+    float aim_rotation[3] = {t[@"aim_pitch"] ? [t[@"aim_pitch"] floatValue] : -65, [t[@"aim_yaw"] floatValue],
                              [t[@"aim_roll"] floatValue]};
     float aim_offset[3] = {0, 0, 0};
     NSArray *ao = [t[@"aim_offset"] isKindOfClass:NSArray.class] ? t[@"aim_offset"] : nil;
@@ -1303,16 +1308,20 @@ static void read_tune(void) {
         axr_log("aim: pitch %.1f, yaw %.1f, roll %.1f deg, offset (%.3f, %.3f, %.3f) m from the grip (right hand)",
                 aim_rotation[0], aim_rotation[1], aim_rotation[2], aim_offset[0], aim_offset[1], aim_offset[2]);
     }
-    float grip_rotation[3] = {[t[@"grip_pitch"] floatValue], [t[@"grip_yaw"] floatValue], [t[@"grip_roll"] floatValue]};
+    float grip_rotation[3] = {t[@"grip_pitch"] ? [t[@"grip_pitch"] floatValue] : GRIP_PITCH, [t[@"grip_yaw"] floatValue],
+                              [t[@"grip_roll"] floatValue]};
     float grip_offset[3] = {0, 0, 0};
     NSArray *go = [t[@"grip_offset"] isKindOfClass:NSArray.class] ? t[@"grip_offset"] : nil;
     for (NSUInteger i = 0; i < 3 && i < go.count; i++) grip_offset[i] = [go[i] floatValue];
-    float hand_offset[2][3] = {{0}};
-    bool hand_set[2] = {false, false};
+    // The measured per-hand moves, unless tune.json gives a hand its own or a shared grip_offset.
+    float hand_offset[2][3];
+    memcpy(hand_offset, k_grip_hand_offset, sizeof hand_offset);
+    bool shared = go != nil, hand_set[2] = {!shared, !shared};
     for (int h = 0; h < 2; h++) {
         NSArray *a = t[h ? @"grip_offset_right" : @"grip_offset_left"];
         if (![a isKindOfClass:NSArray.class]) continue;
         hand_set[h] = true;
+        memset(hand_offset[h], 0, sizeof hand_offset[h]);
         for (NSUInteger i = 0; i < 3 && i < a.count; i++) hand_offset[h][i] = [a[i] floatValue];
     }
     if (memcmp(hand_offset, g_grip_hand_offset, sizeof hand_offset) || memcmp(hand_set, g_grip_hand_set, sizeof hand_set)) {

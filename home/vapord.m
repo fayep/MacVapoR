@@ -544,7 +544,7 @@ static simd_float4x4 projection(XrFovf f, float n, float far) {
 // tune.json "model_scale": the controller models' size against the controllers in hand, scaled
 // about the grip, re-read once a second (for matching them by eye).
 static float model_scale(void) {
-    static float scale = 1;
+    static float scale = 1.01f;   // Sony's models read a hair small against the controllers
     static double checked;
     double now = CFAbsoluteTimeGetCurrent();
     if (now - checked < 1) return scale;
@@ -552,7 +552,7 @@ static float model_scale(void) {
     NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
     NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     id v = [t isKindOfClass:NSDictionary.class] ? t[@"model_scale"] : nil;
-    float s = [v respondsToSelector:@selector(floatValue)] && [v floatValue] > 0.5f && [v floatValue] < 2 ? [v floatValue] : 1;
+    float s = [v respondsToSelector:@selector(floatValue)] && [v floatValue] > 0.5f && [v floatValue] < 2 ? [v floatValue] : 1.01f;
     if (s != scale) NSLog(@"vapord: controller models at %.3fx", s);
     scale = s;
     return scale;
