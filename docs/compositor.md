@@ -94,7 +94,10 @@ Per frame, seq = 1, 2, 3, …:
    `signalEvent:frameEvent value:seq`. The caller commits.
 
 The descriptor is written on the CPU before the GPU can signal, so whoever sees the event
-value can read it.
+value can read it. The GPU wait in step 1 doesn't hold the CPU back, so a runtime running
+ahead could overwrite `frames[seq % 8]` before it is read: `axr_slot_begin` also waits on the
+CPU (`waitUntilSignaledValue: seq - 8`, bounded to 100 ms) before reusing a descriptor, and the
+compositor checks `desc.seq == seq` and skips a frame whose descriptor has moved on.
 
 ## Frames (compositor side)
 
