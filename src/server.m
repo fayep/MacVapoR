@@ -751,12 +751,21 @@ static void publish_tracking_sample(uint64_t ts) {
         for (int i = 0; i < AXR_HAND_JOINTS; i++) s.skel[h][i] = from_alvr(sk[i]);
         s.skel_ok[h] = true;
     }
-    // Seated play (read_eye_height): the first head pose of a connection sets the raise.
+    // Seated play (read_eye_height): a connection's head, once it has held still for half a second,
+    // sets the raise. The first pose alone could be the headset still on its way onto the head.
     pthread_mutex_lock(&g_lock);
+    static uint64_t steady_since;
     if (g_eye_height > 0 && !g_height_offset_set && s.dev[AXR_HEAD].valid && s.dev[AXR_HEAD].pose.position[1] > 0.3f) {
-        g_height_offset = g_eye_height - s.dev[AXR_HEAD].pose.position[1];
-        g_height_offset_set = true;
-        axr_log("seated: head at %.2f m, raised %.2f m", s.dev[AXR_HEAD].pose.position[1], g_height_offset);
+        const float *v = s.dev[AXR_HEAD].linear_velocity, *w = s.dev[AXR_HEAD].angular_velocity;
+        bool still = v[0] * v[0] + v[1] * v[1] + v[2] * v[2] < 0.05f * 0.05f && w[0] * w[0] + w[1] * w[1] + w[2] * w[2] < 0.3f * 0.3f;
+        if (!still || ts < steady_since) steady_since = 0;   // moving, or a new connection's clock
+        if (still && !steady_since) steady_since = ts;
+        else if (ts - steady_since >= 500000000ull) {
+            g_height_offset = g_eye_height - s.dev[AXR_HEAD].pose.position[1];
+            g_height_offset_set = true;
+            steady_since = 0;
+            axr_log("seated: head settled at %.2f m, raised %.2f m", s.dev[AXR_HEAD].pose.position[1], g_height_offset);
+        }
     }
     pthread_mutex_unlock(&g_lock);
     // The header's newest_ts goes first, so a reader woken by the sample sees it.
@@ -1461,8 +1470,16 @@ static void recenter(const char *why) {
         qrot3(r, at, moved);
         pthread_mutex_lock(&g_lock);
         g_world = (axr_pose){{r.x, r.y, r.z, r.w}, {-moved[0], 0, -moved[2]}};
+        // Seated, recentering takes the height again too, as SteamVR's seated recenter does.
+        bool seated = g_eye_height > 0;
+        if (seated) {
+            g_height_offset = g_eye_height - head.position[1];
+            g_height_offset_set = true;
+        }
+        float raise = g_height_offset;
         pthread_mutex_unlock(&g_lock);
         axr_log("recenter (%s): turned %.0f deg, moved (%.2f, %.2f) m", why, -yaw * 180 / (float)M_PI, -at[0], -at[2]);
+        if (seated) axr_log("seated: head at %.2f m, raised %.2f m (recenter)", head.position[1], raise);
     } else {
         axr_log("recenter (%s): no head pose yet", why);
     }
