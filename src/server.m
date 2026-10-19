@@ -1252,6 +1252,18 @@ static bool fit_velocity(int hand, uint64_t ts, float linear[3], float angular[3
 // "swap_eyes":false}. For finding which of the client's view numbers the picture disagrees with.
 static float g_ipd_scale = 1, g_fov_scale = 1;
 static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
+// The controller pose as the headset reports it can sit turned from the controller in hand (PS VR2
+// Sense through visionOS read about 10 degrees low): tune.json grip_pitch, grip_yaw, grip_roll.
+static float g_grip_rotation[3];
+
+static axr_pose grip_turn(int hand) {
+    float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw and roll
+    quat rx = {sinf(g_grip_rotation[0] * d), 0, 0, cosf(g_grip_rotation[0] * d)};
+    quat ry = {0, sinf(m * g_grip_rotation[1] * d), 0, cosf(m * g_grip_rotation[1] * d)};
+    quat rz = {0, 0, sinf(m * g_grip_rotation[2] * d), cosf(m * g_grip_rotation[2] * d)};
+    quat q = qmul(qmul(ry, rx), rz);
+    return (axr_pose){{q.x, q.y, q.z, q.w}, {0, 0, 0}};
+}
 
 // The aim pose in the controller's (grip) frame (alvrxr.h axr_aim_offset). With g_lock held.
 static axr_pose aim_offset(int hand) {
@@ -1284,6 +1296,12 @@ static void read_tune(void) {
         memcpy(g_aim_offset, aim_offset, sizeof aim_offset);
         axr_log("aim: pitch %.1f, yaw %.1f, roll %.1f deg, offset (%.3f, %.3f, %.3f) m from the grip (right hand)",
                 aim_rotation[0], aim_rotation[1], aim_rotation[2], aim_offset[0], aim_offset[1], aim_offset[2]);
+    }
+    float grip_rotation[3] = {[t[@"grip_pitch"] floatValue], [t[@"grip_yaw"] floatValue], [t[@"grip_roll"] floatValue]};
+    if (memcmp(grip_rotation, g_grip_rotation, sizeof grip_rotation)) {
+        memcpy(g_grip_rotation, grip_rotation, sizeof grip_rotation);
+        axr_log("grip: turned pitch %.1f, yaw %.1f, roll %.1f deg (right hand)", grip_rotation[0], grip_rotation[1],
+                grip_rotation[2]);
     }
     pthread_mutex_unlock(&g_lock);
     bool velocity_check = [t[@"velocity_check"] boolValue];
@@ -1362,6 +1380,8 @@ void axr_publish_state(void) {
     g->views = current_views();
     g->aim[0] = aim_offset(AXR_LEFT);
     g->aim[1] = aim_offset(AXR_RIGHT);
+    g->grip[0] = grip_turn(AXR_LEFT);
+    g->grip[1] = grip_turn(AXR_RIGHT);
     g->height_offset = g_height_offset;
     g->eye_height = g_eye_height;
     g->input_gen = g_input_generation;

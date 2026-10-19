@@ -51,6 +51,7 @@ typedef struct {
     uint32_t eye_w, eye_h, render_w, render_h, recenter_gen;
     axr_views views;
     axr_pose aim[2];
+    axr_pose grip[2];
     float height_offset, eye_height;
     uint64_t input_gen;
 } header;
@@ -93,6 +94,8 @@ static bool read_header(header *h) {
         h->views = g->views;
         h->aim[0] = g->aim[0];
         h->aim[1] = g->aim[1];
+        h->grip[0] = g->grip[0];
+        h->grip[1] = g->grip[1];
         h->height_offset = g->height_offset;
         h->eye_height = g->eye_height;
         h->input_gen = g->input_gen;
@@ -286,6 +289,18 @@ int64_t axr_wait_frame(void) {
 
 // ------------------------------------------------------------------------------------- poses
 
+// The controller's own frame turned by t (tune.json grip_*): orientation q * t, position kept.
+// A zero quaternion (an older compositor that doesn't publish it) leaves it alone.
+static void turn_grip(axr_pose *p, const axr_pose *t) {
+    const float *a = p->orientation, *b = t->orientation;
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0) return;
+    float q[4] = {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+                  a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+                  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+                  a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+    memcpy(p->orientation, q, sizeof q);
+}
+
 axr_motion axr_device_motion(int device, int64_t time) {
     axr_motion m = {0};
     header h;
@@ -300,6 +315,7 @@ axr_motion axr_device_motion(int device, int64_t time) {
             memcpy(m.linear_velocity, s.fit_v[device == AXR_RIGHT], sizeof m.linear_velocity);
             memcpy(m.angular_velocity, s.fit_w[device == AXR_RIGHT], sizeof m.angular_velocity);
         }
+        if (device != AXR_HEAD) turn_grip(&m.pose, &h.grip[device == AXR_RIGHT]);
         if (h.eye_height > 0 && h.height_offset_set) m.pose.position[1] += h.height_offset;
         m.valid = true;
     } else if (device == AXR_HEAD) {
