@@ -10,6 +10,8 @@
 #include <time.h>
 
 #include "alvr_capi.h"
+#include <simd/simd.h>
+
 #include "tracking.h"
 
 static _Atomic(const axr_shm_global *) g_shm;
@@ -289,11 +291,14 @@ int64_t axr_wait_frame(void) {
 
 // ------------------------------------------------------------------------------------- poses
 
-// The controller's own frame turned by t (tune.json grip_*): orientation q * t, position kept.
-// A zero quaternion (an older compositor that doesn't publish it) leaves it alone.
+// The controller's own frame moved and turned by t (tune.json grip_*): position + q * t.position,
+// orientation q * t. A zero quaternion (an older compositor that doesn't publish it) leaves it alone.
 static void turn_grip(axr_pose *p, const axr_pose *t) {
     const float *a = p->orientation, *b = t->orientation;
-    if (b[0] == 0 && b[1] == 0 && b[2] == 0) return;
+    if (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0) return;
+    simd_float3 moved = simd_act(simd_quaternion(a[0], a[1], a[2], a[3]),
+                                 simd_make_float3(t->position[0], t->position[1], t->position[2]));
+    for (int i = 0; i < 3; i++) p->position[i] += moved[i];
     float q[4] = {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
                   a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
                   a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],

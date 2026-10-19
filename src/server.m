@@ -1254,7 +1254,7 @@ static float g_ipd_scale = 1, g_fov_scale = 1;
 static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
 // The controller pose as the headset reports it can sit turned from the controller in hand (PS VR2
 // Sense through visionOS read about 10 degrees low): tune.json grip_pitch, grip_yaw, grip_roll.
-static float g_grip_rotation[3];
+static float g_grip_rotation[3], g_grip_offset[3];   // degrees; metres in the grip's frame
 
 static axr_pose grip_turn(int hand) {
     float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw and roll
@@ -1262,7 +1262,7 @@ static axr_pose grip_turn(int hand) {
     quat ry = {0, sinf(m * g_grip_rotation[1] * d), 0, cosf(m * g_grip_rotation[1] * d)};
     quat rz = {0, 0, sinf(m * g_grip_rotation[2] * d), cosf(m * g_grip_rotation[2] * d)};
     quat q = qmul(qmul(ry, rx), rz);
-    return (axr_pose){{q.x, q.y, q.z, q.w}, {0, 0, 0}};
+    return (axr_pose){{q.x, q.y, q.z, q.w}, {m * g_grip_offset[0], g_grip_offset[1], g_grip_offset[2]}};
 }
 
 // The aim pose in the controller's (grip) frame (alvrxr.h axr_aim_offset). With g_lock held.
@@ -1298,10 +1298,14 @@ static void read_tune(void) {
                 aim_rotation[0], aim_rotation[1], aim_rotation[2], aim_offset[0], aim_offset[1], aim_offset[2]);
     }
     float grip_rotation[3] = {[t[@"grip_pitch"] floatValue], [t[@"grip_yaw"] floatValue], [t[@"grip_roll"] floatValue]};
-    if (memcmp(grip_rotation, g_grip_rotation, sizeof grip_rotation)) {
+    float grip_offset[3] = {0, 0, 0};
+    NSArray *go = [t[@"grip_offset"] isKindOfClass:NSArray.class] ? t[@"grip_offset"] : nil;
+    for (NSUInteger i = 0; i < 3 && i < go.count; i++) grip_offset[i] = [go[i] floatValue];
+    if (memcmp(grip_rotation, g_grip_rotation, sizeof grip_rotation) || memcmp(grip_offset, g_grip_offset, sizeof grip_offset)) {
         memcpy(g_grip_rotation, grip_rotation, sizeof grip_rotation);
-        axr_log("grip: turned pitch %.1f, yaw %.1f, roll %.1f deg (right hand)", grip_rotation[0], grip_rotation[1],
-                grip_rotation[2]);
+        memcpy(g_grip_offset, grip_offset, sizeof grip_offset);
+        axr_log("grip: turned pitch %.1f, yaw %.1f, roll %.1f deg, moved (%.3f, %.3f, %.3f) m (right hand)", grip_rotation[0],
+                grip_rotation[1], grip_rotation[2], grip_offset[0], grip_offset[1], grip_offset[2]);
     }
     pthread_mutex_unlock(&g_lock);
     bool velocity_check = [t[@"velocity_check"] boolValue];
