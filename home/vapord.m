@@ -6,6 +6,11 @@
 // Usage: vapord [RUNTIME]   (default ~/Library/Application Support/MacVapoR/runtime/libalvrxr.dylib)
 //        vapord --preview SCENE_DIR OUT.png [YAW [PITCH]]   a scene as seen standing, turned YAW degrees
 //                                                             left and PITCH up (default 0, -8)
+//
+// VAPORD_DASHBOARD_TEST=game|lounge (tests only, with ALVRXR_CONFIG_DIR and ALVRXR_DUMP): the
+// dashboard open with made-up state and pointers, over a game (transparent) or the lounge, for
+// VAPORD_DASHBOARD_TEST_FRAMES frames (120); frames 30 and 45 (hovering, then pressing Recenter)
+// are read back from the left eye's swapchain image, alpha and all, into the config dir.
 
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
@@ -23,6 +28,7 @@
 #include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
 
+#include "dashboard.h"
 #include "objects_metal.h"
 #include "prelude_metal.h"
 
@@ -719,6 +725,10 @@ typedef struct {
     simd_float4x4 view, proj;
 } camera_gpu;   // as objects.metal's Camera
 
+static camera_gpu eye_camera(XrPosef pose, XrFovf fov) {
+    return (camera_gpu){simd_inverse(pose_matrix(pose)), projection(fov, 0.05f, 200)};
+}
+
 static bool make_world(id<MTLDevice> dev, world *w) {
     NSError *err = nil;
     id<MTLLibrary> mlib = [dev newLibraryWithSource:@(objects_metal) options:nil error:&err];
@@ -778,7 +788,7 @@ static camera_gpu draw_world(id<MTLRenderCommandEncoder> enc, const world *w, co
     [enc setFragmentTextures:sc->images withRange:NSMakeRange(0, 8)];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
-    camera_gpu camera = {simd_inverse(pose_matrix(pose)), projection(fov, 0.05f, 200)};
+    camera_gpu camera = eye_camera(pose, fov);
     // The table and the ball.
     {
         simd_float4 no_glow = 0;
@@ -870,6 +880,44 @@ static int preview(NSString *dir, NSString *png, float yaw, float pitch) {
     return 0;
 }
 
+// The dashboard test: a swapchain image as drawn, alpha and all, into a PNG, and how much of it
+// is transparent, opaque and in between.
+static void save_with_alpha(id<MTLTexture> image, id<MTLCommandQueue> q, NSString *png) {
+    NSUInteger width = image.width, height = image.height;
+    id<MTLBuffer> buf = [q.device newBufferWithLength:width * height * 4 options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cmd = [q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit copyFromTexture:image sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+                 toBuffer:buf destinationOffset:0 destinationBytesPerRow:width * 4 destinationBytesPerImage:width * height * 4];
+    [blit endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+    const uint8_t *px = buf.contents;
+    size_t clear = 0, solid = 0, partial = 0;
+    for (size_t i = 0; i < width * height; i++) {
+        uint8_t a = px[i * 4 + 3];
+        if (a == 0) clear++;
+        else if (a == 255) solid++;
+        else partial++;
+    }
+    say(@"dashboard test: %@: alpha 0 %.1f%%, 255 %.1f%%, between %.1f%%", png.lastPathComponent,
+        100.0 * clear / (width * height), 100.0 * solid / (width * height), 100.0 * partial / (width * height));
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, buf.contents, width * height * 4, NULL);
+    CGImageRef img = CGImageCreate(width, height, 8, 32, width * 4, cs,
+                                   (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little, dp, NULL, false,
+                                   kCGRenderingIntentDefault);
+    CGImageDestinationRef d = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:png], CFSTR("public.png"), 1, NULL);
+    if (d) {
+        CGImageDestinationAddImage(d, img, NULL);
+        CGImageDestinationFinalize(d);
+        CFRelease(d);
+    }
+    CGImageRelease(img);
+    CGDataProviderRelease(dp);
+    CGColorSpaceRelease(cs);
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc >= 4 && !strcmp(argv[1], "--preview")) return preview(@(argv[2]), @(argv[3]), argc > 4 ? atof(argv[4]) : 0, argc > 5 ? atof(argv[5]) : -8);
@@ -954,6 +1002,22 @@ int main(int argc, char **argv) {
         FN(xrGetActionStateFloat);
         FN(xrGetActionStateVector2f);
         FN(xrApplyHapticFeedback);
+        // The dashboard's private functions (alvrxr_ext.h). They work only in SERVER mode, the
+        // compositor; a LEGACY runtime doesn't have them, or fails them, and the dashboard never opens.
+        PFN_xrGetDashboardStateALVRXR get_dashboard = NULL;
+        PFN_xrCloseDashboardALVRXR close_dashboard = NULL;
+        PFN_xrQuitGameALVRXR quit_game = NULL;
+        PFN_xrRecenterALVRXR recenter = NULL;
+        PFN_xrSetEyeHeightALVRXR set_eye_height = NULL;
+        gipa(instance, "xrGetDashboardStateALVRXR", (PFN_xrVoidFunction *)&get_dashboard);
+        gipa(instance, "xrCloseDashboardALVRXR", (PFN_xrVoidFunction *)&close_dashboard);
+        gipa(instance, "xrQuitGameALVRXR", (PFN_xrVoidFunction *)&quit_game);
+        gipa(instance, "xrRecenterALVRXR", (PFN_xrVoidFunction *)&recenter);
+        gipa(instance, "xrSetEyeHeightALVRXR", (PFN_xrVoidFunction *)&set_eye_height);
+        // Tests only, and only with a scratch config dir: 1 the lounge behind the panel, 2 a game.
+        const char *test_env = getenv("VAPORD_DASHBOARD_TEST");
+        int dash_test = test_env && *test_env && cfg_env && *cfg_env ? (strcmp(test_env, "lounge") ? 2 : 1) : 0;
+        int dash_test_frames = getenv("VAPORD_DASHBOARD_TEST_FRAMES") ? atoi(getenv("VAPORD_DASHBOARD_TEST_FRAMES")) : 120;
 
         XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO, NULL, XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
         XrSystemId system;
@@ -1011,6 +1075,11 @@ int main(int argc, char **argv) {
         aci.subactionPaths = hands;
         XrAction grip;
         XR(xrCreateAction(set, &aci, &grip));
+        // The aim pose, which the dashboard's lasers come from.
+        strcpy(aci.actionName, "aim");
+        strcpy(aci.localizedActionName, "Aim");
+        XrAction aim;
+        XR(xrCreateAction(set, &aci, &aim));
         // The controls the models show, each bound on both hands (Touch's x and y are the left's a and b).
         // Grip touch, Options touch, the right Options button and PS aren't Touch's, but ALVR passes them on.
         enum { A_TRIGGER, A_TRIGGER_TOUCH, A_SQUEEZE, A_SQUEEZE_TOUCH, A_A, A_A_TOUCH, A_B, A_B_TOUCH, A_MENU, A_MENU_TOUCH,
@@ -1043,12 +1112,14 @@ int main(int argc, char **argv) {
             ci.subactionPaths = hands;
             XR(xrCreateAction(set, &ci, &haptic));
         }
-        XrActionSuggestedBinding sb[4 + 2 * A_COUNT] = {{grip}, {grip}, {haptic}, {haptic}};
+        XrActionSuggestedBinding sb[6 + 2 * A_COUNT] = {{grip}, {grip}, {haptic}, {haptic}, {aim}, {aim}};
         XR(xrStringToPath(instance, "/user/hand/left/input/grip/pose", &sb[0].binding));
         XR(xrStringToPath(instance, "/user/hand/right/input/grip/pose", &sb[1].binding));
         XR(xrStringToPath(instance, "/user/hand/left/output/haptic", &sb[2].binding));
         XR(xrStringToPath(instance, "/user/hand/right/output/haptic", &sb[3].binding));
-        uint32_t nsb = 4;
+        XR(xrStringToPath(instance, "/user/hand/left/input/aim/pose", &sb[4].binding));
+        XR(xrStringToPath(instance, "/user/hand/right/input/aim/pose", &sb[5].binding));
+        uint32_t nsb = 6;
         for (int i = 0; i < A_COUNT; i++) {
             XrActionCreateInfo ci = {XR_TYPE_ACTION_CREATE_INFO};
             strcpy(ci.actionName, controls[i].name);
@@ -1070,11 +1141,13 @@ int main(int argc, char **argv) {
         XR(xrSuggestInteractionProfileBindings(instance, &ipsb));
         XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO, NULL, 1, &set};
         XR(xrAttachSessionActionSets(session, &attach));
-        XrSpace grip_space[2];
+        XrSpace grip_space[2], aim_space[2];
         XrHandTrackerEXT trackers[2];
         for (int h = 0; h < 2; h++) {
             XrActionSpaceCreateInfo asi = {XR_TYPE_ACTION_SPACE_CREATE_INFO, NULL, grip, hands[h], {{0, 0, 0, 1}, {0, 0, 0}}};
             XR(xrCreateActionSpace(session, &asi, &grip_space[h]));
+            asi.action = aim;
+            XR(xrCreateActionSpace(session, &asi, &aim_space[h]));
             XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT, NULL, h ? XR_HAND_RIGHT_EXT : XR_HAND_LEFT_EXT,
                                               XR_HAND_JOINT_SET_DEFAULT_EXT};
             XR(xrCreateHandTrackerEXT(session, &hci, &trackers[h]));
@@ -1092,9 +1165,17 @@ int main(int argc, char **argv) {
         XrTime pinch_time[2][4];
         int pinch_n[2] = {0, 0};
         bool was_gripping[2] = {false, false};
+        // The dashboard: whether it was open last frame, each hand's trigger as a press (with
+        // hysteresis), a bare hand's pointing smoothed, and the seated eye height its Seated
+        // button sets (the runtime's while seated, else the last one used).
+        bool dash_was_open = false, trigger_down[2] = {false, false};
+        simd_float3 hand_ray[2] = {0};
+        float seated_height = 1.20f;
+        int dash_frame = 0;
 
         world w;
         if (!make_world(dev, &w)) return 1;
+        if (!dash_init(dev, queue)) return 1;
         id<MTLTexture> depth[2];
         for (int e = 0; e < 2; e++) {
             MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
@@ -1160,7 +1241,21 @@ int main(int argc, char **argv) {
                 XrFrameState fs = {XR_TYPE_FRAME_STATE};
                 XR(xrWaitFrame(session, NULL, &fs));
                 XR(xrBeginFrame(session, NULL));
-                if (!fs.shouldRender) {   // no headset: an empty frame keeps the session going
+                // The dashboard's state; with the test, made up: seated over a game, or standing in the
+                // lounge, with one battery low and one charging.
+                XrDashboardStateALVRXR dstate = {0};
+                if (dash_test) {
+                    dstate = (XrDashboardStateALVRXR){.open = 1, .game_pid = dash_test == 2 ? (uint32_t)getpid() : 0,
+                                                      .battery = {0.82f, 0.55f, 0.12f}, .charging = {0, 1, 0},
+                                                      .fps = 90, .mbps = 42.5f, .eye_height = dash_test == 2 ? 1.2f : 0};
+                    if (dash_test == 2) strcpy(dstate.game_name, "Half-Life Alyx.exe");
+                } else if (!get_dashboard || XR_FAILED(get_dashboard(session, &dstate))) {
+                    dstate = (XrDashboardStateALVRXR){0};
+                }
+                bool dash_open = dstate.open != 0;
+                if (dstate.eye_height > 0) seated_height = dstate.eye_height;
+                // Headless (the test's ALVRXR_DUMP) the home scene isn't asked to render: it is anyway.
+                if (!fs.shouldRender && !dash_test) {   // no headset: an empty frame keeps the session going
                     XrFrameEndInfo idle = {XR_TYPE_FRAME_END_INFO, NULL, fs.predictedDisplayTime,
                                            XR_ENVIRONMENT_BLEND_MODE_OPAQUE, 0, NULL};
                     XR(xrEndFrame(session, &idle));
@@ -1172,6 +1267,21 @@ int main(int argc, char **argv) {
                 XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                 uint32_t n = 0;
                 XR(xrLocateViews(session, &vli, &vs, 2, &n, views));
+                simd_float3 head = simd_make_float3((views[0].pose.position.x + views[1].pose.position.x) / 2,
+                                                    (views[0].pose.position.y + views[1].pose.position.y) / 2,
+                                                    (views[0].pose.position.z + views[1].pose.position.z) / 2);
+                XrQuaternionf hq = views[0].pose.orientation;
+                simd_quatf head_turn = simd_quaternion(hq.x, hq.y, hq.z, hq.w);
+                // Opening: the panel goes ahead of the head and stays there, world-locked, until it closes.
+                if (dash_open && !dash_was_open) {
+                    dash_place(head, simd_act(head_turn, simd_make_float3(0, 0, -1)));
+                    if (ball.held >= 0) ball.held = -1;   // let go of the ball: the hands are pointing now
+                }
+                dash_was_open = dash_open;
+                if (dash_open) dash_set_state(&dstate, seated_height);
+                // While the dashboard's open the hands point at it, and play nothing else.
+                bool play = focused && !dash_open;
+                dash_pointer pointers[2] = {0};
 
                 // Each hand: a controller where one's held, its joints where it's bare.
                 XrActiveActionSet active = {set, XR_NULL_PATH};
@@ -1222,9 +1332,6 @@ int main(int argc, char **argv) {
                     XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
                     // A pinch the client sends as a controller sits on the gaze ray, at the eyes: not a
                     // controller in the hand, which can't be there.
-                    simd_float3 head = simd_make_float3((views[0].pose.position.x + views[1].pose.position.x) / 2,
-                                                        (views[0].pose.position.y + views[1].pose.position.y) / 2,
-                                                        (views[0].pose.position.z + views[1].pose.position.z) / 2);
                     if (have_model[h] && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
                         (sl.locationFlags & want) == want &&
                         simd_distance(simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z), head) > 0.25f) {
@@ -1234,7 +1341,16 @@ int main(int argc, char **argv) {
                         // hand if that has it.
                         simd_float4x4 hand = pose_matrix(sl.pose);
                         simd_float3 at = simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z);
-                        bool gripping = input[h].trigger > 0.6f || input[h].squeeze > 0.6f;
+                        // The dashboard's laser, from the aim pose; the trigger presses.
+                        trigger_down[h] = focused && (trigger_down[h] ? input[h].trigger > 0.35f : input[h].trigger > 0.6f);
+                        XrSpaceLocation al = {XR_TYPE_SPACE_LOCATION};
+                        if (dash_open && XR_SUCCEEDED(xrLocateSpace(aim_space[h], stage, fs.predictedDisplayTime, &al)) &&
+                            (al.locationFlags & want) == want) {
+                            simd_float4x4 am = pose_matrix(al.pose);
+                            pointers[h] = (dash_pointer){true, simd_make_float3(am.columns[3]),
+                                                         simd_normalize(-simd_make_float3(am.columns[2])), trigger_down[h]};
+                        }
+                        bool gripping = play && (input[h].trigger > 0.6f || input[h].squeeze > 0.6f);
                         bool letting_go = input[h].trigger < 0.35f && input[h].squeeze < 0.35f;
                         if (gripping && !was_gripping[h] && ball.held != h && simd_distance(at, ball.p) < kBallRadius + 0.07f) {
                             ball.held = h;
@@ -1276,12 +1392,28 @@ int main(int argc, char **argv) {
                         simd_float3 at = (t3 + i3) * 0.5f;
                         float gap = simd_distance(t3, i3);
                         bool now = focused && (pinching[h] ? gap < 0.045f : gap < 0.022f);
+                        // The dashboard, bare-handed: a ray from about the shoulder through the hand,
+                        // between the index and thumb knuckles, which hold still through a pinch;
+                        // smoothed, as a hand trembles. A pinch presses.
+                        if (dash_open) {
+                            XrVector3f ik = joints[XR_HAND_JOINT_INDEX_PROXIMAL_EXT].pose.position,
+                                       tk = joints[XR_HAND_JOINT_THUMB_PROXIMAL_EXT].pose.position;
+                            simd_float3 knuckles = (simd_make_float3(ik.x, ik.y, ik.z) + simd_make_float3(tk.x, tk.y, tk.z)) * 0.5f;
+                            simd_float3 fwd = simd_act(head_turn, simd_make_float3(0, 0, -1));
+                            fwd.y = 0;
+                            fwd = simd_length(fwd) > 1e-3f ? simd_normalize(fwd) : simd_make_float3(0, 0, -1);
+                            simd_float3 side = simd_cross(fwd, simd_make_float3(0, 1, 0));
+                            simd_float3 shoulder = head + side * (h ? 0.17f : -0.17f) - simd_make_float3(0, 0.18f, 0) - fwd * 0.05f;
+                            simd_float3 dir = simd_normalize(knuckles - shoulder);
+                            hand_ray[h] = simd_length(hand_ray[h]) > 0.5f ? simd_normalize(simd_mix(hand_ray[h], dir, 0.35f)) : dir;
+                            pointers[h] = (dash_pointer){true, knuckles, hand_ray[h], now};
+                        }
                         // The last few pinch points, for the throw.
                         int k = pinch_n[h] % 4;
                         pinch_at[h][k] = at;
                         pinch_time[h][k] = fs.predictedDisplayTime;
                         pinch_n[h]++;
-                        if (now && !pinching[h] && ball.held != h && simd_distance(at, ball.p) < kBallRadius + 0.05f) {
+                        if (play && now && !pinching[h] && ball.held != h && simd_distance(at, ball.p) < kBallRadius + 0.05f) {
                             ball.held = h;
                             simd_float4x4 bm = simd_matrix4x4(ball.q);
                             bm.columns[3] = simd_make_float4(ball.p, 1);
@@ -1301,7 +1433,46 @@ int main(int argc, char **argv) {
                         pinching[h] = now;
                     } else {
                         pinching[h] = false;
+                        hand_ray[h] = 0;
                         if (ball.held == h) ball.held = -1;   // the hand's gone: drop it
+                    }
+                }
+
+                // The dashboard's pointers hit-tested, and a press acted on.
+                dash_beam beams[2] = {0};
+                if (dash_open) {
+                    if (dash_test) {
+                        // Made-up pointers: the right hand at Recenter, pressing it on frames 40 to
+                        // 51; the left beside the panel, at nothing.
+                        simd_float3 fwd = simd_act(head_turn, simd_make_float3(0, 0, -1));
+                        simd_float3 r_from = head + simd_make_float3(0.22f, -0.35f, 0) + fwd * 0.15f;
+                        simd_float3 l_from = head + simd_make_float3(-0.22f, -0.35f, 0) + fwd * 0.15f;
+                        simd_float3 off = dash_button_centre(DASH_STANDING) + simd_make_float3(-0.5f, 0, 0);
+                        pointers[1] = (dash_pointer){true, r_from, simd_normalize(dash_button_centre(DASH_RECENTER) - r_from),
+                                                     dash_frame >= 40 && dash_frame < 52};
+                        pointers[0] = (dash_pointer){true, l_from, simd_normalize(off - l_from), false};
+                    }
+                    int hand = 0;
+                    int pressed = dash_point(pointers, beams, &hand);
+                    if (pressed != DASH_NONE) {
+                        XrHapticVibration tick = {XR_TYPE_HAPTIC_VIBRATION, NULL, 15000000, XR_FREQUENCY_UNSPECIFIED, 0.5f};
+                        XrHapticActionInfo hai = {XR_TYPE_HAPTIC_ACTION_INFO, NULL, haptic, hands[hand]};
+                        if (focused) xrApplyHapticFeedback(session, &hai, (const XrHapticBaseHeader *)&tick);
+                        // −5/+5 cm nudge the seated height and put it in force, from where the head is now.
+                        if (pressed == DASH_LOWER) seated_height = fmaxf(seated_height - 0.05f, 0.5f);
+                        if (pressed == DASH_HIGHER) seated_height = fminf(seated_height + 0.05f, 2.2f);
+                        XrResult r = XR_ERROR_FUNCTION_UNSUPPORTED;
+                        if (!dash_test) switch (pressed) {
+                        case DASH_STANDING: if (set_eye_height) r = set_eye_height(session, 0); break;
+                        case DASH_SEATED:
+                        case DASH_LOWER:
+                        case DASH_HIGHER: if (set_eye_height) r = set_eye_height(session, seated_height); break;
+                        case DASH_RECENTER: if (recenter) r = recenter(session); break;
+                        case DASH_QUIT: if (quit_game) r = quit_game(session); break;
+                        case DASH_CLOSE: if (close_dashboard) r = close_dashboard(session); break;
+                        }
+                        say(@"dashboard: %s (%s hand)%s", dash_button_name(pressed), hand ? "right" : "left",
+                            dash_test ? ", a test: nothing done" : XR_SUCCEEDED(r) ? "" : [NSString stringWithFormat:@" failed: %d", r].UTF8String);
                     }
                 }
                 // The ball's flight, in small steps.
@@ -1309,27 +1480,49 @@ int main(int argc, char **argv) {
                 last_time = fs.predictedDisplayTime;
                 for (int s = 0; s < 4; s++) ball_step(&ball, dt / 4);
 
+                // Over a game the dashboard is all the lounge draws, over transparency: the compositor
+                // lays it on the dimmed game by its alpha (premultiplied).
+                bool overlay = dash_open && dstate.game_pid != 0;
+                segment beam_lines[4];
+                int nbeams = 0;
+                for (int h = 0; h < 2; h++) {
+                    if (!beams[h].show) continue;
+                    simd_float4 c = beams[h].hit ? sc.bones : sc.palm;   // cyan on the panel, purple off it
+                    segment s = {{beams[h].from.x, beams[h].from.y, beams[h].from.z, 0.0022f}, {beams[h].to.x, beams[h].to.y, beams[h].to.z, 0}, {0}};
+                    memcpy(s.colour, &c, sizeof s.colour);
+                    beam_lines[nbeams++] = s;
+                    if (beams[h].hit) {
+                        segment dot = {{beams[h].to.x, beams[h].to.y, beams[h].to.z, 0.0065f}, {beams[h].to.x, beams[h].to.y, beams[h].to.z, 0}, {0}};
+                        memcpy(dot.colour, &sc.tips, sizeof dot.colour);
+                        beam_lines[nbeams++] = dot;
+                    }
+                }
+
                 XrCompositionLayerProjectionView pv[2];
                 id<MTLCommandBuffer> cmd = [queue commandBuffer];
+                uint32_t acquired[2];
                 for (int e = 0; e < 2; e++) {
                     uint32_t idx;
                     XR(xrAcquireSwapchainImage(chains[e], NULL, &idx));
+                    acquired[e] = idx;
                     XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, NULL, XR_INFINITE_DURATION};
                     XR(xrWaitSwapchainImage(chains[e], &wi));
 
                     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
                     rp.colorAttachments[0].texture = images[e][idx];
-                    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                    rp.colorAttachments[0].loadAction = overlay ? MTLLoadActionClear : MTLLoadActionDontCare;
+                    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
                     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
                     rp.depthAttachment.texture = depth[e];
                     rp.depthAttachment.loadAction = MTLLoadActionClear;
                     rp.depthAttachment.storeAction = MTLStoreActionDontCare;
                     rp.depthAttachment.clearDepth = 1.0;
                     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
-                    camera_gpu camera = draw_world(enc, &w, &sc, views[e].pose, views[e].fov,
-                                                   (float)(CFAbsoluteTimeGetCurrent() - start), &ball);
+                    camera_gpu camera = overlay ? eye_camera(views[e].pose, views[e].fov)
+                                                : draw_world(enc, &w, &sc, views[e].pose, views[e].fov,
+                                                             (float)(CFAbsoluteTimeGetCurrent() - start), &ball);
                     for (int h = 0; h < 2; h++) {
-                        if (!show_controller[h]) continue;
+                        if (!show_controller[h] || overlay) continue;
                         [enc setRenderPipelineState:w.mesh_pso];
                         [enc setDepthStencilState:w.depth_write];
                         [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
@@ -1346,12 +1539,21 @@ int main(int argc, char **argv) {
                                              indexType:MTLIndexTypeUInt32 indexBuffer:p->m.indices indexBufferOffset:0];
                         }
                     }
-                    if (nlines) {
+                    // The panel goes in the depth buffer, so a hand behind it is hidden.
+                    if (dash_open) dash_draw(enc, (simd_float4x4[2]){camera.view, camera.proj}, w.depth_write);
+                    if (nlines && !overlay) {
                         [enc setRenderPipelineState:w.line_pso];
                         [enc setDepthStencilState:w.depth_test];
                         [enc setVertexBytes:lines length:sizeof(segment) * nlines atIndex:0];
                         [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
                         [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:nlines];
+                    }
+                    if (nbeams) {   // over everything: the beam ends on the panel's face
+                        [enc setRenderPipelineState:w.line_pso];
+                        [enc setDepthStencilState:w.no_depth];
+                        [enc setVertexBytes:beam_lines length:sizeof(segment) * nbeams atIndex:0];
+                        [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4 instanceCount:nbeams];
                     }
                     [enc endEncoding];
 
@@ -1362,6 +1564,11 @@ int main(int argc, char **argv) {
                 }
                 [cmd commit];
                 [cmd waitUntilScheduled];
+                if (dash_test && (dash_frame == 30 || dash_frame == 45)) {
+                    [cmd waitUntilCompleted];
+                    save_with_alpha(images[0][acquired[0]], queue,
+                                    [g_config_dir stringByAppendingPathComponent:[NSString stringWithFormat:@"dashboard-%d.png", dash_frame]]);
+                }
                 for (int e = 0; e < 2; e++) XR(xrReleaseSwapchainImage(chains[e], NULL));
 
                 XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION, NULL, 0, stage, 2, pv};
@@ -1369,6 +1576,11 @@ int main(int argc, char **argv) {
                 XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO, NULL, fs.predictedDisplayTime,
                                       XR_ENVIRONMENT_BLEND_MODE_OPAQUE, 1, layers};
                 XR(xrEndFrame(session, &fei));
+                if (dash_test && ++dash_frame >= dash_test_frames) {
+                    say(@"dashboard test: %d frames", dash_frame);
+                    unlink(g_pid_path.fileSystemRepresentation);
+                    return 0;
+                }
             }
         }
     }
