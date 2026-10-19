@@ -12,17 +12,14 @@
 // ~/Library/Application Support/alvrxr). Cheap: read once.
 bool axr_compositor_flag(void);
 
-// The region's config_gen. Bounded, unlike axr_seq_read_begin: a writer that died mid-write must
-// not hang the frame.
+// The region's config_gen.
 static inline uint32_t axr_read_config_gen(const axr_shm_global *g) {
     _Atomic uint32_t *seq = (_Atomic uint32_t *)&g->seq;
-    uint32_t gen = 0;
-    for (int i = 0; i < 1000; i++) {
-        uint32_t b = atomic_load_explicit(seq, memory_order_acquire);
-        if (b & 1) continue;
+    uint32_t begin, gen;
+    do {
+        begin = axr_seq_read_begin(seq);
         gen = g->config_gen;
-        if (axr_seq_read_ok(seq, b)) break;
-    }
+    } while (!axr_seq_read_ok(seq, begin));
     return gen;
 }
 

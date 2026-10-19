@@ -19,6 +19,10 @@ void axr_tracking_attach(const axr_shm_global *g);
 // session after a reconnect start clean. Called at xrCreateSession.
 void axr_tracking_reset_session(void);
 
+// The stream's eye size, which output slots are made for (axr_recommended_eye_size is the size
+// games render at, which can differ).
+void axr_stream_eye_size(uint32_t *w, uint32_t *h);
+
 // The ALVR sample ts a frame for this display time was tied to by axr_wait_frame (0 if none);
 // what client_ts_for() did in backend.m.
 uint64_t axr_client_ts_for(int64_t display_time);

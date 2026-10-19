@@ -39,7 +39,7 @@ void axr_log(const char *fmt, ...) {
 }
 int64_t axr_now_ns(void) { return (int64_t)clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 uint64_t stub_now_ns(void) { return (uint64_t)axr_now_ns(); }
-void axr_recommended_eye_size(uint32_t *w, uint32_t *h) { *w = STUB_EYE_W, *h = STUB_EYE_H; }
+void axr_stream_eye_size(uint32_t *w, uint32_t *h) { *w = STUB_EYE_W, *h = STUB_EYE_H; }
 void axr_submit(int64_t t, const axr_eye_image eyes[2], id<MTLCommandQueue> q) {
     (void)t, (void)eyes, (void)q;
     fprintf(stderr, "FAIL: axr_submit called outside LEGACY\n");

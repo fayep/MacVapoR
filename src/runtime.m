@@ -18,6 +18,7 @@
 #include "alvrxr.h"
 #include "compositor.h"
 #include "transport.h"
+#include "tracking.h"
 
 extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
 extern unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
@@ -541,6 +542,7 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     s->magic = MAGIC_SESSION;
     s->inst = (instance *)h;
     s->queue = queue;
+    axr_tracking_reset_session();
     s->slots = axr_slots_open(queue.device, queue);
     s->vulkan = vk != NULL;
     s->vk_device = vk ? vk->device : VK_NULL_HANDLE;

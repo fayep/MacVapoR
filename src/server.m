@@ -1,8 +1,13 @@
-// ALVR, frame timing, the compositor and the encoder. Ported from alvr-mac-spike, which has the
-// background for most of what is here (README "Things that were not obvious").
+// ALVR, the compositor and the encoder, and the publisher of tracking, timing and input into
+// axr_shm_global for tracking.m to read. Ported from alvr-mac-spike, which has the background for
+// most of what is here (README "Things that were not obvious").
 
+#include <errno.h>
+#include <fcntl.h>
 #include <notify.h>
+#include <os/os_sync_wait_on_address.h>
 #include <signal.h>
+#include <sys/mman.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
@@ -14,10 +19,10 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <time.h>
-#include <sys/time.h>
 
 #include "alvr_capi.h"
 #include "alvrxr.h"
+#include "tracking.h"
 
 // ------------------------------------------------------------------------------------- logging
 
@@ -26,7 +31,9 @@ static FILE *g_logfile;
 void axr_log(const char *fmt, ...) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
+        // A scratch config dir (tests) keeps its log there, out of the real one.
+        NSString *dir = NSProcessInfo.processInfo.environment[@"ALVRXR_CONFIG_DIR"]
+                            ?: [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs"];
         g_logfile = fopen([[dir stringByAppendingPathComponent:@"alvrxr.log"] fileSystemRepresentation], "a");
     });
     char msg[1024];
@@ -169,24 +176,21 @@ static FILE *g_dump;
 static axr_views g_views;
 
 // Tracking samples are stamped with the client's predicted display time, in its own clock.
-// g_clock_offset converts them to ours; frames remember which sample they were made for.
+// g_clock_offset converts them to ours; tracking.m's frames remember which sample they took.
 static uint64_t g_newest_ts;
 static double g_clock_offset;
 static bool g_have_offset;
-enum { FRAME_RING = 32 };
-static struct { int64_t xr_time; uint64_t client_ts; } g_frames[FRAME_RING];
-static unsigned g_frame_next;
-static int64_t g_last_wait, g_last_display, g_last_sample_ns;
-static uint64_t g_last_frame_ts;
+static int64_t g_last_sample_ns;
 // How the headset's tracking samples arrive, for the stats line: how many, the mean interval
 // between their timestamps, and how many came on the heels of the one before (under a third of
 // a frame) or late (over one and a half frames).
 static unsigned g_stat_samples, g_stat_bunched, g_stat_late;
 static bool g_velocity_check;   // see check_velocity
+static bool g_pose_velocity = true;   // see record_hand_samples
 static void undo_alvr_shaping(int device, AlvrDeviceMotion *am, const stream_setup *setup);
 static void record_hand_samples(uint64_t ts);
 static const char *input_name(uint64_t id);
-static bool pose_velocity(int device, uint64_t ts, float linear[3], float angular[3]);
+static bool fit_velocity(int hand, uint64_t ts, float linear[3], float angular[3]);
 
 // tune.json "velocity_check": true compares the right controller's reported velocities with the
 // ones its poses imply, sample to sample, while it moves fast (a throw): the direction each way,
@@ -200,7 +204,7 @@ static void check_velocity(uint64_t ts) {
     stream_setup setup = g_setup;
     pthread_mutex_unlock(&g_lock);
     undo_alvr_shaping(AXR_RIGHT, &m, &setup);
-    pose_velocity(AXR_RIGHT, ts, m.linear_velocity, m.angular_velocity);
+    if (g_pose_velocity) fit_velocity(1, ts, m.linear_velocity, m.angular_velocity);
     double dt = prev_ts ? (ts - prev_ts) / 1e9 : 0;
     if (dt > 0.004 && dt < 0.05) {
         float d[3], r[3];
@@ -232,11 +236,16 @@ static void check_velocity(uint64_t ts) {
     prev_ts = ts;
 }
 static uint64_t g_stat_prev_ts, g_stat_ts_span;
-static pthread_cond_t g_sample_cond = PTHREAD_COND_INITIALIZER;
-unsigned axr_stat_reused;
+extern unsigned axr_stat_reused;   // tracking.m's frames that took a sample again
 
-static NSMutableDictionary<NSNumber *, NSNumber *> *g_inputs;
+// Every input ALVR has reported, by id, as the header publishes them.
+static struct { uint64_t id; float value; } g_buttons[AXR_MAX_BUTTONS];
+static unsigned g_nbuttons;
 static uint64_t g_input_generation;
+
+// The region tracking.m reads. Only the event thread writes it once that thread exists.
+static axr_shm_global *g_shm;
+static int g_shm_fd = -1, g_shm_ro_fd = -1;
 
 // Seated play: <config>/height.json {"eye_height": 1.6}, written by MacVapoR, puts the eyes at
 // that height above the floor. ALVR's own recentering only runs when the client syncs its
@@ -432,17 +441,6 @@ static id<MTLTexture> array_view(id<MTLTexture> t) {
     return v;
 }
 
-static uint64_t client_ts_for(int64_t xr_time) {
-    uint64_t best = 0;
-    int64_t best_d = INT64_MAX;
-    for (int i = 0; i < FRAME_RING; i++) {
-        if (!g_frames[i].client_ts) continue;
-        int64_t d = llabs(g_frames[i].xr_time - xr_time);
-        if (d < best_d) { best_d = d; best = g_frames[i].client_ts; }
-    }
-    return best;
-}
-
 // Copies each eye's layer as the app submitted it and writes it as a PNG, to see what the app
 // actually rendered into each layer.
 static void snapshot_eyes(const axr_eye_image eyes[2], id<MTLCommandQueue> queue, int n) {
@@ -502,9 +500,9 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
     pthread_mutex_unlock(&g_lock);
     if (snap) snapshot_eyes(eyes, queue, snap);
 
+    uint64_t ts = g_dump ? (uint64_t)display_time : axr_client_ts_for(display_time);
     pthread_mutex_lock(&g_lock);
     bool ready = (g_connected || g_dump) && g_encoder && g_pool;
-    uint64_t ts = g_dump ? (uint64_t)display_time : client_ts_for(display_time);
     // The client often sends no tracking until it has decoded a frame, so without this the
     // first frames would have no sample to carry and it would never get one. It takes ours.
     if (!ts && g_connected) ts = (uint64_t)display_time;
@@ -610,11 +608,53 @@ static bool finite_fov(const AlvrFov *f) {
 }
 
 static void read_tune(void);
+static axr_pose from_alvr(AlvrPose p);
+static void clear_samples(void);
 
 // Bumped when the user asks to recenter: the visionOS client syncs its playspace when the Digital
 // Crown is held (with "keep SteamVR center" off, its default) and expects the server to recenter.
-static _Atomic uint32_t g_recenter_generation;
-uint32_t axr_recenter_generation(void) { return g_recenter_generation; }
+static uint32_t g_recenter_generation;
+static uint32_t g_config_gen;   // bumped when ALVR restarts (the stream, and so the eye size, may change)
+
+// The sample ALVR has at ts, as the header's readers want it: every device's motion with ALVR's
+// shaping undone, the hands' fitted velocities, and their skeletons. Each device is looked up by
+// this exact ts, so ALVR's "else the next later one" never applies here: the readers do that on
+// the ring (tracking.m).
+static void publish_tracking_sample(uint64_t ts) {
+    pthread_mutex_lock(&g_lock);
+    stream_setup setup = g_setup;
+    pthread_mutex_unlock(&g_lock);
+    axr_shm_sample s;
+    memset(&s, 0, sizeof s);
+    s.ts = ts;
+    for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
+        AlvrDeviceMotion am;
+        if (!alvr_get_device_motion(g_device_id[d], ts, &am)) continue;
+        undo_alvr_shaping(d, &am, &setup);
+        s.dev[d].pose = from_alvr(am.pose);
+        memcpy(s.dev[d].linear_velocity, am.linear_velocity, sizeof s.dev[d].linear_velocity);
+        memcpy(s.dev[d].angular_velocity, am.angular_velocity, sizeof s.dev[d].angular_velocity);
+        s.dev[d].valid = true;
+    }
+    for (int h = 0; h < 2; h++) {
+        s.fit_ok[h] = fit_velocity(h, ts, s.fit_v[h], s.fit_w[h]);
+        AlvrPose sk[AXR_HAND_JOINTS];
+        if (!alvr_get_hand_skeleton(h, ts, sk)) continue;
+        for (int i = 0; i < AXR_HAND_JOINTS; i++) s.skel[h][i] = from_alvr(sk[i]);
+        s.skel_ok[h] = true;
+    }
+    // Seated play (read_eye_height): the first head pose of a connection sets the raise.
+    pthread_mutex_lock(&g_lock);
+    if (g_eye_height > 0 && !g_height_offset_set && s.dev[AXR_HEAD].valid && s.dev[AXR_HEAD].pose.position[1] > 0.3f) {
+        g_height_offset = g_eye_height - s.dev[AXR_HEAD].pose.position[1];
+        g_height_offset_set = true;
+        axr_log("seated: head at %.2f m, raised %.2f m", s.dev[AXR_HEAD].pose.position[1], g_height_offset);
+    }
+    pthread_mutex_unlock(&g_lock);
+    // The header's newest_ts goes first, so a reader woken by the sample sees it.
+    axr_publish_state();
+    axr_publish_sample(&s);
+}
 
 static void *event_thread(void *arg) {
     (void)arg;
@@ -633,16 +673,21 @@ static void *event_thread(void *arg) {
                 g_tracking_real = false;
                 g_samples_since_real = 0;
                 pthread_mutex_unlock(&g_lock);
+                // ALVR starts each connection with an empty history; so does the ring.
+                clear_samples();
+                axr_publish_state();
                 axr_log("headset connected");
                 break;
             case ALVR_EVENT_PLAYSPACE_SYNC:
                 g_recenter_generation++;
+                axr_publish_state();
                 axr_log("recenter requested");
                 break;
             case ALVR_EVENT_CLIENT_DISCONNECTED:
                 pthread_mutex_lock(&g_lock);
                 g_connected = false;
                 pthread_mutex_unlock(&g_lock);
+                axr_publish_state();
                 axr_log("headset disconnected");
                 break;
             case ALVR_EVENT_VIEWS_CONFIG: {
@@ -659,6 +704,7 @@ static void *event_thread(void *arg) {
                     g_views.fov[e][2] = f->up; g_views.fov[e][3] = f->down;
                 }
                 pthread_mutex_unlock(&g_lock);
+                axr_publish_state();
                 break;
             }
             case ALVR_EVENT_TRACKING_UPDATED: {
@@ -676,7 +722,6 @@ static void *event_thread(void *arg) {
                 g_stat_prev_ts = ts;
                 g_last_sample_ns = arrived;
                 bool check = g_velocity_check;
-                pthread_cond_broadcast(&g_sample_cond);
                 if (g_tracking_real) g_samples_since_real++;
                 // Smoothed, since each sample's arrival carries network jitter.
                 g_clock_offset = g_have_offset ? g_clock_offset + (offset - g_clock_offset) * 0.05 : offset;
@@ -684,6 +729,7 @@ static void *event_thread(void *arg) {
                 pthread_mutex_unlock(&g_lock);
                 record_hand_samples(ts);
                 if (check) check_velocity(ts);
+                publish_tracking_sample(ts);
                 break;
             }
             case ALVR_EVENT_BUTTONS_UPDATED: {
@@ -696,16 +742,31 @@ static void *event_thread(void *arg) {
                 g_stat_button_events++;
                 for (uint64_t i = 0; i < got && i < n; i++) {
                     // The id says nothing about binary or scalar, and a bool only sets the first byte.
-                    NSNumber *old = g_inputs[@(entries[i].id)];
                     float v = entries[i].value.float_;
                     uint32_t bits;
                     memcpy(&bits, &entries[i].value, 4);
                     if (bits <= 1) v = bits ? 1.0f : 0.0f;
-                    g_inputs[@(entries[i].id)] = @(v);
-                    if (!old || old.floatValue != v) g_input_generation++;
-                    if (!old) axr_log("input: first %s", input_name(entries[i].id));
+                    unsigned k = 0;
+                    while (k < g_nbuttons && g_buttons[k].id != entries[i].id) k++;
+                    if (k == g_nbuttons) {
+                        if (k == AXR_MAX_BUTTONS) {
+                            static bool said;
+                            if (!said) axr_log("input: more than %d inputs, dropping %s", AXR_MAX_BUTTONS, input_name(entries[i].id));
+                            said = true;
+                            continue;
+                        }
+                        g_buttons[k].id = entries[i].id;
+                        g_buttons[k].value = v;
+                        g_nbuttons++;
+                        g_input_generation++;
+                        axr_log("input: first %s", input_name(entries[i].id));
+                    } else if (g_buttons[k].value != v) {
+                        g_buttons[k].value = v;
+                        g_input_generation++;
+                    }
                 }
                 pthread_mutex_unlock(&g_lock);
+                axr_publish_state();
                 break;
             }
             case ALVR_EVENT_BATTERY: {
@@ -756,7 +817,9 @@ static void *event_thread(void *arg) {
                 g_connected = false;
                 pthread_mutex_unlock(&g_lock);
                 start_core();
+                g_config_gen++;
             }
+            axr_publish_state();   // after read_tune and any restart
             if (now - g_stat_since > 5000000000LL) {
                 double dt = (now - g_stat_since) / 1e9;
                 uint64_t audio_frames;
@@ -770,7 +833,7 @@ static void *event_thread(void *arg) {
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
                             axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
                             g_stat_samples / dt, g_stat_samples ? g_stat_ts_span / 1e6 / g_stat_samples : 0.0,
-                            g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_inputs.count, axr_stat_syncs,
+                            g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_nbuttons, axr_stat_syncs,
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
                             audio_peak);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
@@ -846,7 +909,6 @@ void axr_backend_start(void) {
     g_device_id[AXR_HEAD] = alvr_path_to_id("/user/head");
     g_device_id[AXR_LEFT] = alvr_path_to_id("/user/hand/left");
     g_device_id[AXR_RIGHT] = alvr_path_to_id("/user/hand/right");
-    g_inputs = [NSMutableDictionary dictionary];
     g_pts_to_ts = [NSMutableDictionary dictionary];
     g_array_views = [NSMapTable weakToStrongObjectsMapTable];
     g_encode_queue = dispatch_queue_create("alvrxr.encode", DISPATCH_QUEUE_SERIAL);
@@ -869,7 +931,12 @@ void axr_backend_start(void) {
     if (!g_pipeline) axr_log("compositor pipeline: %s", err.localizedDescription.UTF8String);
     CVMetalTextureCacheCreate(NULL, NULL, dev, NULL, &g_texture_cache);
 
+    // The region the runtime's readers (tracking.m) take everything from; in-process for now, so
+    // the readers get the writable mapping itself.
+    axr_tracking_attach(axr_shm_create(&g_shm_fd));
+
     start_core();
+    axr_publish_state();
     if (!g_dump) axr_audio_start();
     pthread_t t;
     pthread_create(&t, NULL, event_thread, NULL);
@@ -877,94 +944,61 @@ void axr_backend_start(void) {
     axr_log("started (config %s)", g_config_dir.UTF8String);
 }
 
-bool axr_backend_tracking(void) {
-    pthread_mutex_lock(&g_lock);
-    // Samples queued before the first decoded frame still carry the placeholder pose.
-    bool t = g_connected && g_tracking_real && g_samples_since_real > 45;
-    pthread_mutex_unlock(&g_lock);
-    return t;
-}
+// ------------------------------------------------------------------------------ shared region
 
-static bool g_fake_tpose;   // see axr_device_motion
-
-bool axr_fake_tracking(void) {
-    pthread_mutex_lock(&g_lock);
-    bool f = !g_connected && g_fake_tpose;
-    pthread_mutex_unlock(&g_lock);
-    return f;
-}
-
-bool axr_backend_connected(void) {
-    pthread_mutex_lock(&g_lock);
-    bool c = g_connected;
-    pthread_mutex_unlock(&g_lock);
-    return c;
-}
-
-double axr_refresh_hz(void) {
-    pthread_mutex_lock(&g_lock);
-    double r = g_setup.refresh > 0 ? g_setup.refresh : 90;
-    pthread_mutex_unlock(&g_lock);
-    return r;
-}
-
-void axr_recommended_eye_size(uint32_t *w, uint32_t *h) {
-    pthread_mutex_lock(&g_lock);
-    *w = g_setup.target_w ?: (g_eye_w ?: 2144);
-    *h = g_setup.target_h ?: (g_eye_h ?: 2048);
-    pthread_mutex_unlock(&g_lock);
-}
-
-// ------------------------------------------------------------------------------ frame timing
-
-// Paced by a steady clock at the headset's refresh rate. Each frame takes the newest tracking
-// sample, waiting a little for one if none has come since the last frame's. Starting frames as
-// samples arrived instead let Wi-Fi's bunching and gaps set the frame times, which stuttered.
-int64_t axr_wait_frame(void) {
-    int64_t period = (int64_t)(1e9 / axr_refresh_hz());
-    int64_t now = axr_now_ns();
-    int64_t next = g_last_wait + period;
-    if (next < now - period) next = now;   // fell behind: start again from now
-    if (next > now) {
-        struct timespec d = {(next - now) / 1000000000, (next - now) % 1000000000};
-        nanosleep(&d, NULL);
+axr_shm_global *axr_shm_create(int *fd) {
+    char name[64];
+    snprintf(name, sizeof name, "/axr-%d-%llx", getpid(), (unsigned long long)axr_now_ns());
+    int rw = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (rw < 0) { axr_log("shm_open: %s", strerror(errno)); return NULL; }
+    // The read-only fd must be opened by name, so it is taken now, before the name goes.
+    int ro = shm_open(name, O_RDONLY, 0);
+    shm_unlink(name);
+    axr_shm_global *g = NULL;
+    if (ftruncate(rw, sizeof *g) == 0)
+        g = mmap(NULL, sizeof *g, PROT_READ | PROT_WRITE, MAP_SHARED, rw, 0);
+    if (g == MAP_FAILED || !g) {
+        axr_log("shared region: %s", strerror(errno));
+        close(rw);
+        if (ro >= 0) close(ro);
+        return NULL;
     }
-    g_last_wait = next;
+    memset(g, 0, sizeof *g);
+    g->magic = AXR_SHM_MAGIC;
+    g->version = AXR_SHM_VERSION;
+    g->size = sizeof *g;
+    g_shm = g;
+    g_shm_fd = rw;
+    g_shm_ro_fd = ro;
+    *fd = rw;
+    return g;
+}
 
-    pthread_mutex_lock(&g_lock);
-    bool tracking = g_connected && g_have_offset && axr_now_ns() - g_last_sample_ns < 100000000;
-    if (tracking) {
-        int64_t deadline = axr_now_ns() + period / 4;
-        while (g_newest_ts <= g_last_frame_ts) {
-            int64_t left = deadline - axr_now_ns();
-            if (left <= 0) break;
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            int64_t abs_ns = (int64_t)tv.tv_sec * 1000000000 + tv.tv_usec * 1000 + left;
-            struct timespec until = {abs_ns / 1000000000, abs_ns % 1000000000};
-            pthread_cond_timedwait(&g_sample_cond, &g_lock, &until);
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
+int axr_shm_readonly_fd(int fd) {
+    return fd == g_shm_fd && g_shm_ro_fd >= 0 ? dup(g_shm_ro_fd) : -1;
+}
 
-    pthread_mutex_lock(&g_lock);
-    int64_t display;
-    uint64_t ts = 0;
-    if (g_connected && g_have_offset && g_newest_ts) {
-        ts = g_newest_ts;
-        if (ts == g_last_frame_ts) axr_stat_reused++;
-        g_last_frame_ts = ts;
-        display = (int64_t)((double)ts + g_clock_offset);
-    } else {
-        display = g_last_wait + 2 * period;
+static void clear_samples(void) {
+    if (!g_shm) return;
+    for (unsigned i = 0; i < AXR_SAMPLE_RING; i++) {
+        axr_seq_write_begin(&g_shm->samples[i].seq);
+        g_shm->samples[i].ts = 0;
+        axr_seq_write_end(&g_shm->samples[i].seq);
     }
-    if (display <= g_last_display) display = g_last_display + 1;   // display times must rise
-    g_last_display = display;
-    g_frames[g_frame_next % FRAME_RING].xr_time = display;
-    g_frames[g_frame_next % FRAME_RING].client_ts = ts;
-    g_frame_next++;
-    pthread_mutex_unlock(&g_lock);
-    return display;
+}
+
+void axr_publish_sample(const axr_shm_sample *s) {
+    if (!g_shm) return;
+    uint64_t head = atomic_load_explicit(&g_shm->sample_head, memory_order_relaxed);
+    axr_shm_sample *slot = &g_shm->samples[head % AXR_SAMPLE_RING];
+    axr_seq_write_begin(&slot->seq);
+    // Everything after the seqlock word, which must stay odd throughout.
+    size_t body = offsetof(axr_shm_sample, ts);
+    memcpy((char *)slot + body, (const char *)s + body, sizeof *s - body);
+    axr_seq_write_end(&slot->seq);
+    atomic_store_explicit(&g_shm->sample_head, head + 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_shm->sample_word, 1, memory_order_release);
+    os_sync_wake_by_address_all(&g_shm->sample_word, 4, OS_SYNC_WAKE_BY_ADDRESS_SHARED);
 }
 
 static axr_pose from_alvr(AlvrPose p) {
@@ -976,6 +1010,8 @@ static axr_pose from_alvr(AlvrPose p) {
 // height, and "fake_press": [paths] reads those inputs as pressed. Only while no client is connected.
 static bool g_fake_tpose;
 static NSSet<NSString *> *g_fake_press;
+static uint64_t g_fake_press_id[AXR_MAX_FAKE_PRESS];
+static unsigned g_nfake_press;
 
 typedef struct { float x, y, z, w; } quat;
 static quat qmul(quat a, quat b) {
@@ -1030,7 +1066,6 @@ typedef struct {
 } hand_sample;
 static hand_sample g_hand_samples[2][VELOCITY_RING];
 static unsigned g_hand_next[2];
-static bool g_pose_velocity = true;
 
 static void record_hand_samples(uint64_t ts) {
     pthread_mutex_lock(&g_lock);
@@ -1086,84 +1121,20 @@ static void record_hand_samples(uint64_t ts) {
     }
 }
 
-// The fitted velocities for a hand's sample at ts; false (leaving them) for the head, when turned
-// off, or for a sample not recorded.
-static bool pose_velocity(int device, uint64_t ts, float linear[3], float angular[3]) {
-    if (device == AXR_HEAD) return false;
-    int h = device == AXR_RIGHT;
+// The fitted velocities for a hand's sample at ts; false (leaving them) for a sample not
+// recorded. tune.json "pose_velocity" is the readers' to apply (axr_shm_global.pose_velocity).
+static bool fit_velocity(int hand, uint64_t ts, float linear[3], float angular[3]) {
     bool found = false;
     pthread_mutex_lock(&g_lock);
-    if (g_pose_velocity) {
-        for (unsigned k = 0; k < VELOCITY_RING && !found; k++) {
-            const hand_sample *s = &g_hand_samples[h][k];
-            if (s->ts != ts) continue;
-            memcpy(linear, s->v, sizeof s->v);
-            memcpy(angular, s->w, sizeof s->w);
-            found = true;
-        }
+    for (unsigned k = 0; k < VELOCITY_RING && !found; k++) {
+        const hand_sample *s = &g_hand_samples[hand][k];
+        if (s->ts != ts) continue;
+        memcpy(linear, s->v, sizeof s->v);
+        memcpy(angular, s->w, sizeof s->w);
+        found = true;
     }
     pthread_mutex_unlock(&g_lock);
     return found;
-}
-
-// A hand's 26 joints at time, in the tracking frame as device poses are, in the client's order:
-// SteamVR's bones, which line up with OpenXR's hand joints one for one. False while the hand
-// isn't seen, or is holding a controller and the client sends that instead.
-bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]) {
-    pthread_mutex_lock(&g_lock);
-    bool connected = g_connected;
-    uint64_t ts = client_ts_for(time), newest = g_newest_ts;
-    float raise = g_eye_height > 0 && g_height_offset_set ? g_height_offset : 0;
-    pthread_mutex_unlock(&g_lock);
-    AlvrPose sk[26];
-    uint8_t which = hand == AXR_LEFT ? 0 : 1;
-    // Skeletons are kept by their exact sample time: the frame's, or else the newest.
-    if (!connected || !((ts && alvr_get_hand_skeleton(which, ts, sk)) || (newest && alvr_get_hand_skeleton(which, newest, sk))))
-        return false;
-    for (int i = 0; i < 26; i++) {
-        out[i] = from_alvr(sk[i]);
-        out[i].position[1] += raise;
-    }
-    return true;
-}
-
-axr_motion axr_device_motion(int device, int64_t time) {
-    axr_motion m = {0};
-    pthread_mutex_lock(&g_lock);
-    bool connected = g_connected;
-    uint64_t ts = client_ts_for(time);
-    if (!ts && g_have_offset) ts = (uint64_t)((double)time - g_clock_offset);
-    pthread_mutex_unlock(&g_lock);
-    pthread_mutex_lock(&g_lock);
-    stream_setup setup = g_setup;
-    pthread_mutex_unlock(&g_lock);
-    AlvrDeviceMotion am;
-    if (connected && ts && alvr_get_device_motion(g_device_id[device], ts, &am)) {
-        undo_alvr_shaping(device, &am, &setup);
-        pose_velocity(device, ts, am.linear_velocity, am.angular_velocity);
-        m.pose = from_alvr(am.pose);
-        if (g_eye_height > 0) {
-            if (!g_height_offset_set && device == AXR_HEAD && m.pose.position[1] > 0.3f) {
-                g_height_offset = g_eye_height - m.pose.position[1];
-                g_height_offset_set = true;
-                axr_log("seated: head at %.2f m, raised %.2f m", m.pose.position[1], g_height_offset);
-            }
-            m.pose.position[1] += g_height_offset;
-        }
-        memcpy(m.linear_velocity, am.linear_velocity, sizeof m.linear_velocity);
-        memcpy(m.angular_velocity, am.angular_velocity, sizeof m.angular_velocity);
-        m.valid = true;
-    } else if (device == AXR_HEAD) {
-        m.pose = (axr_pose){{0, 0, 0, 1}, {0, 1.6f, 0}};
-        m.valid = true;
-    } else if (!connected && g_fake_tpose) {
-        // Pointing out along the arms: the left controller yawed 90 degrees left, the right one right.
-        float s = 0.70710678f;
-        m.pose = device == AXR_LEFT ? (axr_pose){{0, s, 0, s}, {-0.75f, 1.45f, -0.1f}}
-                                    : (axr_pose){{0, -s, 0, s}, {0.75f, 1.45f, -0.1f}};
-        m.valid = true;
-    }
-    return m;
 }
 
 // Stereo tuning, read from <config>/tune.json while running: {"ipd_scale":1, "fov_scale":1,
@@ -1171,16 +1142,14 @@ axr_motion axr_device_motion(int device, int64_t time) {
 static float g_ipd_scale = 1, g_fov_scale = 1;
 static float g_aim_rotation[3] = {-45, 0, 0}, g_aim_offset[3];   // pitch, yaw, roll in degrees; metres
 
-axr_pose axr_aim_offset(int hand) {
-    pthread_mutex_lock(&g_lock);
+// The aim pose in the controller's (grip) frame (alvrxr.h axr_aim_offset). With g_lock held.
+static axr_pose aim_offset(int hand) {
     float d = (float)M_PI / 360, m = hand == AXR_LEFT ? -1 : 1;   // the left hand mirrors yaw, roll and x
     quat rx = {sinf(g_aim_rotation[0] * d), 0, 0, cosf(g_aim_rotation[0] * d)};
     quat ry = {0, sinf(m * g_aim_rotation[1] * d), 0, cosf(m * g_aim_rotation[1] * d)};
     quat rz = {0, 0, sinf(m * g_aim_rotation[2] * d), cosf(m * g_aim_rotation[2] * d)};
     quat q = qmul(qmul(ry, rx), rz);
-    axr_pose p = {{q.x, q.y, q.z, q.w}, {m * g_aim_offset[0], g_aim_offset[1], g_aim_offset[2]}};
-    pthread_mutex_unlock(&g_lock);
-    return p;
+    return (axr_pose){{q.x, q.y, q.z, q.w}, {m * g_aim_offset[0], g_aim_offset[1], g_aim_offset[2]}};
 }
 static bool g_swap_eyes;
 
@@ -1220,6 +1189,11 @@ static void read_tune(void) {
     if (tpose != g_fake_tpose || ![pressed isEqualToSet:g_fake_press ?: [NSSet set]]) {
         g_fake_tpose = tpose;
         g_fake_press = pressed;
+        g_nfake_press = 0;
+        for (NSString *path in pressed) {
+            if (g_nfake_press == AXR_MAX_FAKE_PRESS) break;
+            if ([path isKindOfClass:NSString.class]) g_fake_press_id[g_nfake_press++] = alvr_path_to_id(path.UTF8String);
+        }
         g_input_generation++;
         axr_log("fake input: tpose %d, pressed %s", tpose, [[press componentsJoinedByString:@" "] UTF8String]);
     }
@@ -1230,12 +1204,11 @@ static void read_tune(void) {
     if (changed) axr_log("tune: ipd x%.3f, fov x%.3f%s", ipd, fov, swap ? ", eyes swapped" : "");
 }
 
-axr_views axr_current_views(void) {
-    pthread_mutex_lock(&g_lock);
+// The client's views with the stereo tuning applied. With g_lock held.
+static axr_views current_views(void) {
     axr_views v = g_views;
     float ipd = g_ipd_scale, fov = g_fov_scale;
     bool swap = g_swap_eyes;
-    pthread_mutex_unlock(&g_lock);
     for (int e = 0; e < 2; e++) {
         for (int k = 0; k < 3; k++) v.eye_in_head[e].position[k] *= ipd;
         for (int k = 0; k < 4; k++) v.fov[e][k] = atanf(tanf(v.fov[e][k]) * fov);
@@ -1247,28 +1220,49 @@ axr_views axr_current_views(void) {
     return v;
 }
 
-// ------------------------------------------------------------------------------------- input
+// ------------------------------------------------------------------------------- publishing
 
-bool axr_input(const char *path, float *value) {
-    uint64_t id = alvr_path_to_id(path);
+// Everything in the header, from the server's state in one go, so readers see a consistent set.
+void axr_publish_state(void) {
+    axr_shm_global *g = g_shm;
+    if (!g) return;
     pthread_mutex_lock(&g_lock);
-    if (!g_connected && [g_fake_press containsObject:@(path)]) {
-        pthread_mutex_unlock(&g_lock);
-        *value = 1;
-        return true;
+    axr_seq_write_begin(&g->seq);
+    g->connected = g_connected;
+    // Samples queued before the first decoded frame still carry the placeholder pose.
+    g->tracking_real = g_tracking_real && g_samples_since_real > 45;
+    g->have_offset = g_have_offset;
+    g->fake_tpose = g_fake_tpose;
+    g->pose_velocity = g_pose_velocity;
+    g->height_offset_set = g_height_offset_set;
+    g->swap_eyes = g_swap_eyes;
+    g->newest_ts = g_newest_ts;
+    g->clock_offset = g_clock_offset;
+    g->last_sample_ns = g_last_sample_ns;
+    g->refresh_hz = g_setup.refresh > 0 ? g_setup.refresh : 90;
+    // The stream's size, as the field says; the size games should render at (openvr_config's
+    // target, which axr_recommended_eye_size used to prefer) has no field of its own yet.
+    g->eye_w = g_eye_w;
+    g->render_w = g_setup.target_w;
+    g->render_h = g_setup.target_h;
+    g->eye_h = g_eye_h;
+    g->config_gen = g_config_gen;
+    g->recenter_gen = g_recenter_generation;
+    g->views = current_views();
+    g->aim[0] = aim_offset(AXR_LEFT);
+    g->aim[1] = aim_offset(AXR_RIGHT);
+    g->height_offset = g_height_offset;
+    g->eye_height = g_eye_height;
+    g->input_gen = g_input_generation;
+    g->nbuttons = g_nbuttons;
+    for (unsigned i = 0; i < g_nbuttons; i++) {
+        g->buttons[i].id = g_buttons[i].id;
+        g->buttons[i].value = g_buttons[i].value;
     }
-    NSNumber *v = g_inputs[@(id)];
+    g->nfake_press = g_nfake_press;
+    memcpy(g->fake_press, g_fake_press_id, sizeof g->fake_press);
+    axr_seq_write_end(&g->seq);
     pthread_mutex_unlock(&g_lock);
-    if (!v) return false;
-    *value = v.floatValue;
-    return true;
-}
-
-uint64_t axr_input_generation(void) {
-    pthread_mutex_lock(&g_lock);
-    uint64_t g = g_input_generation;
-    pthread_mutex_unlock(&g_lock);
-    return g;
 }
 
 void axr_haptics(int hand, float duration_s, float frequency, float amplitude) {

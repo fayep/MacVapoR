@@ -21,8 +21,21 @@ stays installable: `tools/runtime-switch.sh legacy` (tag `known-good-2026-10-19`
 Chosen at the first `xrGetSystem` (not `xrCreateInstance`: OpenComposite creates and destroys
 instances to probe for a headset, and those must not hand anything over). A CLIENT still links
 libalvr_server_core for LEGACY fallback but never calls `alvr_initialize`. It calls
-`alvr_path_to_id` for input paths: WP1 must confirm that is a pure hash usable without a
-running server, or the server publishes the ids it needs.
+`alvr_path_to_id` for input paths, which is a pure function: `alvr_common::hash_string`
+(common/src/version.rs), the standard library's `DefaultHasher::new()` (SipHash-1-3 with fixed
+keys) over the string, touching no server state, so it needs neither `alvr_initialize` nor
+`alvr_initialize_environment`, and the same dylib gives every process the same ids. tracking.m
+relies on this: the ids in the header (`buttons`, `fake_press`) are matched against it.
+
+How it starts (runtime.m `start_for_mode`, slots.m `axr_mode_init`). Without the flag ALVR still
+starts at `xrCreateInstance`, as at the tag. With it, `xrGetSystem` decides: SERVER starts ALVR,
+then `axr_compositor_start` and the XPC listener (`axr_transport_start`); a CLIENT's `hello`
+there maps the global region and attaches tracking, and its session is opened lazily, by
+`axr_slots_open` at `xrCreateSession`. The graphics API isn't known at `xrGetSystem`, so a Vulkan
+`xrCreateSession` in a CLIENT calls `axr_mode_force_legacy` (drops the connection, detaches
+tracking) and starts ALVR then: the game runs LEGACY. vapord reads the same flag itself and,
+with it, neither waits out claims nor exits on one. `ALVRXR_COMPOSITOR_SERVICE` overrides the
+Mach service name, for tests.
 
 ## Shared memory (axr_shm.h)
 
