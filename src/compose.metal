@@ -41,6 +41,9 @@ fragment float4 fs(VOut in [[stage_in]], texture2d_array<float> left [[texture(0
     if (c.ffr.enabled != 0) { eyeUV = unsqueeze(eyeUV, c.ffr); }
     float2 uv = float2(isRight ? 1.0 - eyeUV.x : eyeUV.x, eyeUV.y);
     uint e = isRight ? 1 : 0;
-    float2 t = c.rect[e].xy + uv * c.rect[e].zw;
+    // Unsqueezing reaches a little past the eye's edges. Clamped to its rect, as clamp_to_edge
+    // would to a texture of its own, so an eye sharing a texture (an output slot) keeps to its half.
+    float2 size = isRight ? float2(right.get_width(), right.get_height()) : float2(left.get_width(), left.get_height());
+    float2 t = clamp(c.rect[e].xy + uv * c.rect[e].zw, c.rect[e].xy + 0.5 / size, c.rect[e].xy + c.rect[e].zw - 0.5 / size);
     return isRight ? right.sample(s, t, c.slice[1]) : left.sample(s, t, c.slice[0]);
 }

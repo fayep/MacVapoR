@@ -16,6 +16,7 @@
 #include <openxr/openxr_reflection.h>
 
 #include "alvrxr.h"
+#include "compositor.h"
 
 extern unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;   // backend.m's frame summary
 extern unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;
@@ -85,6 +86,7 @@ struct session {
     uint32_t magic;
     instance *inst;
     id<MTLCommandQueue> queue;
+    axr_slots *slots;                        // every frame is composed into one of these
     bool vulkan;
     VkDevice vk_device;
     XrSessionState state;
@@ -442,6 +444,7 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     s->magic = MAGIC_SESSION;
     s->inst = (instance *)h;
     s->queue = queue;
+    s->slots = axr_slots_open(queue.device, queue);
     s->vulkan = vk != NULL;
     s->vk_device = vk ? vk->device : VK_NULL_HANDLE;
     s->action_sets = [NSMutableArray array];
@@ -463,6 +466,8 @@ static XrResult xrDestroySession_(XrSession h) {
     signal_fences(s, NULL, -1);
     pthread_mutex_lock(&g_lock);
     s->magic = 0;
+    axr_slots_close(s->slots);
+    s->slots = NULL;
     s->queue = nil;
     s->action_sets = nil;
     g_session = NULL;
@@ -1029,9 +1034,9 @@ static XrResult xrBeginFrame_(XrSession h, const XrFrameBeginInfo *info) {
 // ------------------------------------------------------------------------------- quad layers
 //
 // Games put title, splash and loading screens on quad layers: a flat image at a pose in a space,
-// often with no projection layer at all. The stream carries one picture per eye, so a frame with
-// quads is drawn into two eye images of alvrxr's own: the projection layer, if any, then each
-// quad as that eye sees it at the frame's display time.
+// often with no projection layer at all. The stream carries one picture per eye, so each frame is
+// drawn into an output slot (compositor.h), one half per eye: the projection layer, if any, then
+// each quad as that eye sees it at the frame's display time.
 
 static NSString *const kLayerShaders =
     @"#include <metal_stdlib>\n"
@@ -1057,7 +1062,6 @@ enum { BLEND_NONE, BLEND_PREMULTIPLIED, BLEND_STRAIGHT, BLEND_COUNT };
 // sRGB like the games' own swapchains; Metal blends sRGB targets in linear space.
 static const MTLPixelFormat kLayerFormat = MTLPixelFormatBGRA8Unorm_sRGB;
 static id<MTLRenderPipelineState> g_layer_pso[BLEND_COUNT];
-static id<MTLTexture> g_layer_eye[2];
 
 static bool layer_pipelines(id<MTLDevice> dev) {
     if (g_layer_pso[0]) return true;
@@ -1163,35 +1167,23 @@ static bool log_layers(const XrFrameEndInfo *info) {
     return false;
 }
 
-// Draws the frame's projection layer (if any) and its quads into g_layer_eye; false if it can't.
-static bool compose_layers(session *s, const XrFrameEndInfo *info, const XrCompositionLayerProjection *proj,
-                           bool explain) {
-    id<MTLDevice> dev = s->queue.device;
-    if (!layer_pipelines(dev)) return false;
-    uint32_t w, h;
-    axr_recommended_eye_size(&w, &h);
-    if (proj) {
-        w = proj->views[0].subImage.imageRect.extent.width;
-        h = proj->views[0].subImage.imageRect.extent.height;
-    }
-    for (int e = 0; e < 2; e++) {
-        if (g_layer_eye[e] && g_layer_eye[e].width == w && g_layer_eye[e].height == h) continue;
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kLayerFormat width:w height:h
-                                                                                 mipmapped:NO];
-        d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-        d.storageMode = MTLStorageModePrivate;
-        g_layer_eye[e] = [dev newTextureWithDescriptor:d];
-    }
-    XrPosef head = from_axr(axr_device_motion(AXR_HEAD, info->displayTime).pose);
+// Draws the frame's projection layer (if any) and its quads into target with cmd, the left eye in
+// its left half; false if it can't.
+static bool compose_layers(const XrFrameEndInfo *info, const XrCompositionLayerProjection *proj, bool explain,
+                           id<MTLCommandBuffer> cmd, id<MTLTexture> target, axr_pose head_pose) {
+    if (!layer_pipelines(cmd.device)) return false;
+    uint32_t w = (uint32_t)target.width / 2, h = (uint32_t)target.height;
+    XrPosef head = from_axr(head_pose);
     axr_views v = axr_current_views();
-    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
     for (int e = 0; e < 2; e++) {
-        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = g_layer_eye[e];
-        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
+        [enc setViewport:(MTLViewport){e * w, 0, w, h, 0, 1}];
+        [enc setScissorRect:(MTLScissorRect){e * w, 0, w, h}];
         XrPosef eye = pmul(head, from_axr(v.eye_in_head[e]));
         XrFovf fov = {v.fov[e][0], v.fov[e][1], v.fov[e][2], v.fov[e][3]};
         for (uint32_t i = 0; i < info->layerCount; i++) {
@@ -1239,9 +1231,8 @@ static bool compose_layers(session *s, const XrFrameEndInfo *info, const XrCompo
             for (int c = 0; c < 4; c++) q.uv[c][0] = corner_uv[c][0], q.uv[c][1] = corner_uv[c][1];
             draw_layer(enc, layer_blend(ql->layerFlags), tex, &q);
         }
-        [enc endEncoding];
     }
-    [cmd commit];
+    [enc endEncoding];
     return true;
 }
 
@@ -1263,8 +1254,8 @@ static XrResult end_frame(session *s, const XrFrameEndInfo *info) {
     if (!s->running) return XR_ERROR_SESSION_NOT_RUNNING;
     if (info->displayTime <= 0) return XR_ERROR_TIME_INVALID;
     if (info->environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
-    // The stream carries one picture per eye: the first stereo projection layer, unless there are
-    // quad layers to draw over it (or instead of it).
+    // The stream carries one picture per eye: the first stereo projection layer, with any quad
+    // layers drawn over it (or instead of it).
     const XrCompositionLayerProjection *proj = NULL;
     bool quads = false;
     for (uint32_t i = 0; i < info->layerCount; i++) {
@@ -1282,21 +1273,20 @@ static XrResult end_frame(session *s, const XrFrameEndInfo *info) {
     }
     // Each new layer stack is logged, and explained once.
     bool changed = log_layers(info);
-    axr_eye_image eyes[2];
-    if (quads && compose_layers(s, info, proj, changed)) {
-        for (int e = 0; e < 2; e++)
-            eyes[e] = (axr_eye_image){g_layer_eye[e], 0, 0, 0, (int32_t)g_layer_eye[e].width, (int32_t)g_layer_eye[e].height};
-    } else if (proj) {
-        for (int e = 0; e < 2; e++) {
-            const XrSwapchainSubImage *sub = &proj->views[e].subImage;
-            swapchain *sc = (swapchain *)sub->swapchain;
-            eyes[e] = (axr_eye_image){sc->images[sc->released], sub->imageArrayIndex, sub->imageRect.offset.x,
-                                      sub->imageRect.offset.y, sub->imageRect.extent.width, sub->imageRect.extent.height};
-        }
-    } else {
-        return XR_SUCCESS;
+    if (s->slots && axr_slots_stale(s->slots)) {
+        axr_slots_close(s->slots);
+        s->slots = NULL;
     }
-    axr_submit(info->displayTime, eyes, s->queue);
+    if (!s->slots) s->slots = axr_slots_open(s->queue.device, s->queue);
+    if (!s->slots) return XR_SUCCESS;
+    axr_pose head = axr_device_motion(AXR_HEAD, info->displayTime).pose;
+    id<MTLCommandBuffer> cmd = [s->queue commandBuffer];
+    uint32_t slot;
+    id<MTLTexture> target = axr_slot_begin(s->slots, cmd, &slot);
+    bool content = proj || quads;
+    if (content && !compose_layers(info, proj, changed, cmd, target, head)) content = false;
+    axr_slot_end(s->slots, cmd, slot, info->displayTime, content ? AXR_FRAME_HAS_CONTENT : 0, head);
+    [cmd commit];
     return XR_SUCCESS;
 }
 
