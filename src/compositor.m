@@ -8,10 +8,12 @@
 #import <IOSurface/IOSurfaceObjC.h>
 #import <Metal/Metal.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #include "alvrxr.h"
@@ -21,6 +23,11 @@
 #define MAX_SOURCES 4
 #define LOUNGE_IDLE_NS 2000000000LL    // after a fade to a game, the lounge idles this much later
 #define FIRST_FRAMES 3                 // content frames in a row (each within 2 periods) before a game shows
+// The dashboard (docs/compositor.md): the right controller's system button held this long opens it,
+// and the game under the panel is dimmed to this.
+#define DASHBOARD_HOLD_NS 500000000LL
+#define DASHBOARD_DIM 0.35f
+#define SYSTEM_BUTTON "/user/hand/right/input/system/click"
 
 // A frame a source has handed over: its descriptor, held until it stops being current and no
 // compose command buffer reads it.
@@ -33,6 +40,7 @@ struct axr_source {
     int id;                         // for the log: 1, 2, ...
     bool local;                     // the lounge, drawn in this process
     pid_t pid;
+    char name[64];                  // the game's program name (axr_process_name), for the dashboard
     bool gone;                      // removed: no more frames are taken, its last one may be fading out
     bool dropped;                   // its GPU resources are gone too (the struct stays: late listeners)
     IOSurface *surfaces[AXR_SLOTS];
@@ -79,14 +87,20 @@ static uint64_t g_fade_ms = 400;
 // No frame from the foreground game for this long: fade back to the lounge. Its last frame is held,
 // reprojected, until then, so a game's loading hitch needn't bounce the player to the lounge.
 static _Atomic int64_t g_watchdog_ns = 1500000000LL;
+// The dashboard: while open over a game, the lounge drives the encoder with its panel and the
+// game's held frame shows through, dimmed. The system button is watched in tick().
+static bool g_dashboard;
+static bool g_sys_down, g_sys_fired;         // the button's state, and whether this press has opened or closed
+static int64_t g_sys_press_ns;
 
 // Stats: composes, and the time from the frame's listener firing to its command buffer's commit.
 static unsigned g_stat_composed, g_stat_dropped;
 static int64_t g_stat_latency_sum, g_stat_latency_max;
 
 static void on_frame(axr_source *src, uint64_t value, int64_t fired_ns);
-static void listen(axr_source *src);
+static void listen_next(axr_source *src);
 static void source_gone(axr_source *src, const char *reason);
+static void dashboard_set(bool open, int64_t now, const char *why);
 
 static const char *name_of(const axr_source *s) {
     static char buf[4][48];
@@ -214,13 +228,15 @@ static void fade_end(int64_t now) {
         was->current.valid = false;
         release_update(was);
     }
-    if (g_fg && !g_fg->local && g_lounge) g_lounge_idle_at_ns = now + LOUNGE_IDLE_NS;
+    if (g_fg && !g_fg->local && g_lounge && !g_dashboard) g_lounge_idle_at_ns = now + LOUNGE_IDLE_NS;
 }
 
 // Starts the fade to src, from whoever was in front (its frame fades out underneath). With a
 // fade already running the other way, the new one starts where that one stood, so the picture
 // doesn't jump.
 static void make_foreground(axr_source *src, int64_t now, const char *why) {
+    // The panel belongs to whoever was in front; a change of foreground closes it.
+    if (g_dashboard) dashboard_set(false, now, why);
     axr_source *prev = g_fg;
     float had = fade_alpha(now);   // prev's weight was `had`; it is now the other, at 1 - alpha
     if (g_other && g_other != src && g_other != prev) {
@@ -246,6 +262,58 @@ static void make_foreground(axr_source *src, int64_t now, const char *why) {
     else apply_audio_fade(g_fg, g_other, fade_alpha(now));
 }
 
+// ------------------------------------------------------------------------------------ dashboard
+
+// Opens or closes it (docs/compositor.md "Dashboard"): every source's region says so; open, the
+// lounge takes focus and draws (the panel), the game in front keeps drawing without input; closed,
+// the game has focus again and the lounge idles as after a fade. A fade in progress runs on
+// regardless: its focus changes are the same ones, and fade_end leaves the idling to this.
+static void dashboard_set(bool open, int64_t now, const char *why) {
+    if (open == g_dashboard) return;
+    g_dashboard = open;
+    for (int i = 0; i < MAX_SOURCES; i++)
+        if (g_sources[i] && g_sources[i]->region) atomic_store(&g_sources[i]->region->dashboard, open);
+    axr_source *game = g_fg && !g_fg->local && !g_fg->gone ? g_fg : NULL;
+    axr_log("compositor: dashboard %s (%s) over %s", open ? "open" : "closed", why, name_of(g_fg));
+    if (open) {
+        g_lounge_idle_at_ns = 0;
+        set_focus(g_lounge, AXR_FOCUS_FOCUSED, true);
+        if (game) set_focus(game, AXR_FOCUS_VISIBLE, true);
+        return;
+    }
+    if (!game) return;   // the lounge is in front, with focus already
+    set_focus(game, AXR_FOCUS_FOCUSED, true);
+    if (g_lounge && g_lounge != g_other) {
+        set_focus(g_lounge, AXR_FOCUS_VISIBLE, true);
+        g_lounge_idle_at_ns = now + LOUNGE_IDLE_NS;
+    }
+}
+
+// Who drives the encoder: the lounge while the dashboard is open over a game (it must stay
+// responsive whatever the game does), else the foreground.
+static axr_source *driver(void) {
+    return g_dashboard && g_fg && !g_fg->local && g_lounge ? g_lounge : g_fg;
+}
+
+// The system button, from the published inputs (fake presses count while no headset is connected):
+// held DASHBOARD_HOLD_NS opens; a new press while open closes. Each press does at most one thing.
+static void watch_system_button(int64_t now) {
+    float v = 0;
+    bool down = axr_input(SYSTEM_BUTTON, &v) && v > 0.5f;
+    if (down && !g_sys_down) {
+        g_sys_down = true;
+        g_sys_press_ns = now;
+        g_sys_fired = g_dashboard;
+        if (g_dashboard) dashboard_set(false, now, "system button");
+    } else if (!down) {
+        g_sys_down = false;
+    }
+    if (down && !g_sys_fired && now - g_sys_press_ns >= DASHBOARD_HOLD_NS) {
+        g_sys_fired = true;
+        dashboard_set(true, now, "system button held");
+    }
+}
+
 // A content frame arrived from a game: the first-frame check, then the handover.
 static void handover(axr_source *src, int64_t now) {
     if (src->local || src == g_fg || src->passed) return;
@@ -265,12 +333,20 @@ static axr_compose_frame compose_frame(const axr_source *s) {
                                .display_time = d->display_time};
 }
 
-// The foreground's new frame drives: blend it with the other's current frame at the fade's alpha
-// and encode. The frames read are held until the command buffer completes.
+static bool has_content(const axr_source *s) {
+    return s && s->current.valid && (s->current.d.flags & AXR_FRAME_HAS_CONTENT);
+}
+
+// The driver's new frame drives: blend it with the other's current frame at the fade's alpha and
+// encode; or, with the dashboard open over a game, draw the lounge's panel over the game's held
+// frame, dimmed (the fade, if one runs, keeps its clock and its audio but isn't shown until the
+// panel closes). The frames read are held until the command buffer completes.
 static void compose(int64_t now, int64_t fired_ns) {
-    axr_source *fg = g_fg, *other = g_other;
-    if (!fg || !fg->current.valid || !(fg->current.d.flags & AXR_FRAME_HAS_CONTENT)) return;
-    if (other && !(other->current.valid && (other->current.d.flags & AXR_FRAME_HAS_CONTENT))) other = NULL;
+    axr_source *fg = driver(), *other;
+    if (!has_content(fg)) return;
+    bool overlay = fg != g_fg;
+    if (overlay) other = has_content(g_fg) ? g_fg : NULL;
+    else other = has_content(g_other) ? g_other : NULL;
     if (g_other && !g_fade_start_ns) {
         g_fade_start_ns = now;
         axr_log("compositor: fade start: %s over %s, %llu ms", name_of(g_fg), name_of(g_other), (unsigned long long)g_fade_ms);
@@ -280,7 +356,7 @@ static void compose(int64_t now, int64_t fired_ns) {
     uint64_t fseq = fg->current.d.seq, oseq = other ? other->current.d.seq : 0;
     frame_ref_acquire(fg, fseq);
     if (other) frame_ref_acquire(other, oseq);
-    bool ok = axr_encode_composite(&f, other ? &o : NULL, alpha, ^{
+    void (^done)(void) = ^{
         dispatch_async(g_q, ^{
             pthread_mutex_lock(&g_lock);
             frame_ref_release(fg, fseq);
@@ -289,7 +365,9 @@ static void compose(int64_t now, int64_t fired_ns) {
             if (other) source_drop(other);
             pthread_mutex_unlock(&g_lock);
         });
-    });
+    };
+    bool ok = overlay ? axr_encode_overlay(&f, other ? &o : NULL, DASHBOARD_DIM, done)
+                      : axr_encode_composite(&f, other ? &o : NULL, alpha, done);
     if (!ok) {
         frame_ref_release(fg, fseq);
         if (other) frame_ref_release(other, oseq);
@@ -307,7 +385,7 @@ static void compose(int64_t now, int64_t fired_ns) {
 
 // ------------------------------------------------------------------------------------- frames
 
-static void listen(axr_source *src) {
+static void listen_next(axr_source *src) {
     if (src->gone || !src->frame_event) return;
     uint64_t seq = src->next_seq;
     [src->frame_event notifyListener:g_listener atValue:seq block:^(id<MTLSharedEvent> e, uint64_t value) {
@@ -327,7 +405,7 @@ static void on_frame(axr_source *src, uint64_t value, int64_t fired_ns) {
     if (sig < value) sig = value;
     uint64_t head = atomic_load_explicit(&src->region->frame_head, memory_order_acquire);
     if (sig > head) sig = head;   // can't happen with a runtime that writes the descriptor first
-    if (sig < src->next_seq) { pthread_mutex_unlock(&g_lock); listen(src); return; }
+    if (sig < src->next_seq) { pthread_mutex_unlock(&g_lock); listen_next(src); return; }
     src->stat_skipped += (unsigned)(sig - src->next_seq);
     axr_frame_desc d = src->region->frames[sig % AXR_FRAME_RING];
     src->newest_seq = sig;
@@ -339,7 +417,7 @@ static void on_frame(axr_source *src, uint64_t value, int64_t fired_ns) {
         src->stat_skipped++;
         release_update(src);
         pthread_mutex_unlock(&g_lock);
-        listen(src);
+        listen_next(src);
         return;
     }
     // The slot must not be one still held here; a runtime that reuses it early broke the protocol.
@@ -359,17 +437,19 @@ static void on_frame(axr_source *src, uint64_t value, int64_t fired_ns) {
     if (shown) src->current = (frame_ref){.d = d, .valid = true};
     else if (content) src->stat_unread++;
     release_update(src);
-    if (content && src == g_fg) compose(now, fired_ns);
+    if (content && src == driver()) compose(now, fired_ns);
     pthread_mutex_unlock(&g_lock);
-    listen(src);
+    listen_next(src);
 }
 
 // ------------------------------------------------------------------------------------- timer
 
-// Every 50 ms: the watchdog on the foreground game, the lounge's idling, and gone sources.
+// Every 50 ms: the system button, the watchdog on the foreground game, the lounge's idling, and
+// gone sources.
 static void tick(void) {
     pthread_mutex_lock(&g_lock);
     int64_t now = axr_now_ns();
+    watch_system_button(now);
     axr_source *fg = g_fg;
     if (fg && !fg->local && !fg->gone && fg->last_frame_ns && now - fg->last_frame_ns > atomic_load(&g_watchdog_ns) && g_lounge) {
         axr_log("compositor: watchdog: no frame from %s for %.0f ms", name_of(fg), (now - fg->last_frame_ns) / 1e6);
@@ -379,7 +459,7 @@ static void tick(void) {
     }
     if (g_lounge_idle_at_ns && now >= g_lounge_idle_at_ns) {
         g_lounge_idle_at_ns = 0;
-        if (g_lounge && g_fg != g_lounge && g_other != g_lounge) set_focus(g_lounge, AXR_FOCUS_VISIBLE, false);
+        if (g_lounge && g_fg != g_lounge && g_other != g_lounge && !g_dashboard) set_focus(g_lounge, AXR_FOCUS_VISIBLE, false);
     }
     for (int i = 0; i < MAX_SOURCES; i++)
         if (g_sources[i] && g_sources[i]->gone) source_drop(g_sources[i]);
@@ -487,6 +567,8 @@ axr_source *axr_compositor_add_source(bool local, pid_t pid) {
     // has nothing in front of it.
     atomic_store(&s->region->focus, AXR_FOCUS_FOCUSED);
     atomic_store(&s->region->should_render, 1);
+    atomic_store(&s->region->dashboard, g_dashboard);
+    if (!local && pid > 0) axr_process_name(pid, s->name);
     g_sources[at] = s;
     if (!local && pid > 0) {
         s->exit_source = dispatch_source_create(DISPATCH_SOURCE_TYPE_PROC, (uintptr_t)pid, DISPATCH_PROC_EXIT, g_q);
@@ -514,7 +596,7 @@ axr_source *axr_compositor_add_source(bool local, pid_t pid) {
     axr_log("compositor: source added: %s, slots %ux%u, fd %d%s", name_of(s), eye_w * 2, eye_h, s->fd,
             s == g_fg ? ", foreground" : "");
     pthread_mutex_unlock(&g_lock);
-    listen(s);
+    listen_next(s);
     return s;
 }
 
@@ -587,9 +669,9 @@ void axr_compositor_stats(char *buf, size_t n) {
     if (!g_started) return;
     pthread_mutex_lock(&g_lock);
     size_t at = 0;
-    at += snprintf(buf + at, n - at, " | compositor: %u composed (%u dropped), listener-to-commit %.2f ms mean, %.2f max; fg %s%s",
+    at += snprintf(buf + at, n - at, " | compositor: %u composed (%u dropped), listener-to-commit %.2f ms mean, %.2f max; fg %s%s%s",
                    g_stat_composed, g_stat_dropped, g_stat_composed ? g_stat_latency_sum / 1e6 / g_stat_composed : 0.0,
-                   g_stat_latency_max / 1e6, name_of(g_fg), g_other ? " fading" : "");
+                   g_stat_latency_max / 1e6, name_of(g_fg), g_other ? " fading" : "", g_dashboard ? ", dashboard open" : "");
     for (int i = 0; i < MAX_SOURCES && at < n; i++) {
         axr_source *s = g_sources[i];
         if (!s) continue;
@@ -602,4 +684,81 @@ void axr_compositor_stats(char *buf, size_t n) {
     g_stat_composed = g_stat_dropped = 0;
     g_stat_latency_sum = g_stat_latency_max = 0;
     pthread_mutex_unlock(&g_lock);
+}
+
+// ------------------------------------------------------------------------------------- dashboard API
+
+bool axr_compositor_dashboard(pid_t *game_pid, char name[64]) {
+    pthread_mutex_lock(&g_lock);
+    axr_source *game = g_fg && !g_fg->local && !g_fg->gone ? g_fg : NULL;
+    bool open = g_dashboard;
+    *game_pid = game ? game->pid : 0;
+    snprintf(name, 64, "%s", game ? game->name : "");
+    pthread_mutex_unlock(&g_lock);
+    return open;
+}
+
+void axr_compositor_close_dashboard(void) {
+    pthread_mutex_lock(&g_lock);
+    dashboard_set(false, axr_now_ns(), "the panel");
+    pthread_mutex_unlock(&g_lock);
+}
+
+void axr_compositor_test_dashboard(bool open) {
+    pthread_mutex_lock(&g_lock);
+    dashboard_set(open, axr_now_ns(), "test");
+    pthread_mutex_unlock(&g_lock);
+}
+
+// The game's runtime takes exit_request through xrRequestExitSession's states and ends the
+// session, which removes the source; the lounge comes back now rather than then, so the player
+// isn't left looking at a game that is winding down (or one that ignores the request: its frames
+// go unread from here, as it stays `passed`).
+bool axr_compositor_quit_game(void) {
+    pthread_mutex_lock(&g_lock);
+    axr_source *game = g_fg && !g_fg->local && !g_fg->gone ? g_fg : NULL;
+    if (game) {
+        int64_t now = axr_now_ns();
+        if (game->region) atomic_store(&game->region->exit_request, 1);
+        axr_log("compositor: quit %s (dashboard)", name_of(game));
+        if (g_lounge) make_foreground(g_lounge, now, "quit");
+        else dashboard_set(false, now, "quit");
+    }
+    pthread_mutex_unlock(&g_lock);
+    return game != NULL;
+}
+
+// Trims a path, Windows or POSIX, to its last component without ".exe".
+static void program_name(const char *path, char out[64]) {
+    const char *last = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/' || *p == '\\') last = p + 1;
+    snprintf(out, 64, "%s", last);
+    size_t n = strlen(out);
+    if (n > 4 && !strcasecmp(out + n - 4, ".exe")) out[n - 4] = 0;
+}
+
+void axr_process_name(pid_t pid, char out[64]) {
+    out[0] = 0;
+    // argv[0] (KERN_PROCARGS2): a Wine process puts the Windows program's path there, which is what
+    // the player knows the game as; the Mach-O path would say wine64-preloader.
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+    size_t len = 0;
+    char *buf = NULL;
+    if (sysctl(mib, 3, NULL, &len, NULL, 0) == 0 && len > sizeof(int) && (buf = malloc(len + 1)) &&
+        sysctl(mib, 3, buf, &len, NULL, 0) == 0 && len > sizeof(int)) {
+        buf[len] = 0;
+        int argc;
+        memcpy(&argc, buf, sizeof argc);
+        // argc, the executable path, NUL padding, then argv[0].
+        const char *p = buf + sizeof(int), *end = buf + len;
+        while (p < end && *p) p++;
+        while (p < end && !*p) p++;
+        if (argc > 0 && p < end && *p) program_name(p, out);
+    }
+    free(buf);
+    if (!out[0]) {
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(pid, path, sizeof path) > 0) program_name(path, out);
+    }
 }

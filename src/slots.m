@@ -308,3 +308,5 @@ void axr_slot_end(axr_slots *s, id<MTLCommandBuffer> cmd, uint32_t slot, int64_t
 
 uint32_t axr_slots_focus(const axr_slots *s) { return atomic_load(&s->region->focus); }
 bool axr_slots_should_render(const axr_slots *s) { return atomic_load(&s->region->should_render) != 0; }
+uint32_t axr_slots_dashboard(const axr_slots *s) { return atomic_load(&s->region->dashboard); }
+uint32_t axr_slots_exit_request(const axr_slots *s) { return atomic_load(&s->region->exit_request); }

@@ -107,7 +107,14 @@ typedef struct {
 // axr_submit does. done runs when the GPU has finished reading the textures; false (and no done)
 // when the frame was dropped: not ready, or 2 already in flight.
 bool axr_encode_composite(const axr_compose_frame *fg, const axr_compose_frame *other, float alpha, void (^done)(void));
+// The dashboard: fg (the lounge's panel, premultiplied alpha) over under (the game, reprojected to
+// fg's head pose) dimmed to dim; otherwise as axr_encode_composite. under may be NULL.
+bool axr_encode_overlay(const axr_compose_frame *fg, const axr_compose_frame *under, float dim, void (^done)(void));
 #endif
+// The dashboard's calls into the server (compositor.m and runtime.m's private functions; SERVER only).
+void axr_server_recenter(void);                      // as ALVR_EVENT_PLAYSPACE_SYNC: bumps the recenter generation
+void axr_server_set_eye_height(float eye_height);    // seated at eye_height from where the head is now; 0 = standing. Saves height.json
+void axr_server_dashboard_stats(float battery[3], uint32_t charging[3], float *fps, float *mbps, float *eye_height, float *height_offset);
 // The global region's writable fd (-1 before axr_backend_start); axr_shm_readonly_fd takes it.
 int axr_shm_global_fd(void);
 // The compositor's part of the 5 s stats line, " | compositor: ..." or "" when it isn't running.

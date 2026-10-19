@@ -166,8 +166,11 @@ tests/ drives sources and checks the decoded frames' colours and fade (ffmpeg de
 `--stall-after`, `--exit-after`, `--crash-after`, `--format`) and `dumpcheck` (decodes an
 ALVRXR_DUMP stream, prints per-frame colours and the frame number read from xrclient's bar row);
 `tests/headless.sh single` runs one client end to end with a scratch config dir. The handover,
-crash and two-clients scenarios are stubs until the compositor exists. Anything about feel is
-checked in the headset.
+crash and two-clients scenarios are stubs until the compositor exists. `tests/compositor-check.sh
+dashboard` drives the dashboard in the compositor (a tune.json fake press of the system button,
+the overlay compose, quit, eye height, recenter); `tests/dashboard-check.sh` the runtime side (a
+game never sees the system button and follows exit_request; vapord's session, in SERVER mode on
+a test service name, uses the private functions). Anything about feel is checked in the headset.
 
 ## Dashboard
 
