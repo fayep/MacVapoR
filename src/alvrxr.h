@@ -1,7 +1,8 @@
 // alvrxr: an OpenXR runtime for macOS that displays through ALVR's server_core, so the ALVR
 // visionOS client shows the frames and supplies head, controller and button input.
 //
-// runtime.m is the OpenXR surface; backend.m owns ALVR, the compositor and the encoder.
+// runtime.m is the OpenXR surface; server.m owns ALVR, the compositor and the encoder, and
+// publishes tracking and input into shared memory, which tracking.m reads.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -57,7 +58,7 @@ bool axr_fake_tracking(void);       // tune.json fake_tpose, with no client: rep
 // degrees about its Y, X and Z axes (pitch -45 unless set), and "aim_offset" [x, y, z] metres; the
 // left hand mirrors yaw, roll and x.
 axr_pose axr_aim_offset(int hand);
-bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]);   // see backend.m
+bool axr_hand_joints(int hand, int64_t time, axr_pose out[26]);   // see tracking.m
 bool axr_backend_tracking(void);     // connected and past the client's placeholder poses
 uint32_t axr_recenter_generation(void);   // changes when the user asks to recenter (Digital Crown)
 double axr_refresh_hz(void);

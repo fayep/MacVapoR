@@ -6,5 +6,6 @@ OPENXR=${OPENXR:-$HOME/Source/OpenXR-SDK-Source}
 scratch=$(mktemp -d)
 clang -fobjc-arc -O1 -Wall -I "$OPENXR/build/include" -I "$OPENXR/include" -framework Foundation -framework Metal \
     "$here/tests/focus-check.m" -o "$scratch/focus-check"
+sed "s/\"web_server_port\": 8082/\"web_server_port\": 18082/" "$here/macvapor/session-template.json" > "$scratch/session.json"
 ALVRXR_DUMP=$scratch/dump.bin ALVRXR_CONFIG_DIR=$scratch ALVRXR_TEST_FOCUS_FILE=$scratch/focus ALVRXR_RUNTIME=$here/out/libalvrxr.dylib \
     "$scratch/focus-check"

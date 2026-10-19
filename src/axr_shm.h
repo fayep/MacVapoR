@@ -50,6 +50,8 @@ typedef struct {
     int64_t last_sample_ns;         // CLOCK_MONOTONIC arrival of the newest sample
     double refresh_hz;
     uint32_t eye_w, eye_h;          // the stream's eye size: output slots are 2*eye_w x eye_h
+    uint32_t render_w, render_h;    // openvr_config's target eye size, what games are asked to
+                                    // render at; 0 = the stream's eye size
     uint32_t config_gen;            // bumps when the stream restarts or eye size changes
     uint32_t recenter_gen;          // as axr_recenter_generation()
     axr_views views;                // with tune.json ipd_scale, fov_scale, swap_eyes applied
@@ -99,6 +101,8 @@ typedef struct {
 // ---------------------------------------------------------------------------- seqlock helpers
 // Writer (single thread): axr_seq_write_begin; write the fields; axr_seq_write_end.
 // Reader: do { s = axr_seq_read_begin(); copy the fields out; } while (!axr_seq_read_ok(s));
+// A writer that died mid-write (vapord gone) leaves seq odd for good: after about a millisecond
+// the reader takes what is there rather than spin forever; the session is about to be lost anyway.
 
 static inline void axr_seq_write_begin(_Atomic uint32_t *seq) {
     uint32_t s = atomic_load_explicit(seq, memory_order_relaxed);
@@ -111,10 +115,10 @@ static inline void axr_seq_write_end(_Atomic uint32_t *seq) {
 }
 static inline uint32_t axr_seq_read_begin(_Atomic uint32_t *seq) {
     uint32_t s;
-    while ((s = atomic_load_explicit(seq, memory_order_acquire)) & 1) { }
+    for (int spins = 0; ((s = atomic_load_explicit(seq, memory_order_acquire)) & 1) && spins < 100000; spins++) { }
     return s;
 }
 static inline bool axr_seq_read_ok(_Atomic uint32_t *seq, uint32_t begin) {
     atomic_thread_fence(memory_order_acquire);
-    return atomic_load_explicit(seq, memory_order_relaxed) == begin;
+    return atomic_load_explicit(seq, memory_order_relaxed) == begin || (begin & 1);
 }
