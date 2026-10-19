@@ -143,5 +143,9 @@ Rules for test runs, because Faye's real lounge is running on this machine:
   variant, never touch launchd, the OpenXR manifest or MacVapoR's folders: the lead does that.
 - Check whether `alvr_initialize` opens any port (e.g. a web server) that the real vapord also
   uses; if it does, report it rather than working around it.
- tests/xrclient and tests/headless.sh (WP3) drive sources and check the decoded
-frames' colours and fade. Anything about feel is checked in the headset.
+tests/ drives sources and checks the decoded frames' colours and fade (ffmpeg decodes):
+`tests/build.sh` builds `xrclient` (a Metal client: `--color`, `--quad`, `--black-first`,
+`--stall-after`, `--exit-after`, `--crash-after`, `--format`) and `dumpcheck` (decodes an
+ALVRXR_DUMP stream, prints per-frame colours and the frame number read from xrclient's bar row);
+`tests/headless.sh single` runs one client end to end with a scratch config dir. The handover,
+crash and two-clients scenarios are stubs until the compositor exists. Anything about feel is checked in the headset.
