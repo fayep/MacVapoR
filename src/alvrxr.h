@@ -42,7 +42,16 @@ void axr_backend_start(void);
 // The game's audio, tapped by MacVapoR Audio and handed to ALVR (audio.m).
 bool axr_audio_available(void);
 void axr_audio_start(void);
-void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call
+void axr_audio_stats(uint64_t *frames, float *peak);   // since the last call, over all sources
+// The mixer: each source is a process MacVapoR Audio taps into a ring of its own, mixed into the
+// one stream ALVR sends. A source starts at gain 1, or at the first gain set before it plays; the
+// mixer moves smoothly to a new gain (linear amplitude, 0..1) within 15 ms. Removing fades it out
+// first. Any thread. axr_audio_start is axr_audio_add_source(getpid()).
+#include <sys/types.h>
+typedef struct axr_audio_source axr_audio_source;
+axr_audio_source *axr_audio_add_source(pid_t pid);   // NULL if there's no helper or no room
+void axr_audio_set_gain(axr_audio_source *src, float gain);
+void axr_audio_remove_source(axr_audio_source *src);   // src is gone after this
 bool axr_backend_connected(void);
 bool axr_fake_tracking(void);       // tune.json fake_tpose, with no client: report the head as tracked
 // The aim pose in the controller's (grip) frame: tune.json "aim_yaw", "aim_pitch" and "aim_roll"
