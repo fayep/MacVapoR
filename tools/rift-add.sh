@@ -221,9 +221,10 @@ if pgrep -x steam_osx >/dev/null; then
     while pgrep -x steam_osx >/dev/null; do sleep 3; done
     sleep 2
 fi
-# Forward slashes: Steam strips backslashes from launch options; Windows takes either.
+# Forward slashes: Steam strips backslashes from launch options; Windows takes either. The
+# variables need %command% after them, or Steam hands them to the launcher as arguments.
 winpath() { case "$1" in *" "*) printf '"Z:%s"' "$1" ;; *) printf 'Z:%s' "$1" ;; esac; }
-opts="CX_GRAPHICS_BACKEND=dxmt WINEMSYNC=1 /wait /openxr /app $canonicalName /cwd $(winpath "$(dirname "$game/$exe")") $(winpath "$game/$exe")$game_args"
+opts="CX_GRAPHICS_BACKEND=dxmt WINEMSYNC=1 %command% /wait /openxr /app $canonicalName /cwd $(winpath "$(dirname "$game/$exe")") $(winpath "$game/$exe")$game_args"
 python3 -I "$here/tools/steam_shortcut.py" --steam "$STEAM" --user "$STEAM_USER" --appid "$id" --name "$name" \
     --exe "$prefix/drive_c/Program Files/RiftLift/RiftLiftLauncher.exe" \
     --start-dir "$prefix/drive_c/Program Files/RiftLift" \
