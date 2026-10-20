@@ -9,7 +9,10 @@
 #   --account  AVP-Play's keychain account (`avpplay login --account NAME`). Meta has to confirm
 #              that this account owns the game before anything is copied or installed.
 #   --patched-dxmt  our DXMT with SwapDeviceContextState, for games that need it (Lone Echo);
-#              others keep CrossOver's (Robo Recall crashed on ours).
+#              others keep CrossOver's.
+#
+# An Unreal game with Epic's telemetry (AnalyticsET) has its web requests sent to a dead proxy: its
+# uploads to the retired datarouter.ol.epicgames.com crashed Robo Recall's HTTP thread under Wine.
 #   --from-pc  copy the game over ssh from that Windows PC's Meta library (D:\Oculus or wherever
 #              its manifests say), when it isn't in RIFT_DIR yet. The copy is checked file by file
 #              against the SHA-256 values in Meta's manifest.
@@ -186,6 +189,24 @@ PY
             "$W" reg add "HKCU\\Software\\Wine\\AppDefaults\\$(basename "$exe")\\DllOverrides" /v $f /t REG_SZ /d native /f >/dev/null
     done
     CX_ROOT="$RUNNER" WINEPREFIX="$prefix" "$RUNNER/bin/wineserver-arm64" -w
+fi
+
+# Epic's telemetry: its module (AnalyticsET) beside the game, or built into the executable. Every
+# such game posts to datarouter.ol.epicgames.com, long retired; under Wine a failed upload crashed
+# Robo Recall's HTTP thread (a garbage call, then a stack overflow unwinding it), at random, a few
+# minutes in. A dead proxy for the prefix makes libcurl fail at once, before anything else runs.
+# Rift games' online services go through Meta's platform DLL (RiftLift's stand-in), not curl.
+if find "$game" -iname '*AnalyticsET*' -print -quit 2>/dev/null | grep -q . ||
+    LC_ALL=C /usr/bin/grep -q -a AnalyticsET "$game/$exe" 2>/dev/null; then
+    step "Epic telemetry: blocked"
+    RUNNER="$HOME/Library/Application Support/notproton/runners/current"
+    W="$RUNNER/lib/wine/aarch64-unix/wine.app/Contents/MacOS/wine"
+    for v in http_proxy https_proxy; do
+        CX_ROOT="$RUNNER" WINEPREFIX="$prefix" WINEDEBUG=-all WINESERVER="$RUNNER/bin/wineserver-arm64" \
+            "$W" reg add 'HKCU\Environment' /v $v /t REG_SZ /d http://127.0.0.1:9 /f >/dev/null
+    done
+    CX_ROOT="$RUNNER" WINEPREFIX="$prefix" "$RUNNER/bin/wineserver-arm64" -w
+    echo "the game has Epic's AnalyticsET: its web requests go to a dead proxy (http_proxy, https_proxy)"
 fi
 
 step "artwork"
