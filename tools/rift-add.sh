@@ -2,12 +2,14 @@
 # Adds a Meta Rift (Oculus PC) game to Steam as a NotProton game that runs on the Vision Pro through
 # alvrxr: the files, a Steam shortcut with artwork, its prefix, and the OpenXR and Rift setup.
 #
-#   tools/rift-add.sh [--account NAME] [--from-pc HOST] META_APP_ID
+#   tools/rift-add.sh [--account NAME] [--from-pc HOST] [--patched-dxmt] META_APP_ID
 #       e.g. tools/rift-add.sh --account default 1180401875303371          (Asgard's Wrath)
 #            tools/rift-add.sh --account wife --from-pc jormungandr 1081190428622821
 #
 #   --account  AVP-Play's keychain account (`avpplay login --account NAME`). Meta has to confirm
 #              that this account owns the game before anything is copied or installed.
+#   --patched-dxmt  our DXMT with SwapDeviceContextState, for games that need it (Lone Echo);
+#              others keep CrossOver's (Robo Recall crashed on ours).
 #   --from-pc  copy the game over ssh from that Windows PC's Meta library (D:\Oculus or wherever
 #              its manifests say), when it isn't in RIFT_DIR yet. The copy is checked file by file
 #              against the SHA-256 values in Meta's manifest.
@@ -19,9 +21,10 @@
 #   DXMT_BUILD (an ARM64EC DXMT with SwapDeviceContextState, ~/Source/dxmt/install-arm64ec/aarch64-windows)
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
-account=default host=
+account=default host= patched_dxmt=0
 while [ $# -gt 1 ]; do
     case "$1" in
+        --patched-dxmt) patched_dxmt=1; shift ;;
         --account) account=$2; shift 2 ;;
         --from-pc) host=$2; shift 2 ;;
         *) sed -n 2,14p "$0" >&2; exit 2 ;;
@@ -164,7 +167,7 @@ fi
 
 # Until CrossOver's DXMT has SwapDeviceContextState: ours, loaded as native by the game alone.
 # CX_GRAPHICS_BACKEND=dxmt stays set, so CrossOver still provides winemetal and its Metal side.
-if [ -f "$DXMT_BUILD/d3d11.dll" ]; then
+if [ "$patched_dxmt" = 1 ] && [ -f "$DXMT_BUILD/d3d11.dll" ]; then
     step "DXMT ($DXMT_BUILD)"
     RUNNER="$HOME/Library/Application Support/notproton/runners/current"
     W="$RUNNER/lib/wine/aarch64-unix/wine.app/Contents/MacOS/wine"
