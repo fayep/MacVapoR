@@ -14,7 +14,7 @@ stays installable: `tools/runtime-switch.sh legacy` (tag `known-good-2026-10-19`
 
 | Mode | Who | ALVR server | Frames go |
 |---|---|---|---|
-| LEGACY | everything, without the flag; Vulkan sessions; clients that can't reach vapord | in-process | encoded in-process, as at the tag |
+| LEGACY | everything, without the flag; clients that can't reach vapord | in-process | encoded in-process, as at the tag |
 | SERVER | vapord with the flag | in-process, never exits | compositor in-process |
 | CLIENT | games with the flag | none | IOSurface slots → vapord |
 
@@ -31,9 +31,10 @@ How it starts (runtime.m `start_for_mode`, slots.m `axr_mode_init`). Without the
 starts at `xrCreateInstance`, as at the tag. With it, `xrGetSystem` decides: SERVER starts ALVR,
 then `axr_compositor_start` and the XPC listener (`axr_transport_start`); a CLIENT's `hello`
 there maps the global region and attaches tracking, and its session is opened lazily, by
-`axr_slots_open` at `xrCreateSession`. The graphics API isn't known at `xrGetSystem`, so a Vulkan
-`xrCreateSession` in a CLIENT calls `axr_mode_force_legacy` (drops the connection, detaches
-tracking) and starts ALVR then: the game runs LEGACY. vapord reads the same flag itself and,
+`axr_slots_open` at `xrCreateSession`. Vulkan sessions are clients like Metal ones (since
+2026-10-19; before, a Vulkan `xrCreateSession` forced LEGACY, which vapord in compositor mode
+doesn't make room for): the swapchain images are MoltenVK-backed MTLTextures and the session's
+queue is MoltenVK's MTLCommandQueue, which orders the game's work before the compose. vapord reads the same flag itself and,
 with it, neither waits out claims nor exits on one. `ALVRXR_COMPOSITOR_SERVICE` overrides the
 Mach service name, for tests.
 

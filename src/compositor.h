@@ -16,8 +16,8 @@ typedef enum {
 } axr_mode;
 
 // LEGACY unless tune.json "compositor": true. With it, vapord (ALVRXR_HOME) is SERVER; anything
-// else tries hello() for ~1.5 s and is CLIENT if it succeeds, LEGACY if not. A Vulkan session
-// in a CLIENT process falls back by calling axr_mode_force_legacy() before it is created.
+// else tries hello() for ~1.5 s and is CLIENT if it succeeds, LEGACY if not. Metal and Vulkan
+// sessions alike are clients; axr_mode_force_legacy() remains for a client that must fall back.
 axr_mode axr_mode_init(void);
 axr_mode axr_mode_current(void);
 void axr_mode_force_legacy(void);

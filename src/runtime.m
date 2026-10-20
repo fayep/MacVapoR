@@ -564,11 +564,10 @@ static XrResult xrCreateSession_(XrInstance h, const XrSessionCreateInfo *info, 
     if (binding) queue = (__bridge id<MTLCommandQueue>)binding->commandQueue;
     else if (vk) queue = axr_vk_session_queue(vk->instance, vk->device, vk->queueFamilyIndex, vk->queueIndex);
     if (!queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
-    // The compositor takes Metal frames only (v1): a Vulkan game runs the headset itself.
-    if (vk && axr_mode_current() == AXR_MODE_CLIENT) {
-        axr_mode_force_legacy();
-        axr_backend_start();
-    }
+    // A Vulkan game is a client too. Its swapchain images are MTLTextures (MoltenVK's, made here),
+    // and the queue is MoltenVK's own MTLCommandQueue: the game's submissions are enqueued on it
+    // before xrReleaseSwapchainImage, so end_frame's compose, encoded on the same queue after
+    // them, reads finished images, as in-process.
     pthread_mutex_lock(&g_lock);
     if (g_session) { pthread_mutex_unlock(&g_lock); return XR_ERROR_LIMIT_REACHED; }
     session *s = calloc(1, sizeof *s);
