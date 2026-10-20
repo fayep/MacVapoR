@@ -82,6 +82,7 @@ typedef struct space {
     XrReferenceSpaceType ref;
     action *act;
     int hand;                               // AXR_LEFT/RIGHT for action spaces
+    bool hand_late;                         // no subaction path, made before any binding: see space_hand
     XrPosef offset;
 } space;
 
@@ -772,6 +773,18 @@ typedef struct {
 
 static int sub_of(NSString *binding);
 
+// An action space's hand. One made with no subaction path before its action had bindings
+// (OpenComposite makes its per-hand grip spaces before attaching, and again for each session it
+// recreates) takes the hand its action is bound to now: else both of No Man's Sky's hands were the
+// right one.
+static int space_hand(space *sp) {
+    if (sp->hand_late && sp->act->bindings.count) {
+        sp->hand = sub_of(sp->act->bindings[0]) == SUB_LEFT ? AXR_LEFT : AXR_RIGHT;
+        sp->hand_late = false;
+    }
+    return sp->hand;
+}
+
 // Whether an action space follows the aim pose: what its action is bound to now, since apps may
 // make their spaces before attaching the bindings (RiftLift does).
 static bool space_is_aim(const space *sp) {
@@ -807,7 +820,7 @@ static bool space_in_stage(space *sp, XrTime t, XrPosef *out, bool *tracked, spa
         *out = pmul(base, sp->offset);
         return true;
     }
-    axr_motion m = axr_device_motion(sp->hand, t);
+    axr_motion m = axr_device_motion(space_hand(sp), t);
     if (!m.valid) return false;
     XrPosef device = from_axr(m.pose);
     if (space_is_aim(sp)) device = pmul(device, from_axr(axr_aim_offset(sp->hand)));
@@ -1512,6 +1525,8 @@ static XrResult xrAttachSessionActionSets_(XrSession h, const XrSessionActionSet
         as->attached = true;
         [s->action_sets addObject:[NSValue valueWithPointer:as]];
     }
+    // A new session attaches again (OpenComposite recreates its session): start from none.
+    for (NSArray *pair in sug[profile]) [((action *)[pair[0] pointerValue])->bindings removeAllObjects];
     for (NSArray *pair in sug[profile]) {
         action *a = [pair[0] pointerValue];
         NSString *b = pair[1];
@@ -1730,6 +1745,7 @@ static XrResult xrCreateActionSpace_(XrSession h, const XrActionSpaceCreateInfo 
     }
     // ALVR reports the controller's grip; aim is offset from it by axr_aim_offset (space_is_aim).
     return new_space((session *)h, (space){.kind = SPACE_ACTION, .act = a, .hand = hand,
+                                           .hand_late = u == SUB_NONE && a->bindings.count == 0,
                                            .offset = info->poseInActionSpace}, out);
 }
 
