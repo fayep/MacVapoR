@@ -7,8 +7,10 @@
 //
 // "fill" is the eye's commonest colour (not black or white), "other" the next (a quad, say; -1 if
 // none), "bars" the number from xrclient's bar row, or - if it doesn't read (none drawn, or covered).
-// The stream is limited-range BT.709 without saying so, hence the scale filter below; colours then
-// come out within a few levels of what was asked.
+// At the end of the line, "white" and "black" are the left eye's sync and end cells of the bar row
+// (- if unread), to check the ends of the range. ffmpeg decodes with the range and matrix the
+// stream's VUI gives (full-range BT.709 unless the session says otherwise); colours then come out
+// within a level or two of what was asked.
 #import <Foundation/Foundation.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -55,11 +57,12 @@ static bool white_at(const uint8_t *f, int stride, int x, int y) {
     return p[0] > 215 && p[1] > 215 && p[2] > 215;
 }
 
-static int read_bars(const uint8_t *f, int stride, int eye_x, int eye_w, int eye_h) {
+static int read_bars(const uint8_t *f, int stride, int eye_x, int eye_w, int eye_h, rgb *white, rgb *black) {
     int sx = -1;
     for (int x = eye_x; x < eye_x + eye_w && sx < 0; x++)
         for (int y = 0; y < eye_h; y += 2)
             if (white_at(f, stride, x, y)) { sx = x; break; }
+    *white = *black = (rgb){-1, -1, -1};
     if (sx < 0) return -1;
     // The sync cell's vertical middle: the white run down the column a few pixels in.
     int top = -1, bot = -1;
@@ -68,8 +71,9 @@ static int read_bars(const uint8_t *f, int stride, int eye_x, int eye_w, int eye
     if (top < 0 || bot - top < BAR_H / 2 || bot - top > BAR_H * 2) return -1;
     int y = (top + bot) / 2, x0 = sx;
     if (x0 + (BITS + 2) * CELL > eye_x + eye_w) return -1;
-    float hi = luma(mean_patch(f, stride, x0 + 4, y - 8, CELL - 8, 16));                       // sync, white
-    float lo = luma(mean_patch(f, stride, x0 + (BITS + 1) * CELL + 4, y - 8, CELL - 8, 16));   // end, black
+    *white = mean_patch(f, stride, x0 + 4, y - 8, CELL - 8, 16);                       // sync
+    *black = mean_patch(f, stride, x0 + (BITS + 1) * CELL + 4, y - 8, CELL - 8, 16);   // end
+    float hi = luma(*white), lo = luma(*black);
     if (hi - lo < 100) return -1;
     int v = 0;
     for (int b = 0; b < BITS; b++)
@@ -153,7 +157,7 @@ int main(int argc, char **argv) {
         if (sscanf(info.UTF8String, "%dx%d", &W, &H) != 2 || W <= 0) { fprintf(stderr, "dumpcheck: can't read the stream's size from %s\n", file.UTF8String); return 1; }
         if (png) [NSFileManager.defaultManager createDirectoryAtPath:png withIntermediateDirectories:YES attributes:nil error:nil];
         printf("stream %dx%d (%d per eye)\n", W, H, W / 2);
-        FILE *p = popen([NSString stringWithFormat:@"%@ -v error -f %@ -i %@ -fps_mode passthrough -vf scale=in_range=tv:in_color_matrix=bt709 -f rawvideo -pix_fmt rgb24 - 2>/dev/null",
+        FILE *p = popen([NSString stringWithFormat:@"%@ -v error -f %@ -i %@ -fps_mode passthrough -vf scale=in_range=auto:in_color_matrix=auto -f rawvideo -pix_fmt rgb24 - 2>/dev/null",
                                                    ffmpeg, codec, sh(file)].UTF8String, "r");
         size_t fsz = (size_t)W * H * 3;
         uint8_t *f = malloc(fsz);
@@ -161,18 +165,24 @@ int main(int argc, char **argv) {
         while (fread(f, 1, fsz, p) == fsz) {
             char line[512];
             int len = snprintf(line, sizeof line, "frame %d", index);
+            rgb ends[2] = {{-1, -1, -1}, {-1, -1, -1}};
             for (int e = 0; e < 2; e++) {
                 int ex = e * ew;
                 rgb dom[2];
                 int nd;
                 dominant(f, stride, ex, ew, H, dom, &nd);
                 rgb fill = nd > 0 ? dom[0] : (rgb){0, 0, 0}, quad = nd > 1 ? dom[1] : (rgb){-1, -1, -1};
-                int bars = read_bars(f, stride, ex, ew, H);
+                rgb w, k;
+                int bars = read_bars(f, stride, ex, ew, H, &w, &k);
+                if (e == 0 && bars >= 0) { ends[0] = w; ends[1] = k; }
                 char bs[16];
                 snprintf(bs, sizeof bs, bars < 0 ? "-" : "%d", bars);
                 len += snprintf(line + len, sizeof line - len, "  %c fill %.0f,%.0f,%.0f other %.0f,%.0f,%.0f bars %s", e ? 'R' : 'L',
                                 fill.r, fill.g, fill.b, quad.r, quad.g, quad.b, bs);
             }
+            for (int i = 0; i < 2; i++)
+                len += snprintf(line + len, sizeof line - len, ends[i].r < 0 ? "  %s -" : "  %s %.0f,%.0f,%.0f", i ? "black" : "white",
+                                ends[i].r, ends[i].g, ends[i].b);
             puts(line);
             if (png && index % png_every == 0) write_png(f, W, H, [png stringByAppendingPathComponent:[NSString stringWithFormat:@"frame-%04d.png", index]]);
             index++;

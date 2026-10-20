@@ -106,6 +106,7 @@ typedef struct {
     int codec;
     double refresh;
     bool foveated;
+    bool full_range;           // the encoder's 4:2:0 range: the client takes HEVC as full range
     float center_size[2], center_shift[2], edge_ratio[2];
     uint32_t target_w, target_h;
     // ALVR's controller offsets (its headset.controllers settings), for its SteamVR driver.
@@ -114,8 +115,11 @@ typedef struct {
 } stream_setup;
 
 static stream_setup read_stream_setup(void) {
-    stream_setup s = {.codec = ALVR_CODEC_HEVC, .refresh = 90, .edge_ratio = {1, 1}};
+    stream_setup s = {.codec = ALVR_CODEC_HEVC, .refresh = 90, .edge_ratio = {1, 1}, .full_range = true};
     NSDictionary *session = read_session();
+    // ALVR's video.encoder_config.use_full_range (true by default), as it hands it to its encoders.
+    NSNumber *full = session[@"session_settings"][@"video"][@"encoder_config"][@"use_full_range"];
+    if (full) s.full_range = full.boolValue;
     NSDictionary *controllers = session[@"session_settings"][@"headset"][@"controllers"];
     if ([controllers[@"enabled"] boolValue]) {
         NSArray *pos = controllers[@"content"][@"left_controller_position_offset"][@"content"];
@@ -131,6 +135,7 @@ static stream_setup read_stream_setup(void) {
     s.codec = [cfg[@"codec"] intValue];
     s.refresh = [cfg[@"refresh_rate"] doubleValue] ?: 90;
     s.foveated = [cfg[@"enable_foveated_encoding"] boolValue];
+    if (cfg[@"use_full_range_encoding"]) s.full_range = [cfg[@"use_full_range_encoding"] boolValue];
     s.center_size[0] = [cfg[@"foveation_center_size_x"] floatValue];
     s.center_size[1] = [cfg[@"foveation_center_size_y"] floatValue];
     s.center_shift[0] = [cfg[@"foveation_center_shift_x"] floatValue];
@@ -326,7 +331,8 @@ typedef struct {
 } compose_uniform;
 
 static id<MTLDevice> g_device;
-static id<MTLRenderPipelineState> g_pipeline;
+static id<MTLComputePipelineState> g_pipeline;
+enum { COMPOSE_TG_W = 16, COMPOSE_TG_H = 8 };   // compose.metal's TG_W, TG_H
 static CVMetalTextureCacheRef g_texture_cache;
 static CVPixelBufferPoolRef g_pool;
 static VTCompressionSessionRef g_encoder;
@@ -347,6 +353,8 @@ unsigned axr_stat_wait, axr_stat_end, axr_stat_projection;
 unsigned axr_stat_syncs, axr_stat_unfocused_syncs, axr_stat_pressed;   // runtime.m's input
 static unsigned g_stat_button_events;
 static int64_t g_stat_since;
+static double g_stat_compose_s;            // the compose passes' GPU time, and how many
+static unsigned g_stat_composes;
 
 id<MTLDevice> axr_metal_device(void) {
     static dispatch_once_t once;
@@ -423,12 +431,25 @@ static void make_encoder(void) {
     }
     if (g_pool) { CFRelease(g_pool); g_pool = NULL; }
     g_last_config = nil;
+    // compose.metal writes Y'CbCr itself, in the range the client expects (VideoToolbox's own
+    // conversion from BGRA gave video range, which the client showed as full: lifted blacks,
+    // dim whites), and the buffers say so for the encoder's VUI.
+    bool full = g_setup.full_range;
+    NSDictionary *colour = @{
+        (id)kCVImageBufferColorPrimariesKey : (id)kCVImageBufferColorPrimaries_ITU_R_709_2,
+        (id)kCVImageBufferTransferFunctionKey : (id)kCVImageBufferTransferFunction_sRGB,
+        (id)kCVImageBufferYCbCrMatrixKey : (id)kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        (id)kCVImageBufferChromaLocationTopFieldKey : (id)kCVImageBufferChromaLocation_Left,
+        (id)kCVImageBufferChromaLocationBottomFieldKey : (id)kCVImageBufferChromaLocation_Left,
+    };
     NSDictionary *attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferPixelFormatTypeKey :
+            @(full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
         (id)kCVPixelBufferWidthKey : @(g_out_w * 2),
         (id)kCVPixelBufferHeightKey : @(g_out_h),
         (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
         (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVBufferPropagatedAttachmentsKey : colour,
     };
     CVPixelBufferPoolCreate(NULL, NULL, (__bridge CFDictionaryRef)attrs, &g_pool);
     bool hevc = g_setup.codec == ALVR_CODEC_HEVC;
@@ -447,10 +468,15 @@ static void make_encoder(void) {
     set_prop(kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef) @(g_bitrate));
     set_prop(kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFTypeRef) @(g_setup.refresh));
     set_prop(kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef) @100000);
+    // The VUI's colour description. sRGB transfer (IEC 61966-2-1) is what the pixels carry and
+    // what the client assumes; the range comes from the pixel format.
+    set_prop(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    set_prop(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB);
+    set_prop(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     VTCompressionSessionPrepareToEncodeFrames(g_encoder);
     g_force_idr = true;
-    axr_log("encoder: %ux%u per eye%s, %s, %.0f Hz", g_out_w, g_out_h,
-            g_ffr.enabled ? " (foveated)" : "", hevc ? "HEVC" : "H264", g_setup.refresh);
+    axr_log("encoder: %ux%u per eye%s, %s, %.0f Hz, %s range", g_out_w, g_out_h,
+            g_ffr.enabled ? " (foveated)" : "", hevc ? "HEVC" : "H264", g_setup.refresh, full ? "full" : "video");
 }
 
 static id<MTLTexture> array_view(id<MTLTexture> t);
@@ -565,28 +591,41 @@ static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4
 
     CVPixelBufferRef pb = NULL;
     CVPixelBufferPoolCreatePixelBuffer(NULL, g_pool, &pb);
-    CVMetalTextureRef cvtex = NULL;
-    if (pb) CVMetalTextureCacheCreateTextureFromImage(NULL, g_texture_cache, pb, NULL, MTLPixelFormatBGRA8Unorm_sRGB,
-                                                      out_w * 2, out_h, 0, &cvtex);
-    id<MTLTexture> target = cvtex ? CVMetalTextureGetTexture(cvtex) : nil;
-    id<MTLCommandBuffer> cmd = target ? [queue commandBuffer] : nil;
+    // The 4:2:0 buffer's planes: Y' at the full size, CbCr at half.
+    CVMetalTextureRef cvtex[2] = {NULL, NULL};
+    id<MTLTexture> plane[2] = {nil, nil};
+    NSDictionary *usage = @{(id)kCVMetalTextureUsage : @(MTLTextureUsageShaderWrite)};
+    for (size_t i = 0; pb && i < 2; i++) {
+        CVMetalTextureCacheCreateTextureFromImage(NULL, g_texture_cache, pb, (__bridge CFDictionaryRef)usage,
+                                                  i ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm,
+                                                  CVPixelBufferGetWidthOfPlane(pb, i), CVPixelBufferGetHeightOfPlane(pb, i), i,
+                                                  &cvtex[i]);
+        plane[i] = cvtex[i] ? CVMetalTextureGetTexture(cvtex[i]) : nil;
+    }
+    id<MTLCommandBuffer> cmd = plane[0] && plane[1] ? [queue commandBuffer] : nil;
     if (!cmd) {
-        if (cvtex) CFRelease(cvtex);
+        for (int i = 0; i < 2; i++) if (cvtex[i]) CFRelease(cvtex[i]);
         if (pb) CVPixelBufferRelease(pb);
         dispatch_semaphore_signal(g_in_flight);
         return false;
     }
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    pass.colorAttachments[0].texture = target;
-    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
-    [enc setRenderPipelineState:g_pipeline];
-    for (int i = 0; i < 4; i++) [enc setFragmentTexture:array_view(tex[i]) atIndex:i];
-    [enc setFragmentBytes:u length:sizeof *u atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    CVMetalTextureRef ytex = cvtex[0], ctex = cvtex[1];
+    uint32_t full = CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:g_pipeline];
+    for (int i = 0; i < 4; i++) [enc setTexture:array_view(tex[i]) atIndex:i];
+    [enc setTexture:plane[0] atIndex:4];
+    [enc setTexture:plane[1] atIndex:5];
+    [enc setBytes:u length:sizeof *u atIndex:0];
+    [enc setBytes:&full length:sizeof full atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(plane[1].width, plane[1].height, 1)
+        threadsPerThreadgroup:MTLSizeMake(COMPOSE_TG_W, COMPOSE_TG_H, 1)];
     [enc endEncoding];
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer> _) {
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        pthread_mutex_lock(&g_lock);
+        g_stat_compose_s += c.GPUEndTime - c.GPUStartTime;
+        g_stat_composes++;
+        pthread_mutex_unlock(&g_lock);
         if (done) done();
         dispatch_async(g_encode_queue, ^{
             pthread_mutex_lock(&g_lock);
@@ -606,7 +645,8 @@ static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4
                 alvr_report_present(ts, 0);
                 CFRelease(encoder);
             }
-            CFRelease(cvtex);
+            CFRelease(ytex);
+            CFRelease(ctex);
             CVPixelBufferRelease(pb);
             dispatch_semaphore_signal(g_in_flight);
         });
@@ -951,19 +991,21 @@ static void *event_thread(void *arg) {
                     axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
                             " | headset: %.0f samples/s, every %.1f ms, %u bunched, %u late"
                             " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads"
-                            " | audio: %llu frames tapped, peak %.3f%s",
+                            " | audio: %llu frames tapped, peak %.3f | compose %.3f ms GPU%s",
                             g_stat_frames / dt, g_stat_bytes * 8 / dt / 1e6, axr_stat_wait, axr_stat_end,
                             axr_stat_projection, g_stat_submit_calls, g_stat_not_ready, axr_stat_reused,
                             g_stat_samples / dt, g_stat_samples ? g_stat_ts_span / 1e6 / g_stat_samples : 0.0,
                             g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_nbuttons, axr_stat_syncs,
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
-                            audio_peak, compositor);
+                            audio_peak, g_stat_composes ? g_stat_compose_s * 1e3 / g_stat_composes : 0.0, compositor);
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 pthread_mutex_lock(&g_lock);
                 g_stream_fps = g_stat_frames / dt;
                 g_stream_mbps = g_stat_bytes * 8 / dt / 1e6;
                 g_stat_samples = g_stat_bunched = g_stat_late = 0;
                 g_stat_ts_span = 0;
+                g_stat_compose_s = 0;
+                g_stat_composes = 0;
                 pthread_mutex_unlock(&g_lock);
                 g_stat_frames = g_stat_bytes = g_stat_submit_calls = g_stat_not_ready = 0;
                 axr_stat_wait = axr_stat_end = axr_stat_projection = axr_stat_reused = 0;
@@ -1048,12 +1090,11 @@ void axr_backend_start(void) {
     NSError *err = nil;
     id<MTLLibrary> lib = [dev newLibraryWithSource:@(compose_metal) options:nil error:&err];
     if (!lib) axr_log("compositor shader: %s", err.localizedDescription.UTF8String);
-    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
-    g_pipeline = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLFunction> ycc = [lib newFunctionWithName:@"ycc"];
+    g_pipeline = ycc ? [dev newComputePipelineStateWithFunction:ycc error:&err] : nil;
     if (!g_pipeline) axr_log("compositor pipeline: %s", err.localizedDescription.UTF8String);
+    else if (g_pipeline.maxTotalThreadsPerThreadgroup < COMPOSE_TG_W * COMPOSE_TG_H)
+        axr_log("compositor pipeline: only %lu threads per threadgroup", (unsigned long)g_pipeline.maxTotalThreadsPerThreadgroup);
     CVMetalTextureCacheCreate(NULL, NULL, dev, NULL, &g_texture_cache);
 
     // The region the runtime's readers (tracking.m) take everything from; in-process for now, so

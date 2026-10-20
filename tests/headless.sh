@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs scenarios against the runtime with no headset, checking what ends up in the encoded stream.
-#   tests/headless.sh single|handover|crash|two-clients [--runtime PATH] [--keep]   (handover: tests/compositor-check.sh)
+#   tests/headless.sh single|single-video-range|handover|crash|two-clients [--runtime PATH] [--keep]
+#   (handover: tests/compositor-check.sh; single-video-range: single with the session's use_full_range off)
 # Always runs with a scratch ALVRXR_CONFIG_DIR and ALVRXR_DUMP (see docs/compositor.md, "Testing
 # without a headset"); never uses the real config, never installs, never starts vapord.
 set -eu
@@ -59,8 +60,13 @@ summarize() {
 near() { echo "$5" | awk -F, -v r=$1 -v g=$2 -v b=$3 -v t=$4 'function d(x){return x<0?-x:x} {exit !(d($1-r)<=t && d($2-g)<=t && d($3-b)<=t)}'; }
 
 case "$scenario" in
-single)
-    echo "== single: one client, fill 0,200,60, quad 40,80,230, 4 seconds"
+single|single-video-range)
+    range=pc
+    if [ "$scenario" = single-video-range ]; then
+        range=tv
+        sed -i '' 's/"use_full_range": true/"use_full_range": false/; s/"use_full_range_encoding": true/"use_full_range_encoding": false/' "$scratch/session.json"
+    fi
+    echo "== $scenario: one client, fill 0,200,60, quad 40,80,230, 4 seconds"
     export ALVRXR_DUMP=$scratch/dump.hevc
     "$xrclient" --runtime "$runtime" --frames 0 --seconds 4 --color 0,200,60 --quad > "$scratch/client.log" 2>&1 &
     cpid=$!
@@ -84,12 +90,24 @@ single)
     echo "..."
     tail -3 "$scratch/decoded.txt"
     summarize < "$scratch/decoded.txt" | tee "$scratch/summary.txt"
-    # The colours must be the client's, within encoding noise, and the frame numbers must count up.
-    fill=$(awk '/^frame /{print $5}' "$scratch/decoded.txt" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
-    other=$(awk '/^frame /{print $7}' "$scratch/decoded.txt" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    # The colours must be the client's, within a level or two of rounding, black and white (the bar
+    # row's end and sync cells) exactly or nearly so, and the frame numbers must count up.
+    commonest() { awk "/^frame /{print \$$1}" "$scratch/decoded.txt" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'; }
+    fill=$(commonest 5)
+    other=$(commonest 7)
+    white=$(awk '/^frame /{print $(NF-2)}' "$scratch/decoded.txt" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    black=$(awk '/^frame /{print $NF}' "$scratch/decoded.txt" | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
     ok=1
-    near 0 200 60 12 "$fill" || { echo "FAIL: fill $fill is not 0,200,60"; ok=0; }
-    near 40 80 230 12 "$other" || { echo "FAIL: quad $other is not 40,80,230"; ok=0; }
+    near 0 200 60 2 "$fill" || { echo "FAIL: fill $fill is not 0,200,60"; ok=0; }
+    near 40 80 230 2 "$other" || { echo "FAIL: quad $other is not 40,80,230"; ok=0; }
+    near 255 255 255 1 "$white" || { echo "FAIL: white $white is not 255,255,255"; ok=0; }
+    near 0 0 0 1 "$black" || { echo "FAIL: black $black is not 0,0,0"; ok=0; }
+    echo "white $white, black $black"
+    # The VUI: the client takes HEVC as full-range BT.709 with sRGB's curve.
+    vui=$(/opt/homebrew/bin/ffprobe -v error -f hevc -i "$scratch/dump.hevc" -select_streams v:0 \
+        -show_entries stream=color_range,color_primaries,color_space,color_transfer -of csv=p=0)
+    echo "VUI (range, space, transfer, primaries): $vui"
+    [ "$vui" = "$range,bt709,iec61966-2-1,bt709" ] || { echo "FAIL: VUI is $vui, not $range,bt709,iec61966-2-1,bt709"; ok=0; }
     grep -q "gaps in frame numbers: none" "$scratch/summary.txt" || { echo "FAIL: gaps in the frame numbers"; ok=0; }
     [ $ok -eq 1 ] && echo "PASS: decoded fill $fill and quad $other match what the client drew"
     [ $ok -eq 1 ]
@@ -109,5 +127,5 @@ crash|two-clients)
     echo "scenario '$scenario' is not implemented yet: it needs vapord's ALVRXR_CONFIG_DIR" >&2
     exit 3
     ;;
-*) echo "usage: $0 single|handover|crash|two-clients [--runtime PATH] [--keep]" >&2; exit 2 ;;
+*) echo "usage: $0 single|single-video-range|handover|crash|two-clients [--runtime PATH] [--keep]" >&2; exit 2 ;;
 esac
