@@ -37,3 +37,10 @@ simd_float3 dash_button_centre(int button);
 // shows changed. camera is objects.metal's Camera: view and projection.
 void dash_draw(id<MTLRenderCommandEncoder> enc, const simd_float4x4 camera[2], id<MTLDepthStencilState> depth);
 const char *dash_button_name(int button);
+
+// The "Loading" panel, shown while a game loads behind the lounge (XrDashboardStateALVRXR.loading):
+// placed ahead of the head when it appears and world-locked there; drawn with the game's name at
+// the given opacity (vapord pulses it).
+void dash_loading_place(simd_float3 head, simd_float3 forward);
+void dash_loading_draw(id<MTLRenderCommandEncoder> enc, const simd_float4x4 camera[2], id<MTLDepthStencilState> depth,
+                       const char program[AXR_NAME_MAX], float opacity);

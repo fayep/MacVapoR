@@ -703,6 +703,22 @@ bool axr_compositor_dashboard(pid_t *game_pid, char name[64]) {
     return open;
 }
 
+// A game the lounge is covering while it loads: connected, not in front, and not (or no longer, after
+// the watchdog) through the first-frame check. A second's grace after it connects, so a session
+// opened only to probe the runtime doesn't flash the panel.
+bool axr_compositor_loading(char name[64]) {
+    pthread_mutex_lock(&g_lock);
+    int64_t now = axr_now_ns();
+    axr_source *game = NULL;
+    for (int i = 0; i < MAX_SOURCES && !game; i++) {
+        axr_source *s = g_sources[i];
+        if (s && !s->local && !s->gone && s != g_fg && !s->passed && now - s->added_ns > 1000000000LL) game = s;
+    }
+    snprintf(name, 64, "%s", game ? game->name : "");
+    pthread_mutex_unlock(&g_lock);
+    return game != NULL;
+}
+
 void axr_compositor_close_dashboard(void) {
     pthread_mutex_lock(&g_lock);
     dashboard_set(false, axr_now_ns(), "the panel");

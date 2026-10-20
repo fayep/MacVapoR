@@ -1883,6 +1883,8 @@ static XrResult xrGetDashboardStateALVRXR_(XrSession h, XrDashboardStateALVRXR *
     st->open = axr_compositor_dashboard(&pid, name);
     st->game_pid = pid > 0 ? (uint32_t)pid : 0;
     snprintf(st->game_name, sizeof st->game_name, "%s", name);
+    st->loading = axr_compositor_loading(name);
+    snprintf(st->loading_name, sizeof st->loading_name, "%s", name);
     axr_server_dashboard_stats(st->battery, st->charging, &st->fps, &st->mbps, &st->eye_height, &st->height_offset);
     return XR_SUCCESS;
 }

@@ -12,6 +12,10 @@
 // at a metre, so the text stays sharp as it's mipmapped down.
 static const float kWidth = 0.8f, kHeight = 0.5f, kOpacity = 0.96f;
 enum { CW = 1600, CH = 1000 };
+// The "Loading" panel shown while a game loads behind the lounge: 0.9 x 0.28 m, same pixel density.
+static const float kLoadWidth = 0.9f, kLoadHeight = 0.28f;
+enum { LW = 1800, LH = 560 };
+static CGFloat g_ch = CH;   // the height of the canvas being drawn, for place() and cg()
 
 typedef struct {
     CGFloat x, y, w, h;   // canvas pixels, from the top left
@@ -28,6 +32,10 @@ static struct {
     float seated;
     int hover[2], held[2];   // each hand's button under its pointer, and the one it's pressing
     bool was_down[2];
+    // The "Loading" panel: its picture, the name it shows, and where it is.
+    id<MTLTexture> load_picture;
+    NSString *load_shown;
+    simd_float3 load_centre, load_right, load_up;
 } g = {.centre = {0, 1.5f, -1}, .right = {1, 0, 0}, .up = {0, 1, 0}, .normal = {0, 0, 1}, .seated = 1.2f};
 
 const char *dash_button_name(int b) {
@@ -112,15 +120,17 @@ simd_float3 dash_button_centre(int b) {
     return g.centre + g.right * x + g.up * y;
 }
 
-// The game's name as its executable's, less ".exe".
-static NSString *game_title(void) {
-    if (!has_game()) return @"Lounge";
+// A game's name as its executable's, less ".exe" (and Unreal's "-Win64-Shipping").
+static NSString *title_of(const char program[AXR_NAME_MAX]) {
     char name[AXR_NAME_MAX + 1] = {0};
-    memcpy(name, g.st.game_name, AXR_NAME_MAX);
+    memcpy(name, program, AXR_NAME_MAX);
     NSString *s = [NSString stringWithUTF8String:name] ?: @"";
-    if ([s.lowercaseString hasSuffix:@".exe"]) s = [s substringToIndex:s.length - 4];
+    for (NSString *tail in @[ @".exe", @"-Win64-Shipping", @"-Shipping" ])
+        if ([s.lowercaseString hasSuffix:tail.lowercaseString]) s = [s substringToIndex:s.length - tail.length];
     return s.length ? s : @"Game";
 }
+
+static NSString *game_title(void) { return has_game() ? title_of(g.st.game_name) : @"Lounge"; }
 
 // ------------------------------------------------------------------------------------- pointing
 
@@ -186,7 +196,7 @@ static CGColorRef rgb(double r, double gr, double b, double a) {
 #define SILVER(a) rgb(0.88, 0.90, 0.96, a)
 #define PINK(a) rgb(1.0, 0.36, 0.72, a)
 
-static CGRect cg(box b) { return CGRectMake(b.x, CH - b.y - b.h, b.w, b.h); }
+static CGRect cg(box b) { return CGRectMake(b.x, g_ch - b.y - b.h, b.w, b.h); }
 
 static CGPathRef rounded(box b, CGFloat r) { return CGPathCreateWithRoundedRect(cg(b), r, r, NULL); }
 
@@ -231,7 +241,7 @@ static CGPoint place(CTLineRef line, box b, int align, CGFloat size) {
     CGFloat w = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
     CGFloat x = align == 0 ? b.x : align == 1 ? b.x + (b.w - w) / 2 : b.x + b.w - w;
     CGFloat cap = size * 0.70;   // near enough every font's cap height here
-    return CGPointMake(x, CH - (b.y + b.h / 2) - cap / 2);
+    return CGPointMake(x, g_ch - (b.y + b.h / 2) - cap / 2);
 }
 
 static void text(CGContextRef c, NSString *s, NSString *font, CGFloat size, box b, int align, CGColorRef colour) {
@@ -245,9 +255,11 @@ static void text(CGContextRef c, NSString *s, NSString *font, CGFloat size, box 
 }
 
 // Chrome lettering, as the Vaporwave scene's name: a cyan glow, a gradient of cyan floor, purple
-// horizon and silver sky inside the letters, and a bright rim.
-static void chrome(CGContextRef c, NSString *s, CGFloat size, box b, int align) {
-    CTLineRef line = text_line(s, @"Futura-CondensedExtraBold", size, size * 0.03, true, b.w, true);
+// horizon and silver sky inside the letters, and a bright rim. In the scene's Futura, slanted and
+// in small capitals; or, script, in Brush Script's own italic hand.
+static void chrome_in(CGContextRef c, NSString *s, CGFloat size, box b, int align, bool script) {
+    CTLineRef line = script ? text_line(s, @"BrushScriptMT", size, 0, false, b.w, false)
+                            : text_line(s, @"Futura-CondensedExtraBold", size, size * 0.03, true, b.w, true);
     CGPoint at = place(line, b, align, size);
     CGRect ink = CTLineGetImageBounds(line, c);
     ink.origin.x += at.x;
@@ -286,6 +298,8 @@ static void chrome(CGContextRef c, NSString *s, CGFloat size, box b, int align) 
     CTLineDraw(line, c);
     CFRelease(line);
 }
+
+static void chrome(CGContextRef c, NSString *s, CGFloat size, box b, int align) { chrome_in(c, s, size, b, align, false); }
 
 // A neon rule across the panel, cyan fading into purple.
 static void rule(CGContextRef c, CGFloat y) {
@@ -398,6 +412,43 @@ static void button(CGContextRef c, int b, bool hover, bool held) {
          !on ? SILVER(0.3) : hover || held ? rgb(1, 1, 1, 1) : selected ? CYAN(1) : SILVER(1));
 }
 
+// The panels' ground: deep purple, darker at the foot, with a faint grid like the lounge's floor,
+// and a neon edge, inset so its glow fits.
+static void backdrop(CGContextRef c, CGFloat w, CGFloat h) {
+    box panel = {20, 20, w - 40, h - 40};
+    CGPathRef shape = rounded(panel, 44);
+    CGContextSaveGState(c);
+    CGContextAddPath(c, shape);
+    CGContextClip(c);
+    const CGFloat colors[] = {0.13, 0.04, 0.25, 1, 0.05, 0.01, 0.11, 1};
+    const CGFloat stops[] = {0, 1};
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGGradientRef grad = CGGradientCreateWithColorComponents(cs, colors, stops, 2);
+    CGColorSpaceRelease(cs);
+    CGContextDrawLinearGradient(c, grad, CGPointMake(0, h), CGPointMake(0, 0), 0);
+    CGGradientRelease(grad);
+    CGContextSetStrokeColorWithColor(c, PURPLE(0.10));
+    CGContextSetLineWidth(c, 2);
+    for (int x = 20; x < w; x += 80) {
+        CGContextMoveToPoint(c, x, 0);
+        CGContextAddLineToPoint(c, x, h);
+    }
+    for (int y = 20; y < h; y += 80) {
+        CGContextMoveToPoint(c, 0, y);
+        CGContextAddLineToPoint(c, w, y);
+    }
+    CGContextStrokePath(c);
+    CGContextRestoreGState(c);
+    CGContextSaveGState(c);
+    CGContextAddPath(c, shape);
+    CGContextSetShadowWithColor(c, CGSizeZero, 18, CYAN(1));
+    CGContextSetStrokeColorWithColor(c, CYAN(1));
+    CGContextSetLineWidth(c, 5);
+    CGContextStrokePath(c);
+    CGContextRestoreGState(c);
+    CGPathRelease(shape);
+}
+
 static NSString *content_key(void) {
     int hover = 0, held = 0;
     for (int h = 0; h < 2; h++) {
@@ -417,40 +468,7 @@ static id<MTLTexture> draw_picture(void) {
     CGContextSetAllowsAntialiasing(c, true);
     CGContextSetShouldAntialias(c, true);
 
-    // The panel: deep purple, darker at the foot, with a faint grid like the lounge's floor, and
-    // a neon edge. Inset, so the edge's glow fits.
-    box panel = {20, 20, CW - 40, CH - 40};
-    CGPathRef shape = rounded(panel, 44);
-    CGContextSaveGState(c);
-    CGContextAddPath(c, shape);
-    CGContextClip(c);
-    const CGFloat colors[] = {0.13, 0.04, 0.25, 1, 0.05, 0.01, 0.11, 1};
-    const CGFloat stops[] = {0, 1};
-    cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGGradientRef grad = CGGradientCreateWithColorComponents(cs, colors, stops, 2);
-    CGColorSpaceRelease(cs);
-    CGContextDrawLinearGradient(c, grad, CGPointMake(0, CH), CGPointMake(0, 0), 0);
-    CGGradientRelease(grad);
-    CGContextSetStrokeColorWithColor(c, PURPLE(0.10));
-    CGContextSetLineWidth(c, 2);
-    for (int x = 20; x < CW; x += 80) {
-        CGContextMoveToPoint(c, x, 0);
-        CGContextAddLineToPoint(c, x, CH);
-    }
-    for (int y = 20; y < CH; y += 80) {
-        CGContextMoveToPoint(c, 0, y);
-        CGContextAddLineToPoint(c, CW, y);
-    }
-    CGContextStrokePath(c);
-    CGContextRestoreGState(c);
-    CGContextSaveGState(c);
-    CGContextAddPath(c, shape);
-    CGContextSetShadowWithColor(c, CGSizeZero, 18, CYAN(1));
-    CGContextSetStrokeColorWithColor(c, CYAN(1));
-    CGContextSetLineWidth(c, 5);
-    CGContextStrokePath(c);
-    CGContextRestoreGState(c);
-    CGPathRelease(shape);
+    backdrop(c, CW, CH);
 
     // The status: what's running in chrome, the stream on the right, then the batteries.
     chrome(c, game_title().uppercaseString, 96, (box){80, 50, 900, 120}, 0);
@@ -504,5 +522,59 @@ void dash_draw(id<MTLRenderCommandEncoder> enc, const simd_float4x4 camera[2], i
     [enc setVertexBytes:camera length:sizeof(simd_float4x4) * 2 atIndex:1];
     [enc setFragmentBytes:&panel length:sizeof panel atIndex:0];
     [enc setFragmentTexture:g.picture atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
+// ------------------------------------------------------------------------------------- loading
+
+void dash_loading_place(simd_float3 head, simd_float3 forward) {
+    forward.y = 0;
+    forward = simd_length(forward) > 1e-3f ? simd_normalize(forward) : simd_make_float3(0, 0, -1);
+    g.load_up = simd_make_float3(0, 1, 0);
+    g.load_right = simd_cross(forward, g.load_up);
+    g.load_centre = head + forward * 1.4f - g.load_up * 0.05f;
+}
+
+static id<MTLTexture> draw_loading(NSString *title) {
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef c = CGBitmapContextCreate(NULL, LW, LH, 8, LW * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(cs);
+    CGContextSetAllowsAntialiasing(c, true);
+    CGContextSetShouldAntialias(c, true);
+    g_ch = LH;
+    backdrop(c, LW, LH);
+    chrome_in(c, @"Loading…", 230, (box){80, 50, LW - 160, 300}, 1, true);
+    text(c, title, @"AvenirNext-DemiBold", 64, (box){80, 380, LW - 160, 100}, 1, SILVER(1));
+    g_ch = CH;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+                                                                                 width:LW height:LH mipmapped:YES];
+    id<MTLTexture> t = [g.dev newTextureWithDescriptor:d];
+    [t replaceRegion:MTLRegionMake2D(0, 0, LW, LH) mipmapLevel:0 withBytes:CGBitmapContextGetData(c) bytesPerRow:LW * 4];
+    CGContextRelease(c);
+    id<MTLCommandBuffer> cmd = [g.q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    [blit generateMipmapsForTexture:t];
+    [blit endEncoding];
+    [cmd commit];
+    return t;
+}
+
+void dash_loading_draw(id<MTLRenderCommandEncoder> enc, const simd_float4x4 camera[2], id<MTLDepthStencilState> depth,
+                       const char program[AXR_NAME_MAX], float opacity) {
+    NSString *title = title_of(program);
+    if (!g.load_picture || ![title isEqualToString:g.load_shown]) {
+        g.load_picture = draw_loading(title);
+        g.load_shown = title;
+    }
+    struct {
+        simd_float4 centre, right, up, opacity;
+    } panel = {simd_make_float4(g.load_centre, 1), simd_make_float4(g.load_right * (kLoadWidth / 2), 0),
+               simd_make_float4(g.load_up * (kLoadHeight / 2), 0), simd_make_float4(opacity, 0, 0, 0)};
+    [enc setRenderPipelineState:g.pso];
+    [enc setDepthStencilState:depth];
+    [enc setVertexBytes:&panel length:sizeof panel atIndex:0];
+    [enc setVertexBytes:camera length:sizeof(simd_float4x4) * 2 atIndex:1];
+    [enc setFragmentBytes:&panel length:sizeof panel atIndex:0];
+    [enc setFragmentTexture:g.load_picture atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }

@@ -16,6 +16,8 @@ typedef struct {
     float fps, mbps;                  // the stream, over the last stats period
     float eye_height;                 // the seated eye height in use, 0 when standing (no offset)
     float height_offset;              // metres added to tracked heights now
+    uint32_t loading;                 // a game is loading behind the lounge: vapord shows "Loading"
+    char loading_name[AXR_NAME_MAX];  // its executable's name
 } XrDashboardStateALVRXR;
 
 // The dashboard's state. vapord polls it each frame.

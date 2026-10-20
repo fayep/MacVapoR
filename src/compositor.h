@@ -88,6 +88,9 @@ void axr_transport_start(void);
 // system button itself; these are what the private functions in alvrxr_ext.h come down to.
 // Whether it is open; the foreground game's pid and executable name (0 and "" with none).
 bool axr_compositor_dashboard(pid_t *game_pid, char name[64]);
+// Whether a game is loading behind the lounge (connected, not yet or no longer drawing steadily),
+// and its program name.
+bool axr_compositor_loading(char name[64]);
 void axr_compositor_close_dashboard(void);
 // Sets exit_request on the foreground game's session and fades to the lounge at once; false with no game.
 bool axr_compositor_quit_game(void);

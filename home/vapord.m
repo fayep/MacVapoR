@@ -1031,9 +1031,11 @@ int main(int argc, char **argv) {
         gipa(instance, "xrQuitGameALVRXR", (PFN_xrVoidFunction *)&quit_game);
         gipa(instance, "xrRecenterALVRXR", (PFN_xrVoidFunction *)&recenter);
         gipa(instance, "xrSetEyeHeightALVRXR", (PFN_xrVoidFunction *)&set_eye_height);
-        // Tests only, and only with a scratch config dir: 1 the lounge behind the panel, 2 a game.
+        // Tests only, and only with a scratch config dir: 1 the lounge behind the panel, 2 a game,
+        // 3 no panel but a game loading behind the lounge.
         const char *test_env = getenv("VAPORD_DASHBOARD_TEST");
-        int dash_test = test_env && *test_env && cfg_env && *cfg_env ? (strcmp(test_env, "lounge") ? 2 : 1) : 0;
+        int dash_test = test_env && *test_env && cfg_env && *cfg_env
+                            ? (!strcmp(test_env, "lounge") ? 1 : !strcmp(test_env, "loading") ? 3 : 2) : 0;
         int dash_test_frames = getenv("VAPORD_DASHBOARD_TEST_FRAMES") ? atoi(getenv("VAPORD_DASHBOARD_TEST_FRAMES")) : 120;
 
         XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO, NULL, XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
@@ -1186,6 +1188,9 @@ int main(int argc, char **argv) {
         // hysteresis), a bare hand's pointing smoothed, and the seated eye height its Seated
         // button sets (the runtime's while seated, else the last one used).
         bool dash_was_open = false, trigger_down[2] = {false, false};
+        // The "Loading" panel: shown since (seconds, the loop's clock), or not.
+        bool load_was = false;
+        double load_since = 0;
         simd_float3 hand_ray[2] = {0};
         float seated_height = 1.20f;
         int dash_frame = 0;
@@ -1261,7 +1266,10 @@ int main(int argc, char **argv) {
                 // The dashboard's state; with the test, made up: seated over a game, or standing in the
                 // lounge, with one battery low and one charging.
                 XrDashboardStateALVRXR dstate = {0};
-                if (dash_test) {
+                if (dash_test == 3) {
+                    dstate = (XrDashboardStateALVRXR){.loading = 1, .battery = {-1, -1, -1}};
+                    strcpy(dstate.loading_name, "RoboRecall-Win64-Shipping.exe");
+                } else if (dash_test) {
                     dstate = (XrDashboardStateALVRXR){.open = 1, .game_pid = dash_test == 2 ? (uint32_t)getpid() : 0,
                                                       .battery = {0.82f, 0.55f, 0.12f}, .charging = {0, 1, 0},
                                                       .fps = 90, .mbps = 42.5f, .eye_height = dash_test == 2 ? 1.2f : 0};
@@ -1295,6 +1303,17 @@ int main(int argc, char **argv) {
                     if (ball.held >= 0) ball.held = -1;   // let go of the ball: the hands are pointing now
                 }
                 dash_was_open = dash_open;
+                // A game loading behind the lounge: "Loading" ahead of the head, world-locked, until it
+                // shows (the dashboard, opened meanwhile, takes its place).
+                bool loading = dstate.loading && !dash_open;
+                double clock = CFAbsoluteTimeGetCurrent();
+                if (loading && !load_was) {
+                    dash_loading_place(head, simd_act(head_turn, simd_make_float3(0, 0, -1)));
+                    load_since = clock;
+                }
+                load_was = loading;
+                // Fading in over a third of a second, then breathing gently.
+                float load_opacity = (float)(fmin((clock - load_since) / 0.35, 1) * (0.85 + 0.15 * cos((clock - load_since) * 2.6)));
                 if (dash_open) dash_set_state(&dstate, seated_height);
                 // While the dashboard's open the hands point at it, and play nothing else.
                 bool play = focused && !dash_open;
@@ -1560,6 +1579,9 @@ int main(int argc, char **argv) {
                     }
                     // The panel goes in the depth buffer, so a hand behind it is hidden.
                     if (dash_open) dash_draw(enc, (simd_float4x4[2]){camera.view, camera.proj}, w.depth_write);
+                    if (loading && !overlay)
+                        dash_loading_draw(enc, (simd_float4x4[2]){camera.view, camera.proj}, w.depth_write, dstate.loading_name,
+                                          load_opacity);
                     if (nlines && !overlay) {
                         [enc setRenderPipelineState:w.line_pso];
                         [enc setDepthStencilState:w.depth_test];

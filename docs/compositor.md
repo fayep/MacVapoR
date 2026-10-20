@@ -129,6 +129,10 @@ compositor checks `desc.seq == seq` and skips a frame whose descriptor has moved
   out, reprojected. After the watchdog the game stays FOCUSED and the lounge VISIBLE: a stalled game
   is usually loading, and told it lost focus Unreal's Oculus games drop to a few frames a second
   and never pass the first-frame check again. It comes back through that check.
+- Loading: while a connected game is not in front and not (or, after the watchdog, no longer)
+  through the first-frame check, a second after it connected, `XrDashboardStateALVRXR.loading`
+  says so with its name, and vapord shows a "Loading…" panel (chrome Brush Script) ahead of the
+  head, world-locked, until the game fades in or goes.
 - Several games: the newest to pass the first-frame check is foreground; others are VISIBLE and
   their frames are released unread. At most 4 sources.
 

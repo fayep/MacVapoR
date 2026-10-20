@@ -1,6 +1,6 @@
 #!/bin/sh
 # Renders vapord's dashboard headless and leaves pictures of it to look at.
-#   tests/dashboard-ui-check.sh [game|lounge ...] [--keep DIR]
+#   tests/dashboard-ui-check.sh [game|lounge|loading ...] [--keep DIR]
 # For each mode, runs out/vapord with VAPORD_DASHBOARD_TEST (the panel open with made-up state and
 # pointers: the right hand on Recenter, pressing it on frames 40-51, the left beside the panel)
 # against a scratch ALVRXR_CONFIG_DIR and ALVRXR_DUMP, LEGACY (no "compositor" in tune.json), so it
@@ -9,14 +9,15 @@
 #                                       (hovering Recenter, then pressing it)
 #   stream-*.png                        frames decoded from the encoded stream (alpha is gone there)
 # and checks: over a game, most of the image is alpha 0; in the lounge, none of it is; the press
-# was seen; the real home.pid didn't change.
+# was seen; the real home.pid didn't change. "loading" has no panel open, but the "Loading" one over
+# the lounge for a game loading behind it: only looked at, and the home.pid check.
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
 modes=
 keep=
 while [ $# -gt 0 ]; do
     case "$1" in
-        game | lounge) modes="$modes $1"; shift ;;
+        game | lounge | loading) modes="$modes $1"; shift ;;
         --keep) keep=${2:?}; shift 2 ;;
         *) echo "unknown argument $1" >&2; exit 2 ;;
     esac
@@ -43,7 +44,7 @@ for mode in $modes; do
     wait "$pid" || { echo "$mode: vapord failed"; fail=1; }
     kill "$watchdog" 2>/dev/null || true
     grep 'vapord: dashboard' "$scratch/vapord.log" | sed "s/^/$mode: /"
-    grep -q 'dashboard: recenter (right hand)' "$scratch/vapord.log" || { echo "$mode: no press of Recenter"; fail=1; }
+    [ "$mode" = loading ] || grep -q 'dashboard: recenter (right hand)' "$scratch/vapord.log" || { echo "$mode: no press of Recenter"; fail=1; }
     /opt/homebrew/bin/ffmpeg -v error -f hevc -i "$scratch/dump.hevc" -vf "select=not(mod(n\,30))" -fps_mode passthrough \
         "$scratch/stream-%02d.png" || echo "$mode: couldn't decode the stream"
     # Over a game: transparent round the panel. In the lounge: the scene is opaque everywhere.
