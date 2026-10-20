@@ -8,7 +8,9 @@
  *  - vkGetPhysicalDeviceFeatures(2): wideLines is reported present;
  *  - vkCreateDevice: requested features the device hasn't got are dropped (and logged), in
  *    VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2 and the Vulkan 1.1-1.4 feature structs;
- *  - pipelines' rasterization lineWidth and vkCmdSetLineWidth are clamped to 1.
+ *  - pipelines' rasterization lineWidth and vkCmdSetLineWidth are clamped to 1;
+ *  - vkGetPhysicalDeviceProperties(2): the sampler limits are raised to the sampled-image ones (see
+ *    raise_limits), so No Man's Sky doesn't warn about them at every start.
  * Everything else goes straight to Wine's own vulkan-1.dll (system32), loaded by its path: the
  * pass-through exports are jumps generated from its export list (stubs.S, exports.txt).
  *
@@ -32,6 +34,8 @@ static PFN_vkGetInstanceProcAddr real_GetInstanceProcAddr;
 static PFN_vkGetDeviceProcAddr real_GetDeviceProcAddr;
 static PFN_vkGetPhysicalDeviceFeatures real_GetPhysicalDeviceFeatures;
 static PFN_vkGetPhysicalDeviceFeatures2 real_GetPhysicalDeviceFeatures2;
+static PFN_vkGetPhysicalDeviceProperties real_GetPhysicalDeviceProperties;
+static PFN_vkGetPhysicalDeviceProperties2 real_GetPhysicalDeviceProperties2;
 static PFN_vkCreateDevice real_CreateDevice;
 static PFN_vkCreateInstance real_CreateInstance;
 static PFN_vkEnumerateDeviceExtensionProperties real_EnumerateDeviceExtensionProperties;
@@ -95,6 +99,10 @@ static BOOL load_real(void) {
     real_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)GetProcAddress(real_module, "vkGetDeviceProcAddr");
     real_GetPhysicalDeviceFeatures = (PFN_vkGetPhysicalDeviceFeatures)GetProcAddress(real_module, "vkGetPhysicalDeviceFeatures");
     real_GetPhysicalDeviceFeatures2 = (PFN_vkGetPhysicalDeviceFeatures2)GetProcAddress(real_module, "vkGetPhysicalDeviceFeatures2");
+    real_GetPhysicalDeviceProperties =
+        (PFN_vkGetPhysicalDeviceProperties)GetProcAddress(real_module, "vkGetPhysicalDeviceProperties");
+    real_GetPhysicalDeviceProperties2 =
+        (PFN_vkGetPhysicalDeviceProperties2)GetProcAddress(real_module, "vkGetPhysicalDeviceProperties2");
     real_CreateDevice = (PFN_vkCreateDevice)GetProcAddress(real_module, "vkCreateDevice");
     real_CreateInstance = (PFN_vkCreateInstance)GetProcAddress(real_module, "vkCreateInstance");
     real_EnumerateDeviceExtensionProperties =
@@ -126,6 +134,38 @@ EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice 
 
 static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFeatures2KHR(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
     vkGetPhysicalDeviceFeatures2(pd, f);
+}
+
+// ---------------------------------------------------------------------------- limits
+
+// MoltenVK reports 16 samplers a stage (Metal's fixed sampler slots) even when descriptor sets go
+// in Metal argument buffers, which hold many more; No Man's Sky then warns at every start that the
+// driver hasn't enough, though its shaders with more than 16 compile and run (MoltenVK 1.4,
+// argument buffers on). The sampler limits are raised to the sampled-image ones MoltenVK reports
+// (256 a stage, 1280 a set on an M4 Max).
+static void raise_limits(VkPhysicalDeviceLimits *l) {
+    static int said;
+    if (!said++)
+        say("sampler limits raised: %u -> %u a stage, %u -> %u a set", l->maxPerStageDescriptorSamplers,
+            l->maxPerStageDescriptorSampledImages, l->maxDescriptorSetSamplers, l->maxDescriptorSetSampledImages);
+    if (l->maxPerStageDescriptorSamplers < l->maxPerStageDescriptorSampledImages)
+        l->maxPerStageDescriptorSamplers = l->maxPerStageDescriptorSampledImages;
+    if (l->maxDescriptorSetSamplers < l->maxDescriptorSetSampledImages)
+        l->maxDescriptorSetSamplers = l->maxDescriptorSetSampledImages;
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
+    real_GetPhysicalDeviceProperties(pd, p);
+    if (p) raise_limits(&p->limits);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
+    real_GetPhysicalDeviceProperties2(pd, p);
+    if (p) raise_limits(&p->properties.limits);
+}
+
+static VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceProperties2KHR(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
+    vkGetPhysicalDeviceProperties2(pd, p);
 }
 
 // The Vulkan 1.1-1.4 feature structs: sType, pNext, then nothing but VkBool32s.
@@ -370,6 +410,9 @@ static PFN_vkVoidFunction ours(const char *name) {
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures")) return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures;
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2")) return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures2;
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2KHR")) return (PFN_vkVoidFunction)GetPhysicalDeviceFeatures2KHR;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties")) return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2")) return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties2;
+    if (!strcmp(name, "vkGetPhysicalDeviceProperties2KHR")) return (PFN_vkVoidFunction)GetPhysicalDeviceProperties2KHR;
     if (!strcmp(name, "vkCreateDevice")) return (PFN_vkVoidFunction)vkCreateDevice;
     if (!strcmp(name, "vkCreateInstance")) return (PFN_vkVoidFunction)vkCreateInstance;
     if (!strcmp(name, "vkEnumerateDeviceExtensionProperties")) return (PFN_vkVoidFunction)vkEnumerateDeviceExtensionProperties;
@@ -410,5 +453,6 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     PFN_vkVoidFunction mine = ours(name);
     // vkGetPhysicalDeviceFeatures2KHR only if the instance offers it.
     if (mine && !strcmp(name, "vkGetPhysicalDeviceFeatures2KHR") && !real) return NULL;
+    if (mine && !strcmp(name, "vkGetPhysicalDeviceProperties2KHR") && !real) return NULL;
     return mine ? mine : real;
 }

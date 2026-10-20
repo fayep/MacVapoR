@@ -9,7 +9,7 @@ more, and what each setting is for. Tested on an M4 Max with CrossOver Preview 2
 | The Lab | 450390 | Works, hands included. Nothing needed. |
 | Battlezone (2016) | 312650 | Works. `CX_GRAPHICS_BACKEND=dxmt %command% -windowed`. |
 | Elite Dangerous (Odyssey) | 359320 | Works in VR, 82–90 fps. Needs our DXMT build and a vendor ID; see below. |
-| No Man's Sky | 275850 | Runs flat with the ground drawn: needs MoltenVK 1.4, a Vulkan wrapper and Terrain Tessellation off; see below. VR next. |
+| No Man's Sky | 275850 | Works in VR, hands and sticks included, about 20 fps. Needs MoltenVK 1.4, a Vulkan wrapper and Terrain Tessellation off; see below. |
 
 ## Elite Dangerous
 
@@ -76,6 +76,9 @@ Windows code only.
 `HKCU\Software\Wine\AppDefaults\NMS.exe\DllOverrides` `vulkan-1` = `native,builtin`. It reports
 `wideLines` (NMS refuses to start without; Metal has only one-pixel lines, which it then draws),
 drops requested features the device lacks, clamps line widths, hides `VK_KHR_push_descriptor`,
+raises the reported sampler limits (MoltenVK says 16 a stage, Metal's fixed slots, though with
+argument buffers NMS's shaders use more and run; the wrapper reports the sampled-image limits,
+256 a stage and 1280 a set, so NMS's "not enough per-stage descriptor samplers" warning is gone),
 and attaches a debug messenger (MoltenVK log level via `VK_EXT_layer_settings`) so MoltenVK's
 errors appear in `notproton-wine.log` as `vkfeatures:` lines.
 
@@ -85,5 +88,9 @@ output to `device float*` ("C-style cast ... converts between mismatching addres
 6,000 terrain pipelines fail and the ground near the player isn't drawn. A SPIRV-Cross fix would
 bring tessellation back.
 
-Still showing: NMS's warning that the driver doesn't support enough per-stage descriptor
-samplers (dismiss it; the wrapper could report the higher limit).
+**VR**: `GAMEDATA/opencomposite.ini` with `initUsingVulkan=true` (OpenComposite reads its ini
+from the game's working directory, which for NMS is `GAMEDATA`, not `Binaries`), and OpenComposite
+`local-render-models` from `d82b01b`: its temporary Vulkan device no longer needs Windows external
+memory (`1498479`), a mismatched physical device on a one-GPU Mac isn't fatal (`c12c897`), and
+dpad bindings work in every action set (`d82b01b`; before it the sticks' snap turning and
+teleporting worked in menus only). The runtime's `3988cde` puts each hand on its own controller.
