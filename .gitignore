@@ -3,3 +3,4 @@ out/
 macvapor/dist/
 macvapor/release.env
 __pycache__/
+compat/vkfeatures/out/

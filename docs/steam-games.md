@@ -9,7 +9,7 @@ more, and what each setting is for. Tested on an M4 Max with CrossOver Preview 2
 | The Lab | 450390 | Works, hands included. Nothing needed. |
 | Battlezone (2016) | 312650 | Works. `CX_GRAPHICS_BACKEND=dxmt %command% -windowed`. |
 | Elite Dangerous (Odyssey) | 359320 | Works in VR, 82–90 fps. Needs our DXMT build and a vendor ID; see below. |
-| No Man's Sky | 275850 | In progress: Vulkan only, so MoltenVK rather than DXMT. |
+| No Man's Sky | 275850 | Runs flat with the ground drawn: needs MoltenVK 1.4, a Vulkan wrapper and Terrain Tessellation off; see below. VR next. |
 
 ## Elite Dangerous
 
@@ -45,3 +45,45 @@ A gamepad has to be connected to the Mac (a USB cable is best). Over Bluetooth, 
 playing: a Switch Pro Controller left connected kept streaming and congested the Mac's radio, and
 the Magic Keyboard's input arrived about 30 seconds late. A way to use the headset's controllers as
 a gamepad is specified in [gamepad.md](gamepad.md).
+
+## No Man's Sky
+
+NMS on Windows renders with Vulkan only, so it runs on MoltenVK (Vulkan on Metal), not DXMT.
+Three things were needed (2026-10-19):
+
+**MoltenVK 1.4, not CrossOver's 1.2.10.** With 1.2.10 shaders using more than 16 samplers fail to
+compile ("'sampler' attribute parameter is out of bounds"): its texture-buffer alignment emulation
+switches argument buffers off. MoltenVK 1.4.2 (Homebrew's) doesn't. NotProton has one runner for
+every game, so NMS gets its own: the runner cloned (`cp -cR`, an APFS clone) to
+`runners/crossover-27.0.0.41069-fex-mvk14` with Homebrew's `libMoltenVK.dylib` in
+`CrossOver/lib/aarch64`, and its `share/wine/wine.inf` given the original's modification time
+(`touch -r`, else NotProton takes the prefix for another Wine's). A line in NotProton's tool list
+(`~/Library/Application Support/notproton/tools`):
+
+```
+notproton-mvk14	27.0.0.41069-fex-mvk14	fex	CrossOver 2026 10 06-ARM64 - FEX + MoltenVK 1.4
+```
+
+makes NotProton create that compatibility tool at Steam's start (it deletes unlisted
+`notproton*` folders). NMS's Compatibility setting is that tool, and the prefix's record
+(`compatdata/275850/notproton-build`, build and display name) names its build. Opening the
+NotProton app may rewrite the tool list. Environment variables don't reach MoltenVK: NotProton
+passes only its allowlist (no `MVK_`, no `DYLD_`), and the prefix's registry environment reaches
+Windows code only.
+
+**A Vulkan wrapper** ([compat/vkfeatures](../compat/vkfeatures)): a `vulkan-1.dll` in NMS's
+`Binaries` folder (NMS's own Khronos loader kept as `vulkan-1.dll.khronos`), loaded with
+`HKCU\Software\Wine\AppDefaults\NMS.exe\DllOverrides` `vulkan-1` = `native,builtin`. It reports
+`wideLines` (NMS refuses to start without; Metal has only one-pixel lines, which it then draws),
+drops requested features the device lacks, clamps line widths, hides `VK_KHR_push_descriptor`,
+and attaches a debug messenger (MoltenVK log level via `VK_EXT_layer_settings`) so MoltenVK's
+errors appear in `notproton-wine.log` as `vkfeatures:` lines.
+
+**Terrain Tessellation at its lowest** (Options, Graphics). With tessellation MoltenVK runs the
+vertex shader as a compute pass, and its shader translator (SPIRV-Cross) then casts the stage
+output to `device float*` ("C-style cast ... converts between mismatching address spaces"): about
+6,000 terrain pipelines fail and the ground near the player isn't drawn. A SPIRV-Cross fix would
+bring tessellation back.
+
+Still showing: NMS's warning that the driver doesn't support enough per-stage descriptor
+samplers (dismiss it; the wrapper could report the higher limit).
