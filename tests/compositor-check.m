@@ -508,7 +508,7 @@ static FILE *decode(const char *file, int *W, int *H) {
     FILE *p = popen(cmd, "r");
     if (!p || fscanf(p, "%dx%d", W, H) != 2) { fprintf(stderr, "can't read %s\n", file); exit(1); }
     pclose(p);
-    snprintf(cmd, sizeof cmd, "/opt/homebrew/bin/ffmpeg -v error -f hevc -i '%s' -fps_mode passthrough -vf scale=in_range=tv:in_color_matrix=bt709 -f rawvideo -pix_fmt rgb24 - 2>/dev/null", file);
+    snprintf(cmd, sizeof cmd, "/opt/homebrew/bin/ffmpeg -v error -f hevc -i '%s' -fps_mode passthrough -vf scale=in_range=auto:in_color_matrix=auto -f rawvideo -pix_fmt rgb24 - 2>/dev/null", file);
     return popen(cmd, "r");
 }
 
