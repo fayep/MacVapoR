@@ -9,7 +9,7 @@ more, and what each setting is for. Tested on an M4 Max with CrossOver Preview 2
 | The Lab | 450390 | Works, hands included. Nothing needed. |
 | Battlezone (2016) | 312650 | Works. `CX_GRAPHICS_BACKEND=dxmt %command% -windowed`. |
 | Elite Dangerous (Odyssey) | 359320 | Works in VR, 82–90 fps. Needs our DXMT build and a vendor ID; see below. |
-| No Man's Sky | 275850 | Works in VR, hands and sticks included, about 20 fps. Needs MoltenVK 1.4, a Vulkan wrapper and Terrain Tessellation off; see below. |
+| No Man's Sky | 275850 | Works in VR, hands and sticks included: 40–46 fps on Standard, 34–36 on Enhanced. Needs a patched MoltenVK 1.4.2 and a Vulkan wrapper; see below. |
 
 ## Elite Dangerous
 
@@ -75,18 +75,30 @@ Windows code only.
 `Binaries` folder (NMS's own Khronos loader kept as `vulkan-1.dll.khronos`), loaded with
 `HKCU\Software\Wine\AppDefaults\NMS.exe\DllOverrides` `vulkan-1` = `native,builtin`. It reports
 `wideLines` (NMS refuses to start without; Metal has only one-pixel lines, which it then draws),
-drops requested features the device lacks, clamps line widths, hides `VK_KHR_push_descriptor`,
+drops requested features the device lacks, clamps line widths, answers a pipeline that failed
+before with the same failure without compiling it again (NMS retried its 4 failing ones over
+260,000 times a session: ~17 fps, then 40–46), hides `VK_KHR_push_descriptor`,
 raises the reported sampler limits (MoltenVK says 16 a stage, Metal's fixed slots, though with
 argument buffers NMS's shaders use more and run; the wrapper reports the sampled-image limits,
 256 a stage and 1280 a set, so NMS's "not enough per-stage descriptor samplers" warning is gone),
 and attaches a debug messenger (MoltenVK log level via `VK_EXT_layer_settings`) so MoltenVK's
 errors appear in `notproton-wine.log` as `vkfeatures:` lines.
 
-**Terrain Tessellation at its lowest** (Options, Graphics). With tessellation MoltenVK runs the
-vertex shader as a compute pass, and its shader translator (SPIRV-Cross) then casts the stage
-output to `device float*` ("C-style cast ... converts between mismatching address spaces"): about
-6,000 terrain pipelines fail and the ground near the player isn't drawn. A SPIRV-Cross fix would
-bring tessellation back.
+**MoltenVK 1.4.2 with a SPIRV-Cross fix.** For tessellation MoltenVK runs the vertex shader as a
+compute pass that writes its outputs to a buffer. SPIRV-Cross lowers a vertex shader's output
+block to a local copy there, but still treated it as buffer storage, so a store to one component
+of its vectors became a cast to `device float*` of a thread variable, which Metal rejects ("C-style
+cast ... converts between mismatching address spaces"). NMS's terrain vertex shader does that:
+its pipelines failed and the ground near the player wasn't drawn, unless Terrain Tessellation was
+at its lowest (even then 4 pipelines failed, and NMS asked for them again every frame). Fixed in
+`~/Source/SPIRV-Cross` branch `vertex-block-output-thread` (`spirv_msl.cpp`,
+`variable_decl_is_remapped_storage`: a vertex shader's non-builtin output block isn't remapped;
+SPIRV-Cross's MSL test suites pass). MoltenVK built from `~/Source/MoltenVK` tag `v1.4.2` with
+the fix applied to the SPIRV-Cross revision it pins (`6c09849`):
+`./fetchDependencies --macos --spirv-cross-root <patched checkout>` then `make macos`, and
+`Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` (`lipo -thin arm64`) put in the
+runner's `CrossOver/lib/aarch64`, Homebrew's kept as `libMoltenVK.dylib.brew-1.4.2`. Every
+setting can then be Enhanced, tessellation included.
 
 **VR**: `GAMEDATA/opencomposite.ini` with `initUsingVulkan=true` (OpenComposite reads its ini
 from the game's working directory, which for NMS is `GAMEDATA`, not `Binaries`), and OpenComposite
