@@ -124,8 +124,11 @@ compositor checks `desc.seq == seq` and skips a frame whose descriptor has moved
   `should_render = 0` 2 s after alpha reaches 1 (it idles). The game is FOCUSED from
   `xrBeginSession` as now (games wait for focus before drawing).
 - Fade back to the lounge on: XPC connection invalidated, the game's process exiting
-  (`DISPATCH_SOURCE_TYPE_PROC`), `closeSession`, or no frame for 300 ms. The lounge's
-  `should_render = 1` and focus FOCUSED at once; the game's last frame fades out, reprojected.
+  (`DISPATCH_SOURCE_TYPE_PROC`), `closeSession`, or no frame for `tune.json "watchdog_ms"`
+  (1500). The lounge's `should_render = 1` and focus FOCUSED at once; the game's last frame fades
+  out, reprojected. After the watchdog the game stays FOCUSED and the lounge VISIBLE: a stalled game
+  is usually loading, and told it lost focus Unreal's Oculus games drop to a few frames a second
+  and never pass the first-frame check again. It comes back through that check.
 - Several games: the newest to pass the first-frame check is foreground; others are VISIBLE and
   their frames are released unread. At most 4 sources.
 

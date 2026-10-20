@@ -456,6 +456,11 @@ static void tick(void) {
         fg->passed = false;   // it may come back, through the first-frame check again
         fg->streak = 0;
         make_foreground(g_lounge, now, "watchdog");
+        // A stalled game is usually loading: it keeps its focus while the lounge covers it. Told it
+        // lost focus, Unreal's Oculus games drop to a few frames a second, and so would never pass
+        // the first-frame check to come back (Robo Recall, 2026-10-19).
+        set_focus(fg, AXR_FOCUS_FOCUSED, true);
+        set_focus(g_lounge, AXR_FOCUS_VISIBLE, true);
     }
     if (g_lounge_idle_at_ns && now >= g_lounge_idle_at_ns) {
         g_lounge_idle_at_ns = 0;
