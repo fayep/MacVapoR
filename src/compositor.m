@@ -653,6 +653,10 @@ static void source_gone(axr_source *src, const char *reason) {
     if (src == g_fg) {
         if (g_lounge) make_foreground(g_lounge, now, reason);   // its last frame fades out underneath
         else { g_fg = NULL; g_other = NULL; g_fade_start_ns = 0; }
+    } else if (g_lounge && g_fg == g_lounge && !g_dashboard) {
+        // The lounge covering a stalled game (the watchdog) had left it the focus: the game gone,
+        // the lounge takes it back, or its input stays off.
+        set_focus(g_lounge, AXR_FOCUS_FOCUSED, true);
     }
     if (src->audio && src != g_other) {
         if (!src->local) axr_audio_remove_source(src->audio);
