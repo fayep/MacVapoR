@@ -18,6 +18,7 @@ Some of this only works on the developer's Mac so far: see [What's left](#whats-
 | --- | --- | --- |
 | Lone Echo | 3.17.4 | Plays through. The game runs at about 50 to 58 frames a second on an M4 Max; the headset fills the gaps at 90 Hz. |
 | Asgard's Wrath | 1.6.0 | Title and loading screens, calibration, play. |
+| Robo Recall | 1.6 | Plays through. Needs Epic's telemetry blocked (rift-add.sh does it): its uploads to the retired `datarouter.ol.epicgames.com` crashed the game's HTTP thread a few minutes in. |
 
 Other Rift games built on the same engines (Unreal Engine 4, Unity, Ready At Dawn's) are likely
 to work. Games that need Meta's online services for multiplayer won't (see [Offline](#offline)).
