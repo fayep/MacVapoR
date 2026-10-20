@@ -118,7 +118,7 @@ compositor checks `desc.seq == seq` and skips a frame whose descriptor has moved
 ## Handover
 
 - A game becomes foreground at its first frame with `AXR_FRAME_HAS_CONTENT`, after 2 in a row
-  each within 2 refresh periods of the last. Optional: `tune.json "handover_luma"` waits for a
+  each within 150 ms of the last (or 2 refresh periods, if longer): a slow game (No Man's Sky, ~20 fps) qualifies, a ~3 fps loading screen doesn't. Optional: `tune.json "handover_luma"` waits for a
   frame that isn't black.
 - Fade: alpha 0 → 1 over `tune.json "fade_ms"` (400), blended in linear light, FFR after.
 - The lounge's focus goes FOCUSED → VISIBLE when the fade starts (it stops taking input), and

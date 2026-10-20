@@ -22,7 +22,7 @@
 
 #define MAX_SOURCES 4
 #define LOUNGE_IDLE_NS 2000000000LL    // after a fade to a game, the lounge idles this much later
-#define FIRST_FRAMES 3                 // content frames in a row (each within 2 periods) before a game shows
+#define FIRST_FRAMES 3                 // content frames in a row (each within 150 ms) before a game shows
 // The dashboard (docs/compositor.md): the right controller's system button held this long opens it,
 // and the game under the panel is dimmed to this.
 #define DASHBOARD_HOLD_NS 500000000LL
@@ -58,7 +58,7 @@ struct axr_source {
     uint64_t inflight_seq[AXR_FRAME_RING];   // frames compose command buffers read (seq % RING)
     unsigned inflight[AXR_FRAME_RING];
     // Handover.
-    int streak;                     // content frames in a row, each within 2 refresh periods
+    int streak;                     // content frames in a row, each within 150 ms (or 2 periods)
     int64_t last_content_ns;
     bool passed;                    // has passed the first-frame check (once: a demoted game stays back)
     int64_t last_frame_ns;          // any frame, for the watchdog
@@ -317,8 +317,11 @@ static void watch_system_button(int64_t now) {
 // A content frame arrived from a game: the first-frame check, then the handover.
 static void handover(axr_source *src, int64_t now) {
     if (src->local || src == g_fg || src->passed) return;
-    int64_t period = (int64_t)(1e9 / axr_refresh_hz());
-    src->streak = src->last_content_ns && now - src->last_content_ns <= 2 * period ? src->streak + 1 : 1;
+    // Steady means at least ~7 frames a second (150 ms apart), whatever the refresh: No Man's Sky
+    // runs at ~20 fps here and never showed while the gap was two refresh periods (22 ms), while
+    // a loading screen at ~3 fps (Robo Recall's) still doesn't count.
+    int64_t period = (int64_t)(1e9 / axr_refresh_hz()), gap = 2 * period > 150000000LL ? 2 * period : 150000000LL;
+    src->streak = src->last_content_ns && now - src->last_content_ns <= gap ? src->streak + 1 : 1;
     src->last_content_ns = now;
     if (src->streak < FIRST_FRAMES) return;
     src->passed = true;
