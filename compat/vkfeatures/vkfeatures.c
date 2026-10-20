@@ -9,6 +9,7 @@
  *  - vkCreateDevice: requested features the device hasn't got are dropped (and logged), in
  *    VkPhysicalDeviceFeatures, VkPhysicalDeviceFeatures2 and the Vulkan 1.1-1.4 feature structs;
  *  - pipelines' rasterization lineWidth and vkCmdSetLineWidth are clamped to 1;
+ *  - a graphics pipeline that failed fails again at once when asked for again (see failed_seen);
  *  - vkGetPhysicalDeviceProperties(2): the sampler limits are raised to the sampled-image ones (see
  *    raise_limits), so No Man's Sky doesn't warn about them at every start.
  * Everything else goes straight to Wine's own vulkan-1.dll (system32), loaded by its path: the
@@ -20,9 +21,11 @@
 #include <windows.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 // No prototypes: these functions are this DLL's own, exported through the generated .def.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -44,6 +47,7 @@ static PFN_vkEnumerateDeviceExtensionProperties real_EnumerateDeviceExtensionPro
 static PFN_vkCreateGraphicsPipelines real_CreateGraphicsPipelines;
 static PFN_vkCmdSetLineWidth real_CmdSetLineWidth;
 static PFN_vkCreateComputePipelines real_CreateComputePipelines;
+static PFN_vkDestroyShaderModule real_DestroyShaderModule;
 
 static int hidden(const char *name);
 
@@ -355,11 +359,184 @@ EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(VkPhy
     return r;
 }
 
+// ---------------------------------------------------------------------------- failed pipelines
+
+// No Man's Sky asks again, every frame, for a pipeline MoltenVK couldn't make (its terrain
+// tessellation pipelines: SPIRV-Cross's address-space bug, see docs/steam-games.md), and each try
+// translates the shaders again: ~90,000 failures a session, two threads kept busy, the frame rate
+// down. A failed pipeline is remembered by a hash of what decides whether it compiles (its shaders,
+// their entry points and specialization, the vertex input, topology, tessellation, layout and
+// render pass) and fails again without the work. Shaders count by a hash of their SPIR-V, kept per
+// module handle from vkCreateShaderModule, so a handle reused for other code is another shader.
+
+#define FAILED_SLOTS 32768
+static uint64_t failed[FAILED_SLOTS];   // 0: empty
+static unsigned failed_count, failed_repeats;
+static SRWLOCK failed_lock = SRWLOCK_INIT;
+
+static uint64_t fnv(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 0x100000001b3ULL;
+    return h;
+}
+
+// Shader module handle -> hash of its code (open addressing; a destroyed one is a tombstone).
+#define MODULE_SLOTS 65536
+#define TOMBSTONE ((uint64_t)-1)
+static struct { uint64_t module, code; } modules[MODULE_SLOTS];
+static unsigned modules_used;
+static SRWLOCK modules_lock = SRWLOCK_INIT;
+static PFN_vkCreateShaderModule real_CreateShaderModule;
+
+// Opt-in: with a vkfeatures-dump folder next to this DLL, each shader module's SPIR-V is saved there
+// as <code hash>.spv, and failed pipelines name their stages' hashes, to reproduce them offline.
+static WCHAR dump_dir[MAX_PATH];
+static int dump_state;   // 0 unknown, 1 on, -1 off
+
+static int dumping(void) {
+    if (dump_state) return dump_state > 0;
+    HMODULE self = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)dumping, &self);
+    DWORD n = GetModuleFileNameW(self, dump_dir, MAX_PATH);
+    WCHAR *slash = n ? wcsrchr(dump_dir, L'\\') : NULL;
+    dump_state = -1;
+    if (slash && (size_t)(slash - dump_dir) + 40 < MAX_PATH) {
+        wcscpy(slash + 1, L"vkfeatures-dump");
+        DWORD a = GetFileAttributesW(dump_dir);
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+            dump_state = 1;
+            say("dumping shader modules to vkfeatures-dump");
+        }
+    }
+    return dump_state > 0;
+}
+
+static void dump_module(uint64_t code, const void *bytes, size_t size) {
+    if (!dumping()) return;
+    WCHAR path[MAX_PATH];
+    if (_snwprintf(path, MAX_PATH, L"%ls\\%016llx.spv", dump_dir, (unsigned long long)code) < 0) return;
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;   // already there
+    DWORD wrote;
+    WriteFile(f, bytes, (DWORD)size, &wrote, NULL);
+    CloseHandle(f);
+}
+
+static uint64_t module_code(VkShaderModule m) {
+    uint64_t key = (uint64_t)m, code = 0;
+    AcquireSRWLockShared(&modules_lock);
+    for (unsigned i = (key >> 4) % MODULE_SLOTS, n = 0; n < MODULE_SLOTS && modules[i].module; i = (i + 1) % MODULE_SLOTS, n++)
+        if (modules[i].module == key) { code = modules[i].code; break; }
+    ReleaseSRWLockShared(&modules_lock);
+    return code;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
+                                                         const VkAllocationCallbacks *alloc, VkShaderModule *out) {
+    VkResult r = real_CreateShaderModule(dev, ci, alloc, out);
+    if (r != VK_SUCCESS || !ci->pCode) return r;
+    uint64_t key = (uint64_t)*out, code = fnv(0xcbf29ce484222325ULL, ci->pCode, ci->codeSize) | 1;
+    dump_module(code, ci->pCode, ci->codeSize);
+    AcquireSRWLockExclusive(&modules_lock);
+    if (modules_used < MODULE_SLOTS * 3 / 4) {
+        unsigned i = (key >> 4) % MODULE_SLOTS;
+        while (modules[i].module && modules[i].module != TOMBSTONE && modules[i].module != key) i = (i + 1) % MODULE_SLOTS;
+        if (modules[i].module != key && modules[i].module != TOMBSTONE) modules_used++;
+        modules[i].module = key;
+        modules[i].code = code;
+    }
+    ReleaseSRWLockExclusive(&modules_lock);
+    return r;
+}
+
+EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(VkDevice dev, const VkShaderModuleCreateInfo *ci,
+                                                          const VkAllocationCallbacks *alloc, VkShaderModule *out) {
+    if (!real_CreateShaderModule)
+        real_CreateShaderModule = (PFN_vkCreateShaderModule)GetProcAddress(real_module, "vkCreateShaderModule");
+    return CreateShaderModule(dev, ci, alloc, out);
+}
+
+// 0 when the pipeline can't be keyed (shaders not from modules, several in one call).
+static uint64_t pipeline_key(const VkGraphicsPipelineCreateInfo *ci) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint32_t i = 0; i < ci->stageCount; i++) {
+        const VkPipelineShaderStageCreateInfo *st = &ci->pStages[i];
+        if (st->module == VK_NULL_HANDLE || st->pNext) return 0;
+        uint64_t code = module_code(st->module);
+        if (!code) return 0;
+        h = fnv(h, &st->stage, sizeof st->stage);
+        h = fnv(h, &code, sizeof code);
+        if (st->pName) h = fnv(h, st->pName, strlen(st->pName));
+        const VkSpecializationInfo *sp = st->pSpecializationInfo;
+        if (sp) {
+            if (sp->mapEntryCount) h = fnv(h, sp->pMapEntries, sp->mapEntryCount * sizeof *sp->pMapEntries);
+            if (sp->dataSize) h = fnv(h, sp->pData, sp->dataSize);
+        }
+    }
+    const VkPipelineVertexInputStateCreateInfo *vi = ci->pVertexInputState;
+    if (vi) {
+        if (vi->pNext) return 0;
+        if (vi->vertexBindingDescriptionCount)
+            h = fnv(h, vi->pVertexBindingDescriptions, vi->vertexBindingDescriptionCount * sizeof *vi->pVertexBindingDescriptions);
+        if (vi->vertexAttributeDescriptionCount)
+            h = fnv(h, vi->pVertexAttributeDescriptions,
+                    vi->vertexAttributeDescriptionCount * sizeof *vi->pVertexAttributeDescriptions);
+    }
+    if (ci->pInputAssemblyState) h = fnv(h, &ci->pInputAssemblyState->topology, sizeof(VkPrimitiveTopology));
+    if (ci->pTessellationState) h = fnv(h, &ci->pTessellationState->patchControlPoints, sizeof(uint32_t));
+    h = fnv(h, &ci->layout, sizeof ci->layout);
+    h = fnv(h, &ci->renderPass, sizeof ci->renderPass);
+    h = fnv(h, &ci->subpass, sizeof ci->subpass);
+    return h ? h : 1;
+}
+
+static int failed_seen(uint64_t key) {
+    AcquireSRWLockShared(&failed_lock);
+    int found = 0;
+    for (unsigned i = key % FAILED_SLOTS, n = 0; n < FAILED_SLOTS && failed[i]; i = (i + 1) % FAILED_SLOTS, n++)
+        if (failed[i] == key) { found = 1; break; }
+    ReleaseSRWLockShared(&failed_lock);
+    return found;
+}
+
+static void failed_add(uint64_t key) {
+    AcquireSRWLockExclusive(&failed_lock);
+    if (failed_count < FAILED_SLOTS / 2) {
+        unsigned i = key % FAILED_SLOTS;
+        while (failed[i] && failed[i] != key) i = (i + 1) % FAILED_SLOTS;
+        if (!failed[i]) { failed[i] = key; failed_count++; }
+    }
+    ReleaseSRWLockExclusive(&failed_lock);
+}
+
+static VKAPI_ATTR void VKAPI_CALL DestroyShaderModule(VkDevice dev, VkShaderModule module, const VkAllocationCallbacks *alloc) {
+    uint64_t key = (uint64_t)module;
+    AcquireSRWLockExclusive(&modules_lock);
+    for (unsigned i = (key >> 4) % MODULE_SLOTS, n = 0; n < MODULE_SLOTS && modules[i].module; i = (i + 1) % MODULE_SLOTS, n++)
+        if (modules[i].module == key) { modules[i].module = TOMBSTONE; break; }
+    ReleaseSRWLockExclusive(&modules_lock);
+    real_DestroyShaderModule(dev, module, alloc);
+}
+
+EXPORT VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(VkDevice dev, VkShaderModule module, const VkAllocationCallbacks *alloc) {
+    if (!real_DestroyShaderModule)
+        real_DestroyShaderModule = (PFN_vkDestroyShaderModule)GetProcAddress(real_module, "vkDestroyShaderModule");
+    DestroyShaderModule(dev, module, alloc);
+}
+
 // ---------------------------------------------------------------------------- line width
 
 static VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice dev, VkPipelineCache cache, uint32_t n,
                                                               const VkGraphicsPipelineCreateInfo *infos,
                                                               const VkAllocationCallbacks *alloc, VkPipeline *out) {
+    uint64_t key = n == 1 ? pipeline_key(infos) : 0;
+    if (key && failed_seen(key)) {
+        out[0] = VK_NULL_HANDLE;
+        unsigned k = ++failed_repeats;
+        if ((k & (k - 1)) == 0) say("%u repeats of failed pipelines answered without compiling", k);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     float widths[64];
     uint32_t m = n < 64 ? n : 64;
     for (uint32_t i = 0; i < m; i++) {
@@ -368,7 +545,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice dev, VkPi
         if (rs && rs->lineWidth != 1.0f) rs->lineWidth = 1.0f;
     }
     VkResult r = real_CreateGraphicsPipelines(dev, cache, n, infos, alloc, out);
-    if (r != VK_SUCCESS) say("vkCreateGraphicsPipelines(%u) failed: %d", n, (int)r);
+    if (r != VK_SUCCESS) {
+        if (key) failed_add(key);
+        char stages[256] = "";
+        size_t used = 0;
+        for (uint32_t i = 0; n == 1 && i < infos->stageCount && used + 40 < sizeof stages; i++)
+            used += (size_t)snprintf(stages + used, sizeof stages - used, " stage %#x %016llx", (unsigned)infos->pStages[i].stage,
+                                     (unsigned long long)module_code(infos->pStages[i].module));
+        say("vkCreateGraphicsPipelines(%u) failed: %d%s%s", n, (int)r, key ? " (remembered)" : "", stages);
+    }
     for (uint32_t i = 0; i < m; i++) {
         VkPipelineRasterizationStateCreateInfo *rs = (VkPipelineRasterizationStateCreateInfo *)infos[i].pRasterizationState;
         if (rs) rs->lineWidth = widths[i];
@@ -434,6 +619,14 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice dev
         real_CreateComputePipelines = (PFN_vkCreateComputePipelines)real;
         return (PFN_vkVoidFunction)CreateComputePipelines;
     }
+    if (!strcmp(name, "vkDestroyShaderModule")) {
+        real_DestroyShaderModule = (PFN_vkDestroyShaderModule)real;
+        return (PFN_vkVoidFunction)DestroyShaderModule;
+    }
+    if (!strcmp(name, "vkCreateShaderModule")) {
+        real_CreateShaderModule = (PFN_vkCreateShaderModule)real;
+        return (PFN_vkVoidFunction)CreateShaderModule;
+    }
     PFN_vkVoidFunction mine = ours(name);
     return mine ? mine : real;
 }
@@ -449,6 +642,14 @@ EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance
     if (real && !strcmp(name, "vkCmdSetLineWidth")) {
         real_CmdSetLineWidth = (PFN_vkCmdSetLineWidth)real;
         return (PFN_vkVoidFunction)CmdSetLineWidth;
+    }
+    if (real && !strcmp(name, "vkDestroyShaderModule")) {
+        real_DestroyShaderModule = (PFN_vkDestroyShaderModule)real;
+        return (PFN_vkVoidFunction)DestroyShaderModule;
+    }
+    if (real && !strcmp(name, "vkCreateShaderModule")) {
+        real_CreateShaderModule = (PFN_vkCreateShaderModule)real;
+        return (PFN_vkVoidFunction)CreateShaderModule;
     }
     PFN_vkVoidFunction mine = ours(name);
     // vkGetPhysicalDeviceFeatures2KHR only if the instance offers it.

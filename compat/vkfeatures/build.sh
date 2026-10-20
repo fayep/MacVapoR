@@ -10,7 +10,7 @@ LLVM_MINGW=${LLVM_MINGW:-$HOME/Source/dxmt/toolchains/llvm-mingw-20260908-ucrt-m
 VULKAN_INCLUDE=${VULKAN_INCLUDE:-/opt/homebrew/include}
 out=$here/out
 mkdir -p "$out"
-ours="vkCreateInstance vkEnumerateDeviceExtensionProperties vkGetInstanceProcAddr vkGetDeviceProcAddr vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties2 vkCreateDevice vkCreateGraphicsPipelines vkCmdSetLineWidth"
+ours="vkCreateInstance vkEnumerateDeviceExtensionProperties vkGetInstanceProcAddr vkGetDeviceProcAddr vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties2 vkCreateDevice vkCreateGraphicsPipelines vkCmdSetLineWidth vkCreateShaderModule vkDestroyShaderModule"
 python3 -I - "$here/exports.txt" "$out" $ours <<'PY'
 import sys
 exports = [l.strip() for l in open(sys.argv[1]) if l.strip()]
