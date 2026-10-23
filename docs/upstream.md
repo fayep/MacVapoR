@@ -78,7 +78,7 @@ upstream's `openxr`.
 | 1711376 | D3D methods hooked by replacing their vtable entries, not by rewriting their code with Detours; builds with clang-cl | A game whose D3D11 is ARM64EC code: DXMT under NotProton on Apple silicon (Lone Echo) |
 | b949983 | Detours built unoptimised under clang, which otherwise compiles `DetourRestoreAfterWith` to a trap | Building with clang-cl |
 | 92cd114 | OpenXR functions looked up again for each instance | A runtime that unloads with the first instance and loads elsewhere (Asgard's Wrath, through NotProton's wineopenxr) |
-| 4c06e6b | The launcher uses a shared `Support\oculus-runtime` beside it, `riftlift.env` defaults, and `/env NAME=VALUE` | Running games without RiftLift's app, as MacVapoR does (Lone Echo) |
+| 7f6009c | The launcher uses a shared `Support\oculus-runtime` beside it, `riftlift.env` defaults, and `/env NAME=VALUE` | Nothing yet: a smoother install, one shared runtime instead of copies in each prefix. Builds; not yet run in a game, so it isn't in the preview and will be proposed after the bridge fixes |
 
 ### DXMT
 
@@ -141,7 +141,7 @@ Patches against ALVR 20.14.1's server core, which this repository's runtime link
 | Batman: Arkham VR | + OpenComposite 73dbe20 |
 | No Man's Sky | + OpenComposite d82b01b, 1498479, c12c897, 7579c41; MoltenVK with the SPIRV-Cross fix; [vkfeatures](../compat/vkfeatures) ([steam-games.md](steam-games.md#no-mans-sky)) |
 | Elite Dangerous: Odyssey | + DXMT `thread-stack` |
-| Lone Echo | + RiftLift `vtable-hooks`, DXMT `thread-stack` ([rift-games.md](rift-games.md)) |
+| Lone Echo | + RiftLift 1711376, b949983, 92cd114 (the bridge), DXMT `thread-stack` ([rift-games.md](rift-games.md)) |
 | Asgard's Wrath | + RiftLift 92cd114, NotProton 6928dcb |
 
 ## Not included
@@ -157,5 +157,5 @@ Patches against ALVR 20.14.1's server core, which this repository's runtime link
 In preparation. It will put all of the above together: the runtime and home scene, OpenComposite
 from `local-render-models` (including HudsonMCox's two fixes, credited, and his to submit),
 MoltenVK with the SPIRV-Cross fix, DXMT from `thread-stack`, wineopenxr from NotProton's
-`vr-runtimes`, and RiftLift's bridge from `vtable-hooks`. Each will come with its licence, and its
+`vr-runtimes`, and RiftLift's OpenXR bridge from `vtable-hooks` (with RiftLift 0.11.1.2's own launcher). Each will come with its licence, and its
 source is at the branch above.
