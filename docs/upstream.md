@@ -78,7 +78,7 @@ upstream's `openxr`.
 | 1711376 | D3D methods hooked by replacing their vtable entries, not by rewriting their code with Detours; builds with clang-cl | A game whose D3D11 is ARM64EC code: DXMT under NotProton on Apple silicon (Lone Echo) |
 | b949983 | Detours built unoptimised under clang, which otherwise compiles `DetourRestoreAfterWith` to a trap | Building with clang-cl |
 | 92cd114 | OpenXR functions looked up again for each instance | A runtime that unloads with the first instance and loads elsewhere (Asgard's Wrath, through NotProton's wineopenxr) |
-| 7f6009c | The launcher uses a shared `Support\oculus-runtime` beside it, `riftlift.env` defaults, and `/env NAME=VALUE` | Nothing yet: a smoother install, one shared runtime instead of copies in each prefix. Builds; not yet run in a game, so it isn't in the preview and will be proposed after the bridge fixes |
+| bfbcac9 | The launcher uses a shared `Support\oculus-runtime` beside it, `riftlift.env` defaults, and `/env NAME=VALUE` | Nothing: a smoother install, one shared runtime instead of copies in each prefix. Tested with Lone Echo; not in the preview (which uses 0.11.1.2's launcher), and to be proposed after the bridge fixes |
 
 ### DXMT
 
