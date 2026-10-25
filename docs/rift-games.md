@@ -127,8 +127,8 @@ in AVP-Play (`avpplay login --account NAME`), choose one with `--account NAME`.
 
 ## 4. Use our bridge, and our DXMT
 
-`rift-add.sh` installs RiftLift 0.11.1.2. Its bridge patches D3D11's code with Detours, which breaks
-DXMT's ARM64EC code, so the game can't start. Ours hooks D3D11's vtables instead. In the game's
+`rift-add.sh` installs RiftLift 0.11.1.2. Its bridge patches D3D11's code with Detours, which corrupts
+DXMT's ARM64EC code; ours hooks D3D11's vtables instead. In the game's
 prefix (`rift-add.sh` prints its path), with Steam's copy of the game not running:
 
 1. Replace `drive_c/Program Files/RiftLift/RiftLiftOpenXR64.dll` with the one from the archive's
