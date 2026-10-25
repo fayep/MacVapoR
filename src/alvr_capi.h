@@ -31,6 +31,7 @@ enum {
     ALVR_EVENT_CAPTURE_FRAME,
     ALVR_EVENT_RESTART_PENDING,
     ALVR_EVENT_SHUTDOWN_PENDING,
+    ALVR_EVENT_INTERACTION_PROFILE,   // patches/alvr-20.14.1-which-controller.patch
 };
 
 // A #[repr(u8)] enum with fields is a union of #[repr(C)] structs that each start with the tag,
@@ -41,6 +42,7 @@ typedef union {
     struct { uint8_t tag; float bounds[2]; } playspace;
     struct { uint8_t tag; AlvrPose local_view_transform[2]; AlvrFov fov[2]; } views;
     struct { uint8_t tag; uint64_t sample_timestamp_ns; } tracking;
+    struct { uint8_t tag; uint64_t device_id, profile_id; } interaction_profile;
 } AlvrEvent;
 
 typedef struct {

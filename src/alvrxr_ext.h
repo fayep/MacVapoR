@@ -18,6 +18,7 @@ typedef struct {
     float height_offset;              // metres added to tracked heights now
     uint32_t loading;                 // a game is loading behind the lounge: vapord shows "Loading"
     char loading_name[AXR_NAME_MAX];  // its executable's name
+    uint32_t joycon[2];               // left, right: the client says that hand holds a Joy-Con
 } XrDashboardStateALVRXR;
 
 // The dashboard's state. vapord polls it each frame.

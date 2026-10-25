@@ -1,0 +1,118 @@
+--- a/alvr/server_core/src/lib.rs
++++ b/alvr/server_core/src/lib.rs
+@@ -92,6 +92,11 @@
+         sample_timestamp: Duration,
+     },
+     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
++    // The controller a client says a hand holds (its OpenXR interaction profile path ID)
++    InteractionProfile {
++        device_id: u64,
++        profile_id: u64,
++    },
+     RequestIDR,
+     CaptureFrame,
+     GameRenderLatencyFeedback(Duration), // only used for SteamVR
+--- a/alvr/server_core/src/connection.rs
++++ b/alvr/server_core/src/connection.rs
+@@ -1314,27 +1314,43 @@
+                             }
+                         };
+                     }
+-                    ClientControlPacket::ActiveInteractionProfile { profile_id, .. } => {
+-                        controller_button_mapping_manager = if let Switch::Enabled(config) =
+-                            &SESSION_MANAGER.read().settings().headset.controllers
+-                        {
+-                            if let Some(mappings) = &config.button_mappings {
+-                                Some(ButtonMappingManager::new_manual(mappings))
+-                            } else if let (Some(profile_info), Some(emulation_mode)) = (
+-                                CONTROLLER_PROFILE_INFO.get(&profile_id),
+-                                &controllers_emulation_mode,
+-                            ) {
+-                                Some(ButtonMappingManager::new_automatic(
+-                                    &profile_info.button_set,
+-                                    emulation_mode,
+-                                    &config.button_mapping_config,
+-                                ))
++                    ClientControlPacket::ActiveInteractionProfile {
++                        device_id,
++                        profile_id,
++                    } => {
++                        ctx.events_sender
++                            .send(ServerCoreEvent::InteractionProfile {
++                                device_id,
++                                profile_id,
++                            })
++                            .ok();
++
++                        // A profile without a known button set (a controller the client maps
++                        // itself) keeps the mapping in use, rather than dropping every button
++                        let keep = CONTROLLER_PROFILE_INFO.get(&profile_id).is_none()
++                            && controller_button_mapping_manager.is_some();
++                        if !keep {
++                            controller_button_mapping_manager = if let Switch::Enabled(config) =
++                                &SESSION_MANAGER.read().settings().headset.controllers
++                            {
++                                if let Some(mappings) = &config.button_mappings {
++                                    Some(ButtonMappingManager::new_manual(mappings))
++                                } else if let (Some(profile_info), Some(emulation_mode)) = (
++                                    CONTROLLER_PROFILE_INFO.get(&profile_id),
++                                    &controllers_emulation_mode,
++                                ) {
++                                    Some(ButtonMappingManager::new_automatic(
++                                        &profile_info.button_set,
++                                        emulation_mode,
++                                        &config.button_mapping_config,
++                                    ))
++                                } else {
++                                    None
++                                }
+                             } else {
+                                 None
+-                            }
+-                        } else {
+-                            None
+-                        };
++                            };
++                        }
+                     }
+                     ClientControlPacket::Log { level, message } => {
+                         info!("Client {client_hostname}: [{level:?}] {message}")
+--- a/alvr/server_core/src/c_api.rs
++++ b/alvr/server_core/src/c_api.rs
+@@ -125,6 +125,10 @@
+     CaptureFrame,
+     RestartPending,
+     ShutdownPending,
++    InteractionProfile {
++        device_id: u64,
++        profile_id: u64,
++    },
+ }
+ 
+ #[repr(C)]
+@@ -350,6 +354,15 @@
+                 ServerCoreEvent::ShutdownPending => {
+                     *out_event = AlvrEvent::ShutdownPending;
+                 }
++                ServerCoreEvent::InteractionProfile {
++                    device_id,
++                    profile_id,
++                } => {
++                    *out_event = AlvrEvent::InteractionProfile {
++                        device_id,
++                        profile_id,
++                    };
++                }
+                 ServerCoreEvent::GameRenderLatencyFeedback(_)
+                 | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
+             }
+--- a/alvr/server_openvr/src/lib.rs
++++ b/alvr/server_openvr/src/lib.rs
+@@ -261,6 +261,7 @@
+ 
+                     unsafe { ShutdownSteamvr() };
+                 }
++                ServerCoreEvent::InteractionProfile { .. } => (),
+             }
+         }
+ 
