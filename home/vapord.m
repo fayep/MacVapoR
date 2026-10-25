@@ -1702,8 +1702,11 @@ int main(int argc, char **argv) {
                     XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
                     // A pinch the client sends as a controller sits on the gaze ray, at the eyes: not a
                     // controller in the hand, which can't be there.
-                    bool joycon = force_joycons || dstate.joycon[h];
-                    if ((have_model[h] || joycon) && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
+                    bool joycon = force_joycons || dstate.held[h] == AXR_HELD_JOYCON;
+                    // A hand the client says holds nothing is a bare hand, even while its pose is still a
+                    // controller's (the client keeps one for a moment before turning to the hand).
+                    bool empty = !force_joycons && dstate.held[h] == AXR_HELD_NONE;
+                    if (!empty && (have_model[h] || joycon) && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
                         (sl.locationFlags & want) == want &&
                         simd_distance(simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z), head) > 0.25f) {
                         show_controller[h] = true;

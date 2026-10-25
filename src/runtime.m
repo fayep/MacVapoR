@@ -1900,10 +1900,10 @@ static XrResult xrGetDashboardStateALVRXR_(XrSession h, XrDashboardStateALVRXR *
     snprintf(st->game_name, sizeof st->game_name, "%s", name);
     st->loading = axr_compositor_loading(name);
     snprintf(st->loading_name, sizeof st->loading_name, "%s", name);
-    uint32_t joycon[3];
-    axr_server_dashboard_stats(st->battery, st->charging, joycon, &st->fps, &st->mbps, &st->eye_height, &st->height_offset);
-    st->joycon[0] = joycon[1];
-    st->joycon[1] = joycon[2];
+    uint32_t held[3];
+    axr_server_dashboard_stats(st->battery, st->charging, held, &st->fps, &st->mbps, &st->eye_height, &st->height_offset);
+    st->held[0] = held[1];
+    st->held[1] = held[2];
     return XR_SUCCESS;
 }
 

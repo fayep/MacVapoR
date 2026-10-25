@@ -18,8 +18,12 @@ typedef struct {
     float height_offset;              // metres added to tracked heights now
     uint32_t loading;                 // a game is loading behind the lounge: vapord shows "Loading"
     char loading_name[AXR_NAME_MAX];  // its executable's name
-    uint32_t joycon[2];               // left, right: the client says that hand holds a Joy-Con
+    uint32_t held[2];                 // left, right: what the client says the hand holds, AXR_HELD_*
 } XrDashboardStateALVRXR;
+
+// What a hand holds, as the client says (ALVR's controller profiles): unknown (a client that doesn't
+// say, or a controller the runtime doesn't tell apart), a Joy-Con, or nothing (hands only).
+enum { AXR_HELD_UNKNOWN = 0, AXR_HELD_JOYCON = 1, AXR_HELD_NONE = 2 };
 
 // The dashboard's state. vapord polls it each frame.
 typedef XrResult (XRAPI_PTR *PFN_xrGetDashboardStateALVRXR)(XrSession session, XrDashboardStateALVRXR *state);

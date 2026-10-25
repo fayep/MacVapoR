@@ -22,6 +22,7 @@
 
 #include "alvr_capi.h"
 #include "alvrxr.h"
+#include "alvrxr_ext.h"   // AXR_HELD_*
 #include "tracking.h"
 
 // ------------------------------------------------------------------------------------- logging
@@ -263,7 +264,7 @@ static bool g_height_offset_set;
 // The dashboard's status line (alvrxr_ext.h): each device's charge, and the stream over the last
 // stats period.
 static float g_battery[AXR_DEVICE_COUNT] = {-1, -1, -1};
-static bool g_joycon[AXR_DEVICE_COUNT];   // the client says that hand holds a Joy-Con
+static uint32_t g_held[AXR_DEVICE_COUNT];   // what the client says each hand holds, AXR_HELD_*
 static bool g_charging[AXR_DEVICE_COUNT];
 static float g_stream_fps, g_stream_mbps;
 
@@ -842,23 +843,25 @@ static void *event_thread(void *arg) {
             case ALVR_EVENT_CLIENT_DISCONNECTED:
                 pthread_mutex_lock(&g_lock);
                 g_connected = false;
-                memset(g_joycon, 0, sizeof g_joycon);
+                memset(g_held, 0, sizeof g_held);
                 pthread_mutex_unlock(&g_lock);
                 axr_publish_state();
                 axr_log("headset disconnected");
                 break;
             case ALVR_EVENT_INTERACTION_PROFILE: {
-                // The controller the client says a hand holds: only told apart for vapord's model.
+                // What the client says a hand holds (0: nothing, hands only): told apart for vapord's model.
                 static uint64_t joycon_id;
                 if (!joycon_id) joycon_id = alvr_path_to_id("/interaction_profiles/nintendo/joycon");
+                static const char *names[] = {"other", "Joy-Con", "nothing"};
+                uint64_t profile = ev.interaction_profile.profile_id;
+                uint32_t held = profile == 0 ? AXR_HELD_NONE : profile == joycon_id ? AXR_HELD_JOYCON : AXR_HELD_UNKNOWN;
                 for (int d = AXR_LEFT; d <= AXR_RIGHT; d++) {
                     if (ev.interaction_profile.device_id != g_device_id[d]) continue;
-                    bool joycon = ev.interaction_profile.profile_id == joycon_id;
                     pthread_mutex_lock(&g_lock);
-                    bool changed = g_joycon[d] != joycon;
-                    g_joycon[d] = joycon;
+                    bool changed = g_held[d] != held;
+                    g_held[d] = held;
                     pthread_mutex_unlock(&g_lock);
-                    if (changed) axr_log("controller: %s hand %s", d == AXR_LEFT ? "left" : "right", joycon ? "Joy-Con" : "other");
+                    if (changed) axr_log("controller: %s hand %s", d == AXR_LEFT ? "left" : "right", names[held]);
                 }
                 break;
             }
@@ -1609,13 +1612,13 @@ void axr_server_set_eye_height(float eye_height) {
     else axr_log("standing (dashboard)");
 }
 
-void axr_server_dashboard_stats(float battery[AXR_DEVICE_COUNT], uint32_t charging[AXR_DEVICE_COUNT], uint32_t joycon[AXR_DEVICE_COUNT],
+void axr_server_dashboard_stats(float battery[AXR_DEVICE_COUNT], uint32_t charging[AXR_DEVICE_COUNT], uint32_t held[AXR_DEVICE_COUNT],
                                 float *fps, float *mbps, float *eye_height, float *height_offset) {
     pthread_mutex_lock(&g_lock);
     for (int d = 0; d < AXR_DEVICE_COUNT; d++) {
         battery[d] = g_battery[d];
         charging[d] = g_charging[d];
-        joycon[d] = g_joycon[d];
+        held[d] = g_held[d];
     }
     *fps = g_stream_fps;
     *mbps = g_stream_mbps;

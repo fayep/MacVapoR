@@ -1,0 +1,264 @@
+diff --git a/alvr/client_core/src/c_api.rs b/alvr/client_core/src/c_api.rs
+index b69f7e92..6b255115 100644
+--- a/alvr/client_core/src/c_api.rs
++++ b/alvr/client_core/src/c_api.rs
+@@ -451,6 +451,17 @@ pub extern "C" fn alvr_send_playspace(width: f32, height: f32) {
+     }
+ }
+ 
++/// Whether the connected server handles alvr_send_active_interaction_profile() for any controller,
++/// including ones it has no button mapping for, and profile_id 0 for none (hands only). Without it,
++/// send only profiles the server maps, as before.
++#[no_mangle]
++pub extern "C" fn alvr_server_supports_controller_profiles() -> bool {
++    CLIENT_CORE_CONTEXT
++        .lock()
++        .as_ref()
++        .is_some_and(|context| context.server_supports_controller_profiles())
++}
++
+ #[no_mangle]
+ pub extern "C" fn alvr_send_active_interaction_profile(device_id: u64, profile_id: u64) {
+     if let Some(context) = &*CLIENT_CORE_CONTEXT.lock() {
+diff --git a/alvr/client_core/src/connection.rs b/alvr/client_core/src/connection.rs
+index 357bd436..4b3bde78 100644
+--- a/alvr/client_core/src/connection.rs
++++ b/alvr/client_core/src/connection.rs
+@@ -78,6 +78,7 @@ pub struct ConnectionContext {
+     pub last_good_head_pose: RwLock<Pose>,
+     pub view_params: RwLock<[ViewParams; 2]>,
+     pub uses_multimodal_protocol: RelaxedAtomic,
++    pub server_controller_profiles: RelaxedAtomic,
+     pub velocities_multiplier: RwLock<f32>,
+     pub max_prediction: RwLock<Duration>,
+ }
+@@ -212,6 +213,7 @@ fn connection_pipeline(
+                     prefer_full_range: capabilities.prefer_full_range,
+                     preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
+                     prefer_hdr: capabilities.prefer_hdr,
++                    controller_profiles: true,
+                 })
+                 .to_con()?,
+             ),
+@@ -225,6 +227,8 @@ fn connection_pipeline(
+ 
+     ctx.uses_multimodal_protocol
+         .set(stream_config.negotiated_config.use_multimodal_protocol);
++    ctx.server_controller_profiles
++        .set(stream_config.negotiated_config.controller_profiles);
+ 
+     let streaming_start_event = ClientCoreEvent::StreamingStarted(Box::new(stream_config.clone()));
+ 
+diff --git a/alvr/client_core/src/lib.rs b/alvr/client_core/src/lib.rs
+index 7af1711e..8febafc4 100644
+--- a/alvr/client_core/src/lib.rs
++++ b/alvr/client_core/src/lib.rs
+@@ -172,6 +172,12 @@ impl ClientCoreContext {
+         }
+     }
+ 
++    /// Whether the server handles ActiveInteractionProfile for any controller: only then send it a
++    /// profile it may have no button mapping for (an older server would drop every button), or 0
++    pub fn server_supports_controller_profiles(&self) -> bool {
++        self.connection_context.server_controller_profiles.value()
++    }
++
+     pub fn send_active_interaction_profile(&self, device_id: u64, profile_id: u64) {
+         dbg_client_core!("send_active_interaction_profile");
+ 
+diff --git a/alvr/packets/src/lib.rs b/alvr/packets/src/lib.rs
+index 995888ea..629a0fea 100644
+--- a/alvr/packets/src/lib.rs
++++ b/alvr/packets/src/lib.rs
+@@ -46,6 +46,9 @@ pub struct VideoStreamingCapabilities {
+     pub prefer_full_range: bool,
+     pub preferred_encoding_gamma: f32,
+     pub prefer_hdr: bool,
++    // The client tells the server, with ActiveInteractionProfile, what each hand holds as it changes,
++    // including controllers the server has no button mapping for and 0 for none (hands only)
++    pub controller_profiles: bool,
+ }
+ 
+ // Nasty workaround to make the packet extensible, pushing the limits of protocol compatibility
+@@ -107,6 +110,7 @@ pub fn decode_video_streaming_capabilities(
+             .as_f64()
+             .unwrap_or(1.0) as f32,
+         prefer_hdr: caps_json["prefer_hdr"].as_bool().unwrap_or(false),
++        controller_profiles: caps_json["controller_profiles"].as_bool().unwrap_or(false),
+     })
+ }
+ 
+@@ -135,6 +139,9 @@ pub struct NegotiatedStreamingConfig {
+     pub encoding_gamma: f32,
+     pub enable_hdr: bool,
+     pub wired: bool,
++    // Both sides handle ActiveInteractionProfile for any controller (see VideoStreamingCapabilities):
++    // the server keeps its button mapping for a profile it has none for, and passes each one on
++    pub controller_profiles: bool,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -181,6 +188,8 @@ pub fn decode_stream_config(packet: &StreamConfigPacket) -> Result<StreamConfig>
+     let encoding_gamma = json::from_value(negotiated_json["encoding_gamma"].clone()).unwrap_or(1.0);
+     let enable_hdr = json::from_value(negotiated_json["enable_hdr"].clone()).unwrap_or(false);
+     let wired = json::from_value(negotiated_json["wired"].clone()).unwrap_or(false);
++    let controller_profiles =
++        json::from_value(negotiated_json["controller_profiles"].clone()).unwrap_or(false);
+ 
+     Ok(StreamConfig {
+         server_version: session_config.server_version,
+@@ -195,6 +204,7 @@ pub fn decode_stream_config(packet: &StreamConfigPacket) -> Result<StreamConfig>
+             encoding_gamma,
+             enable_hdr,
+             wired,
++            controller_profiles,
+         },
+     })
+ }
+diff --git a/alvr/server_core/src/c_api.rs b/alvr/server_core/src/c_api.rs
+index e8cb9ab1..550eeddd 100644
+--- a/alvr/server_core/src/c_api.rs
++++ b/alvr/server_core/src/c_api.rs
+@@ -125,6 +125,12 @@ pub enum AlvrEvent {
+     CaptureFrame,
+     RestartPending,
+     ShutdownPending,
++    // What a hand holds (an OpenXR interaction profile path hash, 0 for none), from a client that
++    // says so as it changes
++    InteractionProfile {
++        device_id: u64,
++        profile_id: u64,
++    },
+ }
+ 
+ #[repr(C)]
+@@ -350,6 +356,15 @@ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns:
+                 ServerCoreEvent::ShutdownPending => {
+                     *out_event = AlvrEvent::ShutdownPending;
+                 }
++                ServerCoreEvent::InteractionProfile {
++                    device_id,
++                    profile_id,
++                } => {
++                    *out_event = AlvrEvent::InteractionProfile {
++                        device_id,
++                        profile_id,
++                    };
++                }
+                 ServerCoreEvent::GameRenderLatencyFeedback(_)
+                 | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
+             }
+diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
+index 3144dfef..079be014 100644
+--- a/alvr/server_core/src/connection.rs
++++ b/alvr/server_core/src/connection.rs
+@@ -782,6 +782,7 @@ fn connection_pipeline(
+             encoding_gamma,
+             enable_hdr,
+             wired,
++            controller_profiles: true,
+         },
+     )
+     .to_con()?;
+@@ -1147,6 +1148,7 @@ fn connection_pipeline(
+         });
+         let controllers_emulation_mode =
+             controllers_config.map(|config| config.emulation_mode.clone());
++        let client_controller_profiles = streaming_caps.controller_profiles;
+ 
+         let disconnect_notif = Arc::clone(&disconnect_notif);
+         let control_sender = Arc::clone(&control_sender);
+@@ -1278,27 +1280,46 @@ fn connection_pipeline(
+                             }
+                         };
+                     }
+-                    ClientControlPacket::ActiveInteractionProfile { profile_id, .. } => {
+-                        controller_button_mapping_manager = if let Switch::Enabled(config) =
+-                            &SESSION_MANAGER.read().settings().headset.controllers
++                    ClientControlPacket::ActiveInteractionProfile {
++                        device_id,
++                        profile_id,
++                    } => {
++                        // A client with controller_profiles says what each hand holds as it changes,
++                        // including controllers there's no button mapping for (it maps their buttons
++                        // itself) and 0 for none: those keep the mapping in use, and each is passed on
++                        if client_controller_profiles {
++                            ctx.events_sender
++                                .send(ServerCoreEvent::InteractionProfile {
++                                    device_id,
++                                    profile_id,
++                                })
++                                .ok();
++                        }
++
++                        if !client_controller_profiles
++                            || CONTROLLER_PROFILE_INFO.contains_key(&profile_id)
+                         {
+-                            if let Some(mappings) = &config.button_mappings {
+-                                Some(ButtonMappingManager::new_manual(mappings))
+-                            } else if let (Some(profile_info), Some(emulation_mode)) = (
+-                                CONTROLLER_PROFILE_INFO.get(&profile_id),
+-                                &controllers_emulation_mode,
+-                            ) {
+-                                Some(ButtonMappingManager::new_automatic(
+-                                    &profile_info.button_set,
+-                                    emulation_mode,
+-                                    &config.button_mapping_config,
+-                                ))
++                            controller_button_mapping_manager = if let Switch::Enabled(config) =
++                                &SESSION_MANAGER.read().settings().headset.controllers
++                            {
++                                if let Some(mappings) = &config.button_mappings {
++                                    Some(ButtonMappingManager::new_manual(mappings))
++                                } else if let (Some(profile_info), Some(emulation_mode)) = (
++                                    CONTROLLER_PROFILE_INFO.get(&profile_id),
++                                    &controllers_emulation_mode,
++                                ) {
++                                    Some(ButtonMappingManager::new_automatic(
++                                        &profile_info.button_set,
++                                        emulation_mode,
++                                        &config.button_mapping_config,
++                                    ))
++                                } else {
++                                    None
++                                }
+                             } else {
+                                 None
+-                            }
+-                        } else {
+-                            None
+-                        };
++                            };
++                        }
+                     }
+                     ClientControlPacket::Log { level, message } => {
+                         info!("Client {client_hostname}: [{level:?}] {message}")
+diff --git a/alvr/server_core/src/lib.rs b/alvr/server_core/src/lib.rs
+index a1023203..e5a4ebca 100644
+--- a/alvr/server_core/src/lib.rs
++++ b/alvr/server_core/src/lib.rs
+@@ -92,6 +92,12 @@ pub enum ServerCoreEvent {
+         sample_timestamp: Duration,
+     },
+     Buttons(Vec<ButtonEntry>), // Note: this is after mapping
++    // What a hand holds, from a client with controller_profiles: an OpenXR interaction profile path
++    // hash, or 0 for none (hands only)
++    InteractionProfile {
++        device_id: u64,
++        profile_id: u64,
++    },
+     RequestIDR,
+     CaptureFrame,
+     GameRenderLatencyFeedback(Duration), // only used for SteamVR
+diff --git a/alvr/server_openvr/src/lib.rs b/alvr/server_openvr/src/lib.rs
+index 8d66d792..d262e2f0 100644
+--- a/alvr/server_openvr/src/lib.rs
++++ b/alvr/server_openvr/src/lib.rs
+@@ -261,6 +261,7 @@ fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
+ 
+                     unsafe { ShutdownSteamvr() };
+                 }
++                ServerCoreEvent::InteractionProfile { .. } => (),
+             }
+         }
+ 
