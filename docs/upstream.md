@@ -154,8 +154,10 @@ Patches against ALVR 20.14.1's server core, which this repository's runtime link
 
 ## Preview release
 
-In preparation. It will put all of the above together: the runtime and home scene, OpenComposite
-from `local-render-models` (including HudsonMCox's two fixes, credited, and his to submit),
-MoltenVK with the SPIRV-Cross fix, DXMT from `thread-stack`, wineopenxr from NotProton's
-`vr-runtimes`, and RiftLift's OpenXR bridge from `vtable-hooks` (with RiftLift 0.11.1.2's own launcher). Each will come with its licence, and its
-source is at the branch above.
+[MacVapoR 0.2.0 preview](https://github.com/fayep/MacVapoR/releases/tag/v0.2.0-preview) puts all of
+the above together: the app (the runtime and home scene, wineopenxr from NotProton's
+`vr-runtimes`), and a components archive with OpenComposite from `local-render-models` (including
+HudsonMCox's two fixes, credited, and his to submit), MoltenVK with the SPIRV-Cross fix, DXMT from
+`thread-stack`, and RiftLift's OpenXR bridge from `vtable-hooks` (with RiftLift 0.11.1.2's own
+launcher). Each comes with its licence, and its source is at the branch above; the archive's README
+says where each goes. Built from `compositor` at 670348b.
