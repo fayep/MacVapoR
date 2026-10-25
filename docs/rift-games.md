@@ -10,7 +10,9 @@ Under the hood, the game talks to the Rift's runtime (LibOVR) as it would on a P
 Revive, turns that into OpenXR, and alvrxr takes it from there, as for any other game. Each game
 is added to Steam as a non-Steam game and runs through NotProton like the rest.
 
-Some of this only works on the developer's Mac so far: see [What's left](#whats-left) at the end.
+Two of the pieces aren't in MacVapoR's app yet: our builds of RiftLift's bridge and of DXMT, in the
+[0.2.0 preview](https://github.com/fayep/MacVapoR/releases)'s components archive (step 4 below). The
+rest of what's still rough is in [What's left](#whats-left) at the end.
 
 ## Tested games
 
@@ -34,6 +36,8 @@ to work. Games that need Meta's online services for multiplayer won't (see [Offl
 - Room for the games: they're as big as on the PC (Asgard's Wrath is 133 GB). An external drive is
   fine.
 - For now, a checkout of the MacVapoR source, for `tools/rift-add.sh`.
+- The 0.2.0 preview's components archive (`MacVapoR-0.2.0-components.zip`), for its `riftlift`
+  and `dxmt` folders.
 
 ## 1. Copy from the PC
 
@@ -121,7 +125,22 @@ It:
 Running it again for the same game updates the same Steam entry. With more than one Meta account
 in AVP-Play (`avpplay login --account NAME`), choose one with `--account NAME`.
 
-## 4. Play
+## 4. Use our bridge, and our DXMT
+
+`rift-add.sh` installs RiftLift 0.11.1.2. Its bridge patches D3D11's code with Detours, which breaks
+DXMT's ARM64EC code, so the game can't start. Ours hooks D3D11's vtables instead. In the game's
+prefix (`rift-add.sh` prints its path), with Steam's copy of the game not running:
+
+1. Replace `drive_c/Program Files/RiftLift/RiftLiftOpenXR64.dll` with the one from the archive's
+   `riftlift` folder. RiftLift's own launcher stays as it is.
+2. For Lone Echo, which needs `SwapDeviceContextState` that CrossOver's DXMT doesn't have: back up
+   `d3d11.dll`, `dxgi.dll` and `d3d10core.dll` in the prefix's `drive_c/windows/system32`, and copy in
+   the three from the archive's `dxmt` folder. The archive's README has the rest (the DllOverrides
+   and launch option). Asgard's Wrath and Robo Recall were set up without it.
+
+Running `rift-add.sh` again for the game puts RiftLift's own bridge back, so do this again after it.
+
+## 5. Play
 
 Open Steam: the game is in your library. Wake the controllers, open ALVR on the Vision Pro, and
 launch the game from Steam.
@@ -162,12 +181,15 @@ folder in the Rift folder. The game's saves are in the prefix, so they go with i
 What stands between this guide and someone else following it on their own Mac:
 
 1. **RiftLift's bridge with vtable hooks.** RiftLift's released bridge patches D3D11's code with
-   Detours, which corrupts DXMT's ARM64EC code; ours hooks the vtables instead. It's on a local
-   branch only. To do: ship the built bridge with MacVapoR (RiftLift is MIT), and offer the
-   change to RiftLift.
-2. **DXMT with `SwapDeviceContextState`.** Lone Echo needs it, and CrossOver's DXMT lacks it. It's
-   a local ARM64EC build. To do: find which games need it, ship it with MacVapoR for those (DXMT
-   is zlib licensed), and offer the change to DXMT.
+   Detours, which corrupts DXMT's ARM64EC code; ours hooks the vtables instead. It's on
+   [fayep/RiftLift `vtable-hooks`](https://github.com/fayep/RiftLift/tree/vtable-hooks) and in the
+   0.2.0 preview's components archive, installed by hand (step 4). To do: install it with MacVapoR
+   (RiftLift is MIT), and offer the change to RiftLift.
+2. **DXMT with `SwapDeviceContextState`.** Lone Echo needs it, and CrossOver's DXMT lacks it. It's on
+   [fayep/dxmt `thread-stack`](https://github.com/fayep/dxmt/tree/thread-stack) and in the components
+   archive, installed by hand (step 4). To do: find which other games need it, install it with
+   MacVapoR for those (DXMT is LGPL), and report it to DXMT, which takes issues rather than
+   AI-assisted pull requests.
 3. **The tools are in a source checkout, with this Mac's folders as their defaults.** To do: MacVapoR
    installs `rift-add.sh`, `rift-setup.sh`, their helpers and the builds above beside the
    runtime, and they default to those; the Rift folder has no default.

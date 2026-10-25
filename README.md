@@ -18,8 +18,9 @@ Game audio streams to the headset with the video. OpenXR games (Beat Saber) run 
 - An Apple Vision Pro with ALVR from the App Store, on the same network as the Mac, and
   PS VR2 Sense controllers paired to the Vision Pro.
 
-Tested: Beat Saber and The Lab, both with D3D11. Other D3D11 games are likely to work;
-Vulkan and D3D12 games are not supported yet.
+Tested: Beat Saber and The Lab (D3D11) with the app alone. With the 0.2.0 preview's components
+(below) also No Man's Sky (Vulkan), Elite Dangerous: Odyssey and Meta Rift games. Other D3D11
+games are likely to work; D3D12 games are not supported yet.
 
 ## Install
 
@@ -32,6 +33,12 @@ once, so its CrossOver runner is in place. MacVapoR builds on NotProton and does
    `~/Library/Application Support/MacVapoR`.
 3. macOS asks whether **MacVapoR Audio** may record audio: allow it. It sends each game's sound to
    the headset, and keeps the game quiet on the Mac. MacVapoR shows whether it is allowed.
+
+The [0.2.0 preview](https://github.com/fayep/MacVapoR/releases) also has a components archive: our
+builds of OpenComposite, MoltenVK, DXMT, RiftLift's bridge and a Vulkan wrapper, which some games
+need. The app doesn't install them yet; the archive's README says where each goes and which games
+it's for. What we changed in each project, and where that change stands upstream, is in
+[docs/upstream.md](docs/upstream.md).
 
 ## Set a game up
 
@@ -81,7 +88,13 @@ see [home/SCENES.md](home/SCENES.md).
 - If visionOS takes focus away (Siri, a screenshot, the Mac's screen), the controllers'
   buttons stop working until ALVR is reopened. A fix for the ALVR app is waiting upstream.
 - The controllers must be awake when ALVR connects, or their buttons may not come through.
-- Loading screens hold the last frame; there is no compositor scene in between.
+- Loading screens hold the game's last frame, unless the compositor is on: with `"compositor": true`
+  in `~/Library/Application Support/alvrxr/tune.json`, the home scene stays up while a game loads and
+  cross-fades into it. The compositor is new in 0.2.0 and off by default.
+- With the compositor on, the home scene has twice stopped following head movement, looking like a
+  flat screen fixed in the room, both times after the headset had disconnected and reconnected. The
+  cause isn't known yet. `launchctl kickstart -k gui/$(id -u)/com.zippysoft.macvapor.home`, then
+  reconnecting ALVR, fixes it.
 - The Lab's Secret Shop runs at about 1 fps, because of a bug in CrossOver's MSync that NotProton's
   runner still has: some waits leave entries behind in the wineserver until its pool runs out, and
   from then on it stalls the game. Highball has a fix (its patch 0014); until the runner has it,
@@ -127,9 +140,7 @@ file, for a look with a desktop decoder.
 - `hello_xr -g Vulkan` behind the Homebrew loader needs `VK_DRIVER_FILES` pointing at a copy of
   MoltenVK's manifest without `is_portability_driver`, since that app does not ask for
   portability drivers. (`-g Vulkan2` is fine: the runtime creates the instance and asks.)
-- The aim pose is the grip pose; the offset is not measured yet.
-- Quad and other non-projection layers are ignored; depth is accepted and ignored.
-- Velocities are not reported.
+- Depth layers are accepted and ignored; layers other than projection and quad are ignored.
 
 ## Releases
 
