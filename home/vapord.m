@@ -404,6 +404,9 @@ typedef struct {
     simd_float4x4 frame;       // joystick: its centre, turned as it sits
     float tilt;                // joystick: degrees at full deflection
     simd_float3 press;         // joystick: travel when clicked
+    id<MTLTexture> tex;        // its own colour, or nil for the controller's texture
+    bool flip_x;               // joystick: tilts the other way for x (the Joy-Con's frame faces the other way)
+    simd_float3 top;           // the middle of its top, where a thumb presses it (Joy-Cons)
 } part;
 
 typedef struct {
@@ -514,7 +517,7 @@ static simd_float4x4 part_pose(const part *p, const hand_input *in, const scene 
     case MOVE_JOYSTICK: {
         // The stick stands along its own z axis: forward tilts it about x, sideways about y.
         simd_float4x4 tilt = simd_mul(rotation(simd_make_float3(1, 0, 0), -in->stick[1] * p->tilt),
-                                      rotation(simd_make_float3(0, 1, 0), -in->stick[0] * p->tilt));
+                                      rotation(simd_make_float3(0, 1, 0), (p->flip_x ? 1 : -1) * in->stick[0] * p->tilt));
         simd_float4x4 m = simd_mul(p->frame, simd_mul(tilt, simd_inverse(p->frame)));
         return simd_mul(translation(p->press * (in->stick_click ? 1.0f : 0.0f)), m);
     }
@@ -538,6 +541,152 @@ static simd_float4x4 projection(XrFovf f, float n, float far) {
         {0, 0, -far * n / (far - n), 0},
     }};
     return m;
+}
+
+// The Joy-Con model's frame from the OpenXR grip (the client's, from the hand holding it): turned
+// so its top end is up as held, rolled about its length, and moved along itself. tune.json
+// "joycon_pitch" (degrees about the grip's x), "joycon_roll" (degrees about the model's length,
+// clockwise looking down on its top end), "joycon_drop" (metres towards its bottom end) and
+// "joycon_y" (metres up in the room, + up, returned in *y) and "joycon_yaw" (degrees about the
+// room's vertical through the hand, + anticlockwise seen from the top, returned in *yaw), re-read
+// once a second.
+static simd_float3 g_nudge[2];   // joycon_left/right_offset, also for the finger-attached placement
+
+// Set for the left hand; the right one's roll and yaw are mirrored, plus "joycon_yaw_right"
+// (degrees, + anticlockwise from the top): the thumb rests on the stick, which is above the buttons
+// on the left Joy-Con and below them on the right, so the right one sits a little differently.
+static simd_float4x4 joycon_from_grip(bool left, float *y, float *yaw) {
+    static float pitch = -70, roll = 10, drop = 0, up = -0.06f, turn = 0, turn_right = 5;
+    // "joycon_left_offset" / "joycon_right_offset": [x, y, z] metres, as you see the Joy-Con held up
+    // in front of you: + right, + up (towards its top end), + into the screen (behind its face).
+    static simd_float3 nudge[2];
+    g_nudge[0] = nudge[0];
+    g_nudge[1] = nudge[1];
+    static double checked;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - checked >= 1) {
+        checked = now;
+        NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
+        NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if (![t isKindOfClass:NSDictionary.class]) t = nil;
+        float p = [t[@"joycon_pitch"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_pitch"] floatValue] : -70;
+        float r = [t[@"joycon_roll"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_roll"] floatValue] : 10;
+        float m = [t[@"joycon_drop"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_drop"] floatValue] : 0;
+        float u = [t[@"joycon_y"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_y"] floatValue] : -0.06f;
+        float w = [t[@"joycon_yaw"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_yaw"] floatValue] : 0;
+        float wr = [t[@"joycon_yaw_right"] respondsToSelector:@selector(floatValue)] ? [t[@"joycon_yaw_right"] floatValue] : 5;
+        if (wr != turn_right) NSLog(@"vapord: right Joy-Con yawed %+.0f more", wr);
+        turn_right = wr;
+        for (int i = 0; i < 2; i++) {
+            NSArray *o = t[i ? @"joycon_right_offset" : @"joycon_left_offset"];
+            simd_float3 v = 0;
+            if ([o isKindOfClass:NSArray.class] && o.count == 3)
+                for (int k = 0; k < 3; k++) v[k] = [o[k] respondsToSelector:@selector(floatValue)] ? [o[k] floatValue] : 0;
+            if (simd_any(v != nudge[i])) NSLog(@"vapord: %@ Joy-Con moved (%+.3f, %+.3f, %+.3f) m", i ? @"right" : @"left", v.x, v.y, v.z);
+            nudge[i] = v;
+        }
+        if (p != pitch || r != roll || m != drop || u != up || w != turn)
+            NSLog(@"vapord: Joy-Con models pitched %.0f degrees, rolled %.0f, yawed %.0f, %.3f m along, y %+.3f m", p, r, w, m, u);
+        pitch = p;
+        roll = r;
+        drop = m;
+        up = u;
+        turn = w;
+    }
+    *y = up;
+    float mirror = left ? 1 : -1;
+    *yaw = turn * mirror + (left ? 0 : turn_right);
+    // Looking down on the top end is looking along +Z: clockwise from there is a turn about +Z.
+    // The model's own axes: x across, its top end along -z, its face along +y.
+    simd_float3 n = nudge[left ? 0 : 1];
+    return simd_mul(simd_mul(rotation(simd_make_float3(1, 0, 0), pitch), rotation(simd_make_float3(0, 0, 1), roll * mirror)),
+                    translation(simd_make_float3(n.x, -n.z, drop - n.y)));
+}
+
+// A Joy-Con attached to the hand holding it by the palm: its bottom presses into the palm and the ring
+// and little fingers close it against the rail, so it moves with the palm. The palm's frame from joint
+// positions only, as the hand is drawn (joint orientations reach us through other conversions and needn't
+// agree): the wrist and the index and little knuckles, rigid with the palm and on the back of the hand.
+// Its origin among them; x from the little knuckle to the index one; y out of the palm; z = x * y. The two
+// hands' frames are mirror images, both right-handed, so a pose in the left one's is the right one's with
+// z reflected (and the model, mirrored across its x).
+static bool finger_frame(const XrHandJointLocationEXT *j, bool left, simd_float4x4 *out) {
+    const XrSpaceLocationFlags pos = XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    int need[] = {XR_HAND_JOINT_WRIST_EXT, XR_HAND_JOINT_INDEX_PROXIMAL_EXT, XR_HAND_JOINT_LITTLE_PROXIMAL_EXT};
+    for (int i = 0; i < 3; i++)
+        if (!(j[need[i]].locationFlags & pos)) return false;
+#define P(n) simd_make_float3(j[n].pose.position.x, j[n].pose.position.y, j[n].pose.position.z)
+    simd_float3 wrist = P(XR_HAND_JOINT_WRIST_EXT), index = P(XR_HAND_JOINT_INDEX_PROXIMAL_EXT), little = P(XR_HAND_JOINT_LITTLE_PROXIMAL_EXT);
+#undef P
+    if (simd_distance(index, little) < 0.02f) return false;
+    simd_float3 x = simd_normalize(index - little);
+    // index x little, from the wrist: out of the palm for a right hand, into it for a left.
+    simd_float3 y = simd_cross(index - wrist, little - wrist) * (left ? -1 : 1);
+    y = y - simd_dot(y, x) * x;
+    if (simd_length(y) < 1e-6f) return false;
+    y = simd_normalize(y);
+    simd_float3 z = simd_cross(x, y);
+    *out = (simd_float4x4){{simd_make_float4(x, 0), simd_make_float4(y, 0), simd_make_float4(z, 0),
+                            simd_make_float4((wrist + index + little) / 3, 1)}};
+    return true;
+}
+
+// tune.json "joycon_attach" and "joycon_attach_right": [x, y, z, qx, qy, qz, qw], each Joy-Con's pose in
+// its hand's palm frame. The grips aren't mirror images (the stick and buttons sit differently), so each
+// hand has its own; without the right one's, it's the left one's mirrored. "joycon_capture": true has
+// vapord set the left one from where the left Joy-Con is drawn now (placed the old way, from the grip and
+// the joycon_* turns), the right one to its mirror, and drop the flag. Re-read once a second.
+static simd_float4x4 g_attach[2];
+static bool g_have_attach, g_capture, g_record;
+
+static simd_float4x4 mirror_attach(simd_float4x4 a) {
+    return simd_mul(simd_mul(simd_diagonal_matrix(simd_make_float4(1, 1, -1, 1)), a), simd_diagonal_matrix(simd_make_float4(-1, 1, 1, 1)));
+}
+
+static bool attach_from(id o, simd_float4x4 *out) {
+    if (![o isKindOfClass:NSArray.class] || [o count] != 7) return false;
+    float v[7];
+    for (int i = 0; i < 7; i++) v[i] = [o[i] respondsToSelector:@selector(floatValue)] ? [o[i] floatValue] : 0;
+    *out = simd_matrix4x4(simd_normalize(simd_quaternion(v[3], v[4], v[5], v[6])));
+    out->columns[3] = simd_make_float4(v[0], v[1], v[2], 1);
+    return true;
+}
+
+static void read_attach(void) {
+    static double checked;
+    double now = CFAbsoluteTimeGetCurrent();
+    if (now - checked < 1) return;
+    checked = now;
+    NSData *d = [NSData dataWithContentsOfFile:[g_config_dir stringByAppendingPathComponent:@"tune.json"]];
+    NSDictionary *t = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+    if (![t isKindOfClass:NSDictionary.class]) t = nil;
+    g_capture = [t[@"joycon_capture"] respondsToSelector:@selector(boolValue)] && [t[@"joycon_capture"] boolValue];
+    g_record = [t[@"joycon_record"] respondsToSelector:@selector(boolValue)] && [t[@"joycon_record"] boolValue];
+    g_have_attach = attach_from(t[@"joycon_attach"], &g_attach[0]);
+    if (g_have_attach && !attach_from(t[@"joycon_attach_right"], &g_attach[1])) g_attach[1] = mirror_attach(g_attach[0]);
+}
+
+// Saves a hand's attachment; capturing the left one (capture) resets the right one to its mirror.
+static void save_attach(int hand, simd_float4x4 a, bool capture) {
+    NSString *path = [g_config_dir stringByAppendingPathComponent:@"tune.json"];
+    NSData *d = [NSData dataWithContentsOfFile:path];
+    NSMutableDictionary *t = [(d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil) mutableCopy];
+    if (![t isKindOfClass:NSMutableDictionary.class]) t = [NSMutableDictionary dictionary];
+    simd_quatf q = simd_quaternion((simd_float3x3){{simd_make_float3(a.columns[0]), simd_make_float3(a.columns[1]),
+                                                    simd_make_float3(a.columns[2])}});
+    t[hand ? @"joycon_attach_right" : @"joycon_attach"] = @[@(a.columns[3].x), @(a.columns[3].y), @(a.columns[3].z), @(q.vector.x),
+                                                           @(q.vector.y), @(q.vector.z), @(q.vector.w)];
+    g_attach[hand] = a;
+    if (capture) {
+        [t removeObjectForKey:@"joycon_attach_right"];
+        [t removeObjectForKey:@"joycon_capture"];
+        g_attach[1] = mirror_attach(a);
+        g_have_attach = true;
+        g_capture = false;
+    }
+    [[NSJSONSerialization dataWithJSONObject:t options:0 error:nil] writeToFile:path atomically:YES];
+    NSLog(@"vapord: %@ Joy-Con attached to the palm at (%.3f, %.3f, %.3f) m", hand ? @"right" : @"left", a.columns[3].x, a.columns[3].y,
+          a.columns[3].z);
 }
 
 // The model's frame from the OpenXR grip: Sony's openxr_grip component, undone.
@@ -592,12 +741,12 @@ static void hand_lines(const XrHandJointLocationEXT *j, const scene *sc, segment
 
 // ---------------------------------------------------------------------------- the ball and table
 //
-// A beach ball on a pedestal beside you. Grab it by reaching in with a controller and squeezing the
+// A beach ball on a pedestal in front of you. Grab it by reaching in with a controller and squeezing the
 // trigger or grip, or bare-handed by pinching it; let go and it flies with your hand's velocity
 // and spin, bounces on the grid and the table, and rolls to a stop. Out of reach, it comes back.
 
 static const float kBallRadius = 0.11f;
-static const simd_float3 kTableCentre = {0.5f, 0.0f, -0.42f};   // on the floor, ahead and to the right
+static const simd_float3 kTableCentre = {0.0f, 0.0f, -0.55f};   // on the floor, straight ahead
 static const float kTableTop = 0.76f, kTableHalf = 0.22f, kTableThick = 0.035f, kColumnHalf = 0.045f;
 
 static mesh mesh_from(NSData *verts, NSData *idx, id<MTLDevice> dev) {
@@ -629,7 +778,7 @@ static mesh sphere_mesh(id<MTLDevice> dev) {
 }
 
 // A box of the given half sizes, centred; each face shows the whole texture.
-static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) {
+static mesh box_mesh_at(simd_float3 half, simd_float3 centre, id<MTLDevice> dev) {
     NSMutableData *verts = [NSMutableData data], *idx = [NSMutableData data];
     for (int axis = 0; axis < 3; axis++)
         for (int sign = -1; sign <= 1; sign += 2) {
@@ -640,7 +789,7 @@ static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) {
             uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
             for (int k = 0; k < 4; k++) {
                 float a = (k & 1) ? 1 : -1, b = (k & 2) ? 1 : -1;
-                simd_float3 p = (n + u * a + w * b) * half;
+                simd_float3 p = (n + u * a + w * b) * half + centre;
                 mesh_vertex m = {{p.x, p.y, p.z}, {n.x, n.y, n.z}, {(a + 1) / 2, (b + 1) / 2}};
                 [verts appendBytes:&m length:sizeof m];
             }
@@ -648,6 +797,150 @@ static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) {
             [idx appendBytes:tri length:sizeof tri];
         }
     return mesh_from(verts, idx, dev);
+}
+
+static mesh box_mesh(simd_float3 half, id<MTLDevice> dev) { return box_mesh_at(half, 0, dev); }
+
+// A Joy-Con's body, as its face's outline shows: straight along the rail (+X, or -X with rail < 0)
+// and across the top (z0) and bottom (z1) ends, with the two corners away from the rail rounded with
+// radius r, a D; flat face (+Y) and back, hy either side of the middle.
+static mesh joycon_body_mesh(float hx, float hy, float z0, float z1, float rail, float r, id<MTLDevice> dev) {
+    NSMutableData *verts = [NSMutableData data], *idx = [NSMutableData data];
+    enum { ARC = 16 };
+    simd_float2 pt[2 * ARC + 6];   // (x, z), the rail at +X; walked so the outward side is on the right
+    int n = 0;
+    pt[n++] = simd_make_float2(hx, z1);
+    pt[n++] = simd_make_float2(hx, z0);
+    for (int i = 0; i <= ARC; i++) {   // the top corner away from the rail
+        float a = -(float)M_PI / 2 - (float)M_PI / 2 * i / ARC;
+        pt[n++] = simd_make_float2(-hx + r + r * cosf(a), z0 + r + r * sinf(a));
+    }
+    for (int i = 0; i <= ARC; i++) {   // the bottom one
+        float a = (float)M_PI + (float)M_PI / 2 * i / ARC;
+        pt[n++] = simd_make_float2(-hx + r + r * cosf(a), z1 - r - r * sinf(a));
+    }
+    if (rail < 0)
+        for (int i = 0; i < n; i++) pt[i].x = -pt[i].x;
+    simd_float2 centre = 0;
+    for (int i = 0; i < n; i++) centre += pt[i] / n;
+    for (int i = 0; i < n; i++) {   // the edge all round: flat-shaded quads, facing away from the middle
+        simd_float2 p0 = pt[i], p1 = pt[(i + 1) % n];
+        if (simd_distance(p0, p1) < 1e-6f) continue;
+        simd_float2 d = p1 - p0, nm = simd_normalize(simd_make_float2(d.y, -d.x));
+        if (simd_dot(nm, (p0 + p1) / 2 - centre) < 0) nm = -nm;
+        uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
+        mesh_vertex q[4] = {{{p0.x, -hy, p0.y}, {nm.x, 0, nm.y}, {0, 0}}, {{p1.x, -hy, p1.y}, {nm.x, 0, nm.y}, {1, 0}},
+                            {{p0.x, hy, p0.y}, {nm.x, 0, nm.y}, {0, 1}}, {{p1.x, hy, p1.y}, {nm.x, 0, nm.y}, {1, 1}}};
+        [verts appendBytes:q length:sizeof q];
+        uint32_t tri[6] = {base, base + 1, base + 2, base + 1, base + 3, base + 2};
+        [idx appendBytes:tri length:sizeof tri];
+    }
+    for (int side = -1; side <= 1; side += 2) {   // the face and the back: fans round the middle
+        uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
+        mesh_vertex c = {{centre.x, side * hy, centre.y}, {0, (float)side, 0}, {0.5f, 0.5f}};
+        [verts appendBytes:&c length:sizeof c];
+        for (int i = 0; i < n; i++) {
+            mesh_vertex v = {{pt[i].x, side * hy, pt[i].y}, {0, (float)side, 0}, {0.5f, 0.5f}};
+            [verts appendBytes:&v length:sizeof v];
+            uint32_t t[3] = {base, base + 1 + i, base + 1 + (i + 1) % n};
+            [idx appendBytes:t length:sizeof t];
+        }
+    }
+    return mesh_from(verts, idx, dev);
+}
+
+// A round button or stick: a cylinder standing along Y, with flat ends.
+static mesh cylinder_mesh_at(float radius, float half_height, simd_float3 centre, id<MTLDevice> dev) {
+    NSMutableData *verts = [NSMutableData data], *idx = [NSMutableData data];
+    const int segs = 24;
+    for (int end = -1; end <= 1; end += 2) {   // the ends: a fan round a centre vertex
+        uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
+        mesh_vertex c = {{centre.x, centre.y + end * half_height, centre.z}, {0, (float)end, 0}, {0.5f, 0.5f}};
+        [verts appendBytes:&c length:sizeof c];
+        for (int i = 0; i < segs; i++) {
+            float a = 2 * (float)M_PI * i / segs;
+            mesh_vertex v = {{centre.x + radius * cosf(a), centre.y + end * half_height, centre.z + radius * sinf(a)},
+                             {0, (float)end, 0}, {0.5f + 0.5f * cosf(a), 0.5f + 0.5f * sinf(a)}};
+            [verts appendBytes:&v length:sizeof v];
+            uint32_t a1 = base + 1 + i, a2 = base + 1 + (i + 1) % segs;
+            uint32_t tri[3] = {base, end > 0 ? a2 : a1, end > 0 ? a1 : a2};
+            [idx appendBytes:tri length:sizeof tri];
+        }
+    }
+    uint32_t base = (uint32_t)(verts.length / sizeof(mesh_vertex));
+    for (int i = 0; i <= segs; i++) {   // the side
+        float a = 2 * (float)M_PI * i / segs;
+        for (int end = -1; end <= 1; end += 2) {
+            mesh_vertex v = {{centre.x + radius * cosf(a), centre.y + end * half_height, centre.z + radius * sinf(a)},
+                             {cosf(a), 0, sinf(a)}, {(float)i / segs, (end + 1) / 2.0f}};
+            [verts appendBytes:&v length:sizeof v];
+        }
+        if (i < segs) {
+            uint32_t b = base + 2 * i;
+            uint32_t tri[6] = {b, b + 1, b + 2, b + 1, b + 3, b + 2};
+            [idx appendBytes:tri length:sizeof tri];
+        }
+    }
+    return mesh_from(verts, idx, dev);
+}
+
+// A Joy-Con held upright, as the client maps a joined pair (see the ALVR client's WorldTracker):
+// L/R the trigger, ZL/ZR the grip, Minus the left menu button, Plus the right one. Our own boxes,
+// in the OpenXR grip's frame: the top end (stick end) along -Z, the face up (+Y), the rail
+// towards the other hand. Not Nintendo's model.
+static void joycon_controller(bool left, id<MTLDevice> dev, id<MTLCommandQueue> q, controller *c) {
+    const float hx = 0.0175f, hy = 0.0068f, hz = 0.050f, cz = -0.012f;   // half sizes; the body's centre
+    const float face = hy, top = cz - hz, side = left ? 1 : -1;          // side: towards the rail
+    id<MTLTexture> body = colour_texture(left ? simd_make_float3(0.04f, 0.73f, 0.90f) : simd_make_float3(1.0f, 0.24f, 0.16f), dev, q);
+    id<MTLTexture> dark = colour_texture(simd_make_float3(0.11f, 0.11f, 0.12f), dev, q);
+    id<MTLTexture> rail = colour_texture(simd_make_float3(0.22f, 0.22f, 0.24f), dev, q);
+    c->count = 0;
+    c->texture = dark;
+    // half.x == half.z with round: a cylinder of that radius; else a box.
+    void (^add)(simd_float3, simd_float3, id<MTLTexture>, int, simd_float3, bool) =
+        ^(simd_float3 half, simd_float3 at, id<MTLTexture> tex, int input, simd_float3 travel, bool round) {
+            part p = {.m = round ? cylinder_mesh_at(half.x, half.y, at, dev) : box_mesh_at(half, at, dev), .input = input, .tex = tex,
+                      .top = at + simd_make_float3(0, half.y, 0)};
+            if (simd_length(travel) > 0) {
+                p.move = MOVE_TRANSLATE;
+                p.axis = simd_normalize(travel);
+                p.amount = simd_length(travel);
+            }
+            c->parts[c->count++] = p;
+        };
+    c->parts[c->count++] = (part){.m = joycon_body_mesh(hx, hy, cz - hz, cz + hz, side, 0.020f, dev), .tex = body};
+    add(simd_make_float3(0.0015f, hy * 0.6f, hz * 0.9f), simd_make_float3(side * (hx + 0.0015f), 0, cz), rail, IN_NONE, 0, false);
+    // L/R on the top end, over the face: the trigger. ZL/ZR behind it: the grip.
+    add(simd_make_float3(hx * 0.9f, 0.003f, 0.004f), simd_make_float3(0, face - 0.004f, top - 0.002f), dark, IN_TRIGGER,
+        simd_make_float3(0, 0, 0.002f), false);
+    add(simd_make_float3(hx * 0.85f, 0.006f, 0.006f), simd_make_float3(0, -face - 0.003f, top + 0.010f), dark, IN_SQUEEZE,
+        simd_make_float3(0, 0.003f, 0), false);
+    // The stick: near the top on the left Joy-Con, below the buttons on the right.
+    float stick_z = left ? top + 0.022f : cz + 0.002f, buttons_z = left ? cz + 0.002f : top + 0.022f;
+    part stick = {.m = cylinder_mesh_at(0.0068f, 0.005f, simd_make_float3(0, face + 0.006f, stick_z), dev),
+                  .input = IN_STICK, .move = MOVE_JOYSTICK, .tilt = 16, .press = simd_make_float3(0, -0.002f, 0), .tex = dark,
+                  .flip_x = true, .top = simd_make_float3(0, face + 0.0095f, stick_z)};
+    // The stick stands along its frame's z: here the face's normal, forward towards the top end.
+    stick.frame = simd_mul(translation(simd_make_float3(0, face, stick_z)), rotation(simd_make_float3(1, 0, 0), -90));
+    c->parts[c->count++] = stick;
+    // Four buttons in a diamond (x towards +X, z towards the bottom), each lit by what the client
+    // sends for it: the left's arrows down and left are X, right is Y, up the grip; on the right,
+    // where A is (east) is B and where B is (south) is A (the client swaps them), and Y (west) and X
+    // (north), nearer the thumb, are A and B too.
+    const float d = 0.0085f;
+    simd_float3 button = simd_make_float3(0.0035f, 0.0015f, 0.0035f), press = simd_make_float3(0, -0.0015f, 0);
+    struct { float x, z; int input; } diamond[2][4] = {
+        {{0, -d, IN_SQUEEZE}, {0, d, IN_A}, {-d, 0, IN_A}, {d, 0, IN_B}},     // left: up, down, left, right
+        {{0, -d, IN_B}, {0, d, IN_A}, {-d, 0, IN_A}, {d, 0, IN_B}},          // right: north, south, west, east
+    };
+    for (int i = 0; i < 4; i++) {
+        const typeof(diamond[0][0]) *b = &diamond[left ? 0 : 1][i];
+        add(button, simd_make_float3(b->x, face + 0.0015f, buttons_z + b->z), dark, b->input, press, true);
+    }
+    // Minus or Plus, by the top end towards the rail; Capture or Home below everything.
+    add(simd_make_float3(0.0032f, 0.001f, 0.0012f), simd_make_float3(side * 0.010f, face + 0.001f, top + 0.006f), dark, IN_MENU, press, false);
+    add(simd_make_float3(0.003f, 0.001f, 0.003f), simd_make_float3(side * 0.006f, face + 0.001f, cz + 0.024f), dark, IN_NONE, 0,
+        !left);   // Home is round, Capture square
 }
 
 typedef struct {
@@ -831,6 +1124,26 @@ static camera_gpu draw_world(id<MTLRenderCommandEncoder> enc, const world *w, co
     return camera;
 }
 
+// A controller's parts where they sit for this hand's input, in the mesh pipeline.
+static void draw_controller(id<MTLRenderCommandEncoder> enc, const world *w, const camera_gpu *camera, const controller *c,
+                            simd_float4x4 model, const hand_input *input, const scene *sc) {
+    [enc setRenderPipelineState:w->mesh_pso];
+    [enc setDepthStencilState:w->depth_write];
+    [enc setVertexBytes:camera length:sizeof *camera atIndex:1];
+    [enc setFragmentBytes:&sc->look length:sizeof sc->look atIndex:1];
+    for (int i = 0; i < c->count; i++) {
+        const part *p = &c->parts[i];
+        simd_float4 glow;
+        simd_float4x4 m = simd_mul(model, part_pose(p, input, sc, &glow));
+        [enc setFragmentTexture:p->tex ?: c->texture atIndex:0];
+        [enc setVertexBuffer:p->m.vertices offset:0 atIndex:0];
+        [enc setVertexBytes:&m length:sizeof m atIndex:2];
+        [enc setFragmentBytes:&glow length:sizeof glow atIndex:0];
+        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:p->m.index_count indexType:MTLIndexTypeUInt32
+                       indexBuffer:p->m.indices indexBufferOffset:0];
+    }
+}
+
 // vapord --preview: the scene in a folder as you'd see it standing by the table, into a PNG,
 // without a headset; for making scenes.
 static int preview(NSString *dir, NSString *png, float yaw, float pitch) {
@@ -870,7 +1183,19 @@ static int preview(NSString *dir, NSString *png, float yaw, float pitch) {
     rp.depthAttachment.clearDepth = 1.0;
     id<MTLCommandBuffer> cmd = [q commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
-    draw_world(enc, &w, &sc, pose, fov, 10, &ball);
+    camera_gpu camera = draw_world(enc, &w, &sc, pose, fov, 10, &ball);
+    // VAPORD_PREVIEW_JOYCONS=1: a pair held up in front, faces towards you, the left one's L and
+    // the right one's A lit.
+    if (getenv("VAPORD_PREVIEW_JOYCONS")) {
+        for (int h = 0; h < 2; h++) {
+            controller jc;
+            joycon_controller(h == 0, dev, q, &jc);
+            simd_float4x4 m = simd_mul(translation(simd_make_float3(h ? 0.07f : -0.07f, 1.45f, -0.30f)),
+                                       rotation(simd_make_float3(1, 0, 0), 70));
+            hand_input in = {.trigger = h == 0 ? 1.0f : 0, .a = h == 1, .stick = {h ? 0.0f : 1.0f, 0}};
+            draw_controller(enc, &w, &camera, &jc, m, &in, &sc);
+        }
+    }
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
@@ -1175,6 +1500,10 @@ int main(int argc, char **argv) {
         controller controllers[2];
         bool have_model[2];
         for (int h = 0; h < 2; h++) have_model[h] = load_controller(models_dir, h == 0, dev, queue, &controllers[h]);
+        // Drawn instead while the client says a hand holds a Joy-Con (or VAPORD_JOYCONS=1).
+        controller joycons[2];
+        for (int h = 0; h < 2; h++) joycon_controller(h == 0, dev, queue, &joycons[h]);
+        bool force_joycons = getenv("VAPORD_JOYCONS") != NULL;
         ball_state ball;
         ball_reset(&ball);
         XrTime last_time = 0;
@@ -1184,6 +1513,9 @@ int main(int argc, char **argv) {
         XrTime pinch_time[2][4];
         int pinch_n[2] = {0, 0};
         bool was_gripping[2] = {false, false};
+        bool a_was_down = false;       // A's last state, for capturing the Joy-Con's attachment on a press
+        bool thumb_moved[2] = {false, false};   // a hand's attachment moved to meet its thumb: saved now and then
+        double attach_saved = 0;
         // The dashboard: whether it was open last frame, each hand's trigger as a press (with
         // hysteresis), a bare hand's pointing smoothed, and the seated eye height its Seated
         // button sets (the runtime's while seated, else the last one used).
@@ -1324,6 +1656,7 @@ int main(int argc, char **argv) {
                 XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO, NULL, 1, &active};
                 if (focused) xrSyncActions(session, &sync);
                 bool show_controller[2] = {false, false};
+                const controller *drawn[2] = {&controllers[0], &controllers[1]};
                 simd_float4x4 controller_model[2];
                 hand_input input[2] = {0};
                 for (int h = 0; h < 2 && focused; h++) {
@@ -1368,13 +1701,105 @@ int main(int argc, char **argv) {
                     XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
                     // A pinch the client sends as a controller sits on the gaze ray, at the eyes: not a
                     // controller in the hand, which can't be there.
-                    if (have_model[h] && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
+                    bool joycon = force_joycons || dstate.joycon[h];
+                    if ((have_model[h] || joycon) && XR_SUCCEEDED(xrLocateSpace(grip_space[h], stage, fs.predictedDisplayTime, &sl)) &&
                         (sl.locationFlags & want) == want &&
                         simd_distance(simd_make_float3(sl.pose.position.x, sl.pose.position.y, sl.pose.position.z), head) > 0.25f) {
                         show_controller[h] = true;
+                        drawn[h] = joycon ? &joycons[h] : &controllers[h];
                         float ms = model_scale();
-                        controller_model[h] = simd_mul(simd_mul(pose_matrix(sl.pose), simd_diagonal_matrix(simd_make_float4(ms, ms, ms, 1))),
-                                                       grip_to_model(h == 0));
+                        float y = 0, yaw = 0;
+                        simd_float4x4 from_grip = joycon_from_grip(h == 0, &y, &yaw);
+                        // Turned about the room's vertical through the hand, then raised.
+                        simd_float4x4 held = pose_matrix(sl.pose);
+                        simd_float4 held_at = held.columns[3];
+                        held.columns[3] = simd_make_float4(0, 0, 0, 1);
+                        held = simd_mul(rotation(simd_make_float3(0, 1, 0), yaw), held);
+                        held.columns[3] = held_at + simd_make_float4(0, y, 0, 0);
+                        controller_model[h] = joycon ? simd_mul(held, from_grip)
+                                                     : simd_mul(simd_mul(pose_matrix(sl.pose), simd_diagonal_matrix(simd_make_float4(ms, ms, ms, 1))),
+                                                                grip_to_model(h == 0));
+                        // Attached to the fingers, once captured from the left hand (the right mirrored).
+                        XrHandJointLocationEXT fj[XR_HAND_JOINT_COUNT_EXT];
+                        XrHandJointLocationsEXT fjl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT, NULL, XR_FALSE, XR_HAND_JOINT_COUNT_EXT, fj};
+                        XrHandJointsLocateInfoEXT fli = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, NULL, stage, fs.predictedDisplayTime};
+                        simd_float4x4 fingers;
+                        if (joycon && XR_SUCCEEDED(xrLocateHandJointsEXT(trackers[h], &fli, &fjl)) && fjl.isActive &&
+                            finger_frame(fj, h == 0, &fingers)) {
+                            read_attach();
+                            // Until there's one, pressing A (the right Joy-Con's bottom button) captures too: that's
+                            // "in position".
+                            bool a_pressed = input[1].a && !a_was_down;
+                            if ((g_capture || (a_pressed && !g_have_attach)) && h == 0)
+                                save_attach(0, simd_mul(simd_inverse(fingers), controller_model[h]), true);
+                            if (g_have_attach) {
+                                simd_float4x4 a = g_attach[h];
+                                // The hand's nudge, in its own axes as seen held up in front: + right, + up (its top
+                                // end, the model's -z), + into the screen (behind its face, the model's -y).
+                                simd_float3 n = g_nudge[h];
+                                controller_model[h] = simd_mul(simd_mul(fingers, a), translation(simd_make_float3(n.x, -n.z, -n.y)));
+                                // tune.json "joycon_record": true: every joint, in this Joy-Con model's frame (mm), ten
+                                // times a second into joycon-joints.csv, for checking how the hand fits round it.
+                                static double recorded[2];
+                                if (g_record && CFAbsoluteTimeGetCurrent() - recorded[h] > 0.1) {
+                                    recorded[h] = CFAbsoluteTimeGetCurrent();
+                                    static FILE *csv;
+                                    if (!csv) csv = fopen([g_config_dir stringByAppendingPathComponent:@"joycon-joints.csv"].fileSystemRepresentation, "a");
+                                    simd_float4x4 inv = simd_inverse(controller_model[h]);
+                                    for (int jn = 0; csv && jn < XR_HAND_JOINT_COUNT_EXT; jn++) {
+                                        if (!(fj[jn].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) continue;
+                                        simd_float4 l = simd_mul(inv, simd_make_float4(fj[jn].pose.position.x, fj[jn].pose.position.y,
+                                                                                        fj[jn].pose.position.z, 1));
+                                        fprintf(csv, "%.2f,%d,%d,%.1f,%.1f,%.1f,%d,%d\n", recorded[h], h, jn, l.x * 1000, l.y * 1000, l.z * 1000,
+                                                input[h].a || input[h].b, input[h].trigger > 0.5f);
+                                    }
+                                    if (csv) fflush(csv);
+                                }
+                                // While the thumb presses a button (or pushes the stick), its tip is about 8 mm over that
+                                // part's top: move the attachment a little towards making it so. A and B each come from
+                                // two buttons; the one nearer the thumb is taken.
+                                // While the stick moves the thumb's on it, so a button pressed then wasn't the thumb.
+                                int pressed[4], np = 0;
+                                if (fabsf(input[h].stick[0]) > 0.3f || fabsf(input[h].stick[1]) > 0.3f || input[h].stick_click) {
+                                    pressed[np++] = IN_STICK;
+                                } else {
+                                    if (input[h].a) pressed[np++] = IN_A;
+                                    if (input[h].b) pressed[np++] = IN_B;
+                                    if (input[h].menu) pressed[np++] = IN_MENU;
+                                }
+                                for (int k = 0; k < np; k++) {
+                                    // The left thumb's tip rests on the stick and its knuckle presses the arrows; the right
+                                    // one's tip presses the buttons and its knuckle works the stick.
+                                    bool knuckle = h == 0 ? pressed[k] == IN_A || pressed[k] == IN_B : pressed[k] == IN_STICK;
+                                    // Otherwise the pad a third of the way down the last bone from the tip, not the tip.
+                                    const XrHandJointLocationEXT *tip = &fj[XR_HAND_JOINT_THUMB_TIP_EXT], *ip = &fj[XR_HAND_JOINT_THUMB_DISTAL_EXT];
+                                    if (!(tip->locationFlags & ip->locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) continue;
+                                    simd_float3 t3 = simd_make_float3(tip->pose.position.x, tip->pose.position.y, tip->pose.position.z);
+                                    simd_float3 i3 = simd_make_float3(ip->pose.position.x, ip->pose.position.y, ip->pose.position.z);
+                                    simd_float3 thumb = knuckle ? i3 : t3 + (i3 - t3) / 3;
+                                    {
+                                        float best = 1e9f;
+                                        simd_float3 want = 0;
+                                        for (int i = 0; i < drawn[h]->count; i++) {
+                                            const part *pp = &drawn[h]->parts[i];
+                                            if (pp->input != pressed[k]) continue;
+                                            simd_float3 at = simd_make_float3(simd_mul(controller_model[h],
+                                                                                       simd_make_float4(pp->top + simd_make_float3(0, 0.008f, 0), 1)));
+                                            if (simd_distance(at, thumb) < best) best = simd_distance(at, thumb), want = at;
+                                        }
+                                        if (best > 0.06f) continue;   // too far to be this one: tracking's off
+                                        // Into the palm frame's axes (its columns are orthonormal).
+                                        simd_float3 w = thumb - want;
+                                        simd_float3 d = simd_make_float3(simd_dot(simd_make_float3(fingers.columns[0]), w),
+                                                                         simd_dot(simd_make_float3(fingers.columns[1]), w),
+                                                                         simd_dot(simd_make_float3(fingers.columns[2]), w));
+                                        g_attach[h].columns[3] += simd_make_float4(d * 0.05f, 0);
+                                        thumb_moved[h] = true;
+                                    }
+                                }
+
+                            }
+                        }
                         // The ball: squeeze the trigger or grip with the controller in it, taking it from the other
                         // hand if that has it.
                         simd_float4x4 hand = pose_matrix(sl.pose);
@@ -1416,6 +1841,14 @@ int main(int argc, char **argv) {
                             }
                         }
                         was_gripping[h] = gripping;
+                        // The hand too, round a Joy-Con: its model is placed from the hand, so this shows
+                        // how well it fits.
+                        if (joycon) {
+                            XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
+                            XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT, NULL, XR_FALSE, XR_HAND_JOINT_COUNT_EXT, joints};
+                            XrHandJointsLocateInfoEXT hli = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, NULL, stage, fs.predictedDisplayTime};
+                            if (XR_SUCCEEDED(xrLocateHandJointsEXT(trackers[h], &hli, &jl)) && jl.isActive) hand_lines(joints, &sc, lines, &nlines);
+                        }
                         continue;
                     }
                     was_gripping[h] = false;
@@ -1474,6 +1907,13 @@ int main(int argc, char **argv) {
                         hand_ray[h] = 0;
                         if (ball.held == h) ball.held = -1;   // the hand's gone: drop it
                     }
+                }
+                a_was_down = input[1].a;
+                if ((thumb_moved[0] || thumb_moved[1]) && CFAbsoluteTimeGetCurrent() - attach_saved > 10) {
+                    attach_saved = CFAbsoluteTimeGetCurrent();
+                    for (int k = 0; k < 2; k++)
+                        if (thumb_moved[k]) save_attach(k, g_attach[k], false);
+                    thumb_moved[0] = thumb_moved[1] = false;
                 }
 
                 // The dashboard's pointers hit-tested, and a press acted on.
@@ -1560,22 +2000,8 @@ int main(int argc, char **argv) {
                                                 : draw_world(enc, &w, &sc, views[e].pose, views[e].fov,
                                                              (float)(CFAbsoluteTimeGetCurrent() - start), &ball);
                     for (int h = 0; h < 2; h++) {
-                        if (!show_controller[h] || overlay) continue;
-                        [enc setRenderPipelineState:w.mesh_pso];
-                        [enc setDepthStencilState:w.depth_write];
-                        [enc setVertexBytes:&camera length:sizeof camera atIndex:1];
-                        [enc setFragmentTexture:controllers[h].texture atIndex:0];
-                        [enc setFragmentBytes:&sc.look length:sizeof sc.look atIndex:1];
-                        for (int i = 0; i < controllers[h].count; i++) {
-                            const part *p = &controllers[h].parts[i];
-                            simd_float4 glow;
-                            simd_float4x4 m = simd_mul(controller_model[h], part_pose(p, &input[h], &sc, &glow));
-                            [enc setVertexBuffer:p->m.vertices offset:0 atIndex:0];
-                            [enc setVertexBytes:&m length:sizeof m atIndex:2];
-                            [enc setFragmentBytes:&glow length:sizeof glow atIndex:0];
-                            [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:p->m.index_count
-                                             indexType:MTLIndexTypeUInt32 indexBuffer:p->m.indices indexBufferOffset:0];
-                        }
+                        if (show_controller[h] && !overlay)
+                            draw_controller(enc, &w, &camera, drawn[h], controller_model[h], &input[h], &sc);
                     }
                     // The panel goes in the depth buffer, so a hand behind it is hidden.
                     if (dash_open) dash_draw(enc, (simd_float4x4[2]){camera.view, camera.proj}, w.depth_write);
