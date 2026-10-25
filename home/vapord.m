@@ -637,7 +637,7 @@ static bool finger_frame(const XrHandJointLocationEXT *j, bool left, simd_float4
 // vapord set the left one from where the left Joy-Con is drawn now (placed the old way, from the grip and
 // the joycon_* turns), the right one to its mirror, and drop the flag. Re-read once a second.
 static simd_float4x4 g_attach[2];
-static bool g_have_attach, g_capture, g_record;
+static bool g_have_attach, g_capture, g_record, g_show_hands;
 
 static simd_float4x4 mirror_attach(simd_float4x4 a) {
     return simd_mul(simd_mul(simd_diagonal_matrix(simd_make_float4(1, 1, -1, 1)), a), simd_diagonal_matrix(simd_make_float4(-1, 1, 1, 1)));
@@ -662,6 +662,7 @@ static void read_attach(void) {
     if (![t isKindOfClass:NSDictionary.class]) t = nil;
     g_capture = [t[@"joycon_capture"] respondsToSelector:@selector(boolValue)] && [t[@"joycon_capture"] boolValue];
     g_record = [t[@"joycon_record"] respondsToSelector:@selector(boolValue)] && [t[@"joycon_record"] boolValue];
+    g_show_hands = [t[@"joycon_show_hands"] respondsToSelector:@selector(boolValue)] && [t[@"joycon_show_hands"] boolValue];
     g_have_attach = attach_from(t[@"joycon_attach"], &g_attach[0]);
     if (g_have_attach && !attach_from(t[@"joycon_attach_right"], &g_attach[1])) g_attach[1] = mirror_attach(g_attach[0]);
 }
@@ -1841,9 +1842,10 @@ int main(int argc, char **argv) {
                             }
                         }
                         was_gripping[h] = gripping;
-                        // The hand too, round a Joy-Con: its model is placed from the hand, so this shows
-                        // how well it fits.
-                        if (joycon) {
+                        // The hand too, round a Joy-Con, with tune.json "joycon_show_hands": its model is placed
+                        // from the hand, so this shows how well it fits.
+                        read_attach();
+                        if (joycon && g_show_hands) {
                             XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
                             XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT, NULL, XR_FALSE, XR_HAND_JOINT_COUNT_EXT, joints};
                             XrHandJointsLocateInfoEXT hli = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, NULL, stage, fs.predictedDisplayTime};
