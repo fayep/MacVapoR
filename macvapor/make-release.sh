@@ -30,6 +30,36 @@ MIN_VER=15.0
 dist=$here/dist
 app=$dist/MacVapoR.app
 
+# A signed release names the commits it was built from in build-info.txt, so each source tree
+# must be committed: alvrxr, NotProton's wineopenxr, and ALVR, which build.sh patches, so it must
+# differ from its commit by exactly alvrxr's patches/alvr-*.patch. It must also be built here, not
+# reused with SKIP_BUILD, since nothing records what an earlier build was made from.
+# ALLOW_DIRTY=1 builds anyway, and build-info.txt then says which trees were dirty.
+dirty=
+rev() { # tree [path]: sets r
+    r=$(git -C "$1" rev-parse HEAD)
+    [ -z "$(git -C "$1" status --porcelain -- "${2:-.}")" ] || { r=$r-dirty; dirty="$dirty $1${2:+/$2}"; }
+}
+refuse_dirty() {
+    if [ "$IDENTITY" != "-" ] && [ -n "$dirty" ] && [ -z "${ALLOW_DIRTY:-}" ]; then
+        echo "==> not releasing from uncommitted or unbuilt sources:$dirty (ALLOW_DIRTY=1 overrides)" >&2
+        exit 1
+    fi
+}
+alvr_patched() {
+    files=$(sed -n 's|^+++ b/||p' "$repo"/patches/alvr-*.patch | sort -u)
+    [ "$files" = "$(git -C "$ALVR" status --porcelain | cut -c4- | sort -u)" ] || return 1
+    tmp=$(mktemp -d)
+    for f in $files; do mkdir -p "$tmp/${f%/*}"; git -C "$ALVR" show "HEAD:$f" > "$tmp/$f"; done
+    ( cd "$tmp" && for p in "$repo"/patches/alvr-*.patch; do git apply "$p" || exit 1; done ) || { rm -rf "$tmp"; return 1; }
+    for f in $files; do cmp -s "$tmp/$f" "$ALVR/$f" || { rm -rf "$tmp"; return 1; }; done
+    rm -rf "$tmp"
+}
+rev "$repo"; alvrxr_rev=$r
+rev "$NOTPROTON" wineopenxr; wox_rev=$r
+[ -z "${SKIP_BUILD:-}" ] || dirty="$dirty SKIP_BUILD"
+refuse_dirty
+
 if [ -z "${SKIP_BUILD:-}" ]; then
     MIN_VER=$MIN_VER "$repo/build.sh"
     "$NOTPROTON/wineopenxr/build.sh"
@@ -64,6 +94,17 @@ cp "$repo/LICENSE" "$data/LICENSES/MacVapoR-MIT.txt"
 cp "$ALVR/LICENSE" "$data/LICENSES/ALVR-MIT.txt"
 cp "$OPENXR/LICENSES/Apache-2.0.txt" "$data/LICENSES/OpenXR-loader-Apache-2.0.txt"
 cp "$NOTPROTON/wineopenxr/crossover.patch" "$data/LICENSES/wineopenxr-crossover.patch"
+# Once built, ALVR must carry exactly alvrxr's patches.
+alvr_rev=$(git -C "$ALVR" rev-parse HEAD)
+alvr_patched || { alvr_rev=$alvr_rev-dirty; dirty="$dirty $ALVR"; }
+refuse_dirty
+{
+    echo "MacVapoR $VERSION"
+    echo "alvrxr $alvrxr_rev"
+    echo "NotProton wineopenxr $wox_rev"
+    echo "ALVR $alvr_rev with alvrxr's patches/alvr-*.patch"
+    [ -z "${SKIP_BUILD:-}" ] || echo "binaries reused from an earlier build (SKIP_BUILD), not built from these"
+} | tee "$data/build-info.txt"
 
 for f in "$code"/runtime/* "$code"/wineopenxr/aarch64-unix/* "$app/Contents/MacOS/MacVapoR" "$helper/Contents/MacOS/MacVapoR Audio"; do
     case "$(vtool -show-build "$f" 2>/dev/null | sed -n 's/.*minos //p' | head -1)" in
