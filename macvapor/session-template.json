@@ -325,7 +325,7 @@
         },
         "variant": "Absolute"
       },
-      "preferred_fps": 72.0,
+      "preferred_fps": 120.0,
       "adapter_index": 0,
       "clientside_foveation": {
         "enabled": false,

@@ -170,6 +170,12 @@ final class Model: ObservableObject {
             if !fm.fileExists(atPath: Paths.session.path) {
                 try fm.createDirectory(at: Paths.session.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.copyItem(at: Paths.bundledData.appending(path: "session-template.json"), to: Paths.session)
+            } else if let s = try? String(contentsOf: Paths.session, encoding: .utf8),
+                      s.contains("\"preferred_fps\": 72.0,") {
+                // Sessions from 0.2.0 and earlier asked for ALVR's default 72 fps, which ALVR
+                // rounds to the headset's 90 Hz; 120 gets 120 Hz where the headset has it, else 100.
+                try s.replacingOccurrences(of: "\"preferred_fps\": 72.0,", with: "\"preferred_fps\": 120.0,")
+                    .write(to: Paths.session, atomically: true, encoding: .utf8)
             }
             try writeActiveRuntime()
             try bundleVersion.write(to: Paths.version, atomically: true, encoding: .utf8)
