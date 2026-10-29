@@ -1,0 +1,110 @@
+diff --git a/alvr/server_core/src/statistics.rs b/alvr/server_core/src/statistics.rs
+index b67bfaf..dab596c 100644
+--- a/alvr/server_core/src/statistics.rs
++++ b/alvr/server_core/src/statistics.rs
+@@ -9,6 +9,64 @@ use std::{
+ const FULL_REPORT_INTERVAL: Duration = Duration::from_millis(500);
+ const EPS_INTERVAL: Duration = Duration::from_micros(1);
+ 
++// Each stage of the pipeline latency, summed over the frames since the last
++// alvr_get_latency_stats, for a server without the dashboard (which gets the same numbers
++// per frame in GraphStatistics events, which the session log leaves empty).
++const LATENCY_STAGES: usize = 9;
++struct LatencyTotals {
++    frames: u32,
++    discarded: u32,
++    packets_lost: u32,
++    sum_s: [f64; LATENCY_STAGES],
++    max_s: [f32; LATENCY_STAGES],
++}
++static LATENCY_TOTALS: std::sync::Mutex<LatencyTotals> = std::sync::Mutex::new(LatencyTotals {
++    frames: 0,
++    discarded: 0,
++    packets_lost: 0,
++    sum_s: [0.0; LATENCY_STAGES],
++    max_s: [0.0; LATENCY_STAGES],
++});
++
++/// Means and maxima in ms, in pipeline order: total, game (tracking received to frame
++/// present), server compositor (present to composed), encoder, network, decoder, decoder
++/// queue, client compositor, vsync queue.
++#[repr(C)]
++pub struct AlvrLatencyStats {
++    pub frames: u32,
++    pub discarded: u32,
++    pub packets_lost: u32,
++    pub mean_ms: [f32; LATENCY_STAGES],
++    pub max_ms: [f32; LATENCY_STAGES],
++}
++
++/// Fills out with the latencies of the frames the client reported since the last call, and
++/// starts again. False if out is null.
++#[no_mangle]
++pub extern "C" fn alvr_get_latency_stats(out: *mut AlvrLatencyStats) -> bool {
++    if out.is_null() {
++        return false;
++    }
++    let mut t = LATENCY_TOTALS.lock().unwrap();
++    let n = t.frames.max(1) as f64;
++    let stats = AlvrLatencyStats {
++        frames: t.frames,
++        discarded: t.discarded,
++        packets_lost: t.packets_lost,
++        mean_ms: t.sum_s.map(|s| (s / n * 1000.) as f32),
++        max_ms: t.max_s.map(|s| s * 1000.),
++    };
++    unsafe { out.write(stats) };
++    *t = LatencyTotals {
++        frames: 0,
++        discarded: 0,
++        packets_lost: 0,
++        sum_s: [0.0; LATENCY_STAGES],
++        max_s: [0.0; LATENCY_STAGES],
++    };
++    true
++}
++
+ pub struct HistoryFrame {
+     target_timestamp: Duration,
+     tracking_received: Instant,
+@@ -168,6 +226,7 @@ impl StatisticsManager {
+     pub fn report_packet_loss(&mut self) {
+         self.packets_lost_total += 1;
+         self.packets_lost_partial_sum += 1;
++        LATENCY_TOTALS.lock().unwrap().packets_lost += 1;
+     }
+ 
+     pub fn report_battery(&mut self, device_id: u64, gauge_value: f32, is_plugged: bool) {
+@@ -222,6 +281,32 @@ impl StatisticsManager {
+                     + client_stats.vsync_queue,
+             );
+ 
++            {
++                let stages = [
++                    client_stats.total_pipeline_latency,
++                    game_time_latency,
++                    server_compositor_latency,
++                    encoder_latency,
++                    network_latency,
++                    client_stats.video_decode,
++                    client_stats.video_decoder_queue,
++                    client_stats.rendering,
++                    client_stats.vsync_queue,
++                ];
++                let mut t = LATENCY_TOTALS.lock().unwrap();
++                // Some client reports carry a wrapped-around duration (a vsync queue of
++                // 1.8e16 ms): a frame with any stage over a second is counted, not averaged.
++                if stages.iter().any(|d| *d > Duration::from_secs(1)) {
++                    t.discarded += 1;
++                } else {
++                    t.frames += 1;
++                    for (i, d) in stages.iter().enumerate() {
++                        t.sum_s[i] += d.as_secs_f64();
++                        t.max_s[i] = t.max_s[i].max(d.as_secs_f32());
++                    }
++                }
++            }
++
+             let client_fps =
+                 1.0 / Duration::max(client_stats.frame_interval, EPS_INTERVAL).as_secs_f32();
+             let server_fps =

@@ -589,6 +589,9 @@ void axr_submit(int64_t display_time, const axr_eye_image eyes[2], id<MTLCommand
 // frame had to be dropped, in which case done never runs.
 static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4], id<MTLCommandQueue> queue, uint64_t ts, bool idr,
                          uint32_t out_w, uint32_t out_h, void (^done)(void)) {
+    // The frame has reached the server: ALVR's "present", where its game latency ends. Its
+    // compositor latency then runs to alvr_report_composed, after the compose, below.
+    alvr_report_present(ts, 0);
     if (dispatch_semaphore_wait(g_in_flight, dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) != 0) return false;
 
     CVPixelBufferRef pb = NULL;
@@ -644,7 +647,6 @@ static bool encode_frame(const compose_uniform *u, id<MTLTexture> __strong tex[4
                     ^(OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
                         if (status == noErr && sample) handle_encoded(sample);
                     });
-                alvr_report_present(ts, 0);
                 CFRelease(encoder);
             }
             CFRelease(ytex);
@@ -1018,6 +1020,20 @@ static void *event_thread(void *arg) {
                             g_stat_bunched, g_stat_late, g_stat_button_events, (unsigned long)g_nbuttons, axr_stat_syncs,
                             axr_stat_unfocused_syncs, axr_stat_pressed, (unsigned long long)audio_frames,
                             audio_peak, g_stat_composes ? g_stat_compose_s * 1e3 / g_stat_composes : 0.0, compositor);
+                // ALVR's latency breakdown for the frames the headset reported on, mean/max in ms.
+                AlvrLatencyStats lat;
+                if (alvr_get_latency_stats(&lat) && (lat.frames || lat.discarded) && g_connected) {   // drained either way
+                    const float *m = lat.mean_ms, *x = lat.max_ms;
+                    axr_log("latency: %.1f/%.1f ms = game %.1f/%.1f + compose %.1f/%.1f + encode %.1f/%.1f"
+                            " + network %.1f/%.1f + decode %.1f/%.1f + decode queue %.1f/%.1f"
+                            " + headset compose %.1f/%.1f + vsync %.1f/%.1f | %u frames (%u discarded), %u packets lost",
+                            m[AXR_LAT_TOTAL], x[AXR_LAT_TOTAL], m[AXR_LAT_GAME], x[AXR_LAT_GAME],
+                            m[AXR_LAT_COMPOSE], x[AXR_LAT_COMPOSE], m[AXR_LAT_ENCODE], x[AXR_LAT_ENCODE],
+                            m[AXR_LAT_NETWORK], x[AXR_LAT_NETWORK], m[AXR_LAT_DECODE], x[AXR_LAT_DECODE],
+                            m[AXR_LAT_DECODE_QUEUE], x[AXR_LAT_DECODE_QUEUE],
+                            m[AXR_LAT_CLIENT_COMPOSE], x[AXR_LAT_CLIENT_COMPOSE], m[AXR_LAT_VSYNC], x[AXR_LAT_VSYNC],
+                            lat.frames, lat.discarded, lat.packets_lost);
+                }
                 g_stat_button_events = axr_stat_syncs = axr_stat_unfocused_syncs = axr_stat_pressed = 0;
                 pthread_mutex_lock(&g_lock);
                 g_stream_fps = g_stat_frames / dt;

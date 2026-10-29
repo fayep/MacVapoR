@@ -83,3 +83,12 @@ void alvr_shutdown(void);
 // From alvrxr's ALVR patch (patches/alvr-20.14.1-game-audio.patch).
 void alvr_set_external_game_audio(uint32_t sample_rate);
 void alvr_send_game_audio(const int16_t *samples, uint64_t frame_count);
+// From alvrxr's ALVR patch (patches/alvr-20.14.1-latency-stats.patch). Means and maxima in ms,
+// in pipeline order: AXR_LAT_* below.
+enum { AXR_LAT_TOTAL, AXR_LAT_GAME, AXR_LAT_COMPOSE, AXR_LAT_ENCODE, AXR_LAT_NETWORK, AXR_LAT_DECODE,
+       AXR_LAT_DECODE_QUEUE, AXR_LAT_CLIENT_COMPOSE, AXR_LAT_VSYNC, AXR_LAT_STAGES };
+typedef struct {
+    uint32_t frames, discarded, packets_lost;   // discarded: reports with a stage over a second
+    float mean_ms[AXR_LAT_STAGES], max_ms[AXR_LAT_STAGES];
+} AlvrLatencyStats;
+bool alvr_get_latency_stats(AlvrLatencyStats *out);
