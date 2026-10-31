@@ -1009,7 +1009,9 @@ static void *event_thread(void *arg) {
                 axr_audio_stats(&audio_frames, &audio_peak);
                 char compositor[512];
                 axr_compositor_stats(compositor, sizeof compositor);   // "" unless this is SERVER
-                if (g_stat_frames || axr_stat_wait || compositor[0])
+                // Only while streaming: the lounge waits on frames even with no headset, which
+                // filled the log with idle lines.
+                if (g_stat_frames || g_connected)
                     axr_log("%.0f fps, %.1f Mbps | app: %u waits, %u ends, %u projection layers, %u submits (%u not ready), %u reused samples"
                             " | headset: %.0f samples/s, every %.1f ms, %u bunched, %u late"
                             " | input: %u button events, %lu buttons seen, %u syncs (%u unfocused), %u pressed reads"
